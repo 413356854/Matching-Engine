@@ -8,15 +8,16 @@ import java.util.Locale;
  * 双边成交结算命令，作为 {@link TradeSettlementBatch#getMsgList()} 的元素发往
  * Kafka topic {@code me.account.settlements-batch}。
  *
- * <p>一个成交对（taker / maker）只产生<b>一条消息</b>，消息携带买方和卖方的全部资金腿：
+ * <p>一个成交对（taker / maker）拆成买方、卖方<b>两条命令</b>，每条只携带一个用户的资金腿：
  * <ul>
  *   <li>买方：付计价币（{@link FundsLogType#TRADE_SETTLE_OUT}，冻结扣账）、
  *       收基础币（{@link FundsLogType#TRADE_SETTLE_IN}，可用入账）；</li>
  *   <li>卖方：付基础币（冻结扣账）、收计价币（可用入账）；</li>
- *   <li>买单全部成交且成交价优于限价时，附带一条剩余冻结释放腿（{@link FundsLogType#ORDER_UNFREEZE}）。</li>
+ *   <li>买单全部成交且成交价优于限价时，买方命令附带一条剩余冻结释放腿（{@link FundsLogType#ORDER_UNFREEZE}）。</li>
  * </ul>
  *
- * <p>账户模块把整条消息的<b>所有腿作为一个原子操作</b>执行：任一腿余额不足，整条消息不生效。
+ * <p>账户模块把每条命令的<b>所有腿作为一个原子操作</b>执行：任一腿余额不足，该条命令不生效。
+ * 买卖两侧是两条独立命令，不保证跨用户原子性。
  *
  * <p><b>非成交清算</b>：市价买入撮合结束后退回未用完的冻结预算，只携带一条
  * {@link FundsLogType#ORDER_UNFREEZE} 腿；此时 {@code tradeId} 与 {@code makerOrderId} 为 0，
