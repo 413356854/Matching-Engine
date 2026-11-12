@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.env.local
+*.log
+.edge-profile/
+.screenshot*.png
+.modal*.png
+.after-login.png
+.ui-test.mjs
+.modal-test.mjs

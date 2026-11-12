@@ -1,0 +1,26 @@
+# 构建产物
+matching-engine/target/
+web/node_modules/
+web/dist/
+
+# IDE
+.idea/
+*.iml
+
+# 日志与调试产物
+*.log
+.playwright-mcp/
+
+# 本地配置与密钥
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.jks
+.npmrc
+application-local.yml
+
+# 操作系统
+.DS_Store
+Thumbs.db

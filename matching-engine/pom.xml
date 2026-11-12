@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>4.1.2</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>com.me</groupId>
+    <artifactId>matching-engine</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+    <name>matching-engine</name>
+    <description>币币撮合演示系统（单体）</description>
+
+    <properties>
+        <java.version>21</java.version>
+        <mybatis-plus.version>3.5.18.1</mybatis-plus.version>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter</artifactId>
+        </dependency>
+
+        <!-- REST 接入层：Spring MVC + Tomcat（Boot 4 推荐使用 webmvc starter） -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-webmvc</artifactId>
+        </dependency>
+
+        <!-- MyBatis-Plus：Spring Boot 4 专用 starter（Boot 3 用 mybatis-plus-spring-boot3-starter） -->
+        <dependency>
+            <groupId>com.baomidou</groupId>
+            <artifactId>mybatis-plus-spring-boot4-starter</artifactId>
+            <version>${mybatis-plus.version}</version>
+        </dependency>
+
+        <!-- 版本由 spring-boot-dependencies 4.1.2 管理：9.7.0 -->
+        <dependency>
+            <groupId>com.mysql</groupId>
+            <artifactId>mysql-connector-j</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
+        <!-- Kafka：直接使用官方 kafka-clients（版本由 Spring Boot BOM 管理），不引入 Spring Kafka -->
+        <dependency>
+            <groupId>org.apache.kafka</groupId>
+            <artifactId>kafka-clients</artifactId>
+        </dependency>
+
+        <!-- Jackson 3：自建 Kafka JsonSerializer/JsonDeserializer 使用 JsonMapper -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-jackson</artifactId>
+        </dependency>
+
+        <!-- QuestDB 使用 PostgreSQL wire protocol（默认 8812 端口）做查询/建表 -->
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
+        <!-- QuestDB 官方 Java 客户端：QWP/ILP 高吞吐写入（默认 QWP over WebSocket） -->
+        <dependency>
+            <groupId>org.questdb</groupId>
+            <artifactId>questdb-client</artifactId>
+            <version>1.3.11</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- Kafka value 序列化：Apache Fory 二进制 -->
+        <dependency>
+            <groupId>org.apache.fory</groupId>
+            <artifactId>fory-core</artifactId>
+            <version>1.7.7</version>
+        </dependency>
+
+        <!-- account 消费入口：进程内无锁环形缓冲（poll 线程 → 单 handler 线程） -->
+        <dependency>
+            <groupId>com.lmax</groupId>
+            <artifactId>disruptor</artifactId>
+            <version>4.0.0</version>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>

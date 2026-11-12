@@ -1,0 +1,182 @@
+server:
+  tomcat:
+    # 默认 maxKeepAliveRequests=100，会在高并发下频繁关闭连接；下单是一单一请求，
+    # 连接复用能明显降低重连开销。-1 = 不限制；公网部署可改成较大的有限值（如 10000）。
+    max-keep-alive-requests: -1
+    # 默认等于 connectionTimeout；显式给 60s，避免连接空闲过早被关闭。
+    keep-alive-timeout: 60s
+
+spring:
+  application:
+    name: matching-engine
+
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    # 本地开发默认值；部署时用环境变量 DB_URL / DB_USERNAME / DB_PASSWORD 覆盖
+    url: "${DB_URL:jdbc:mysql://localhost:3306/db_exchange?useUnicode=true&characterEncoding=utf8&connectionTimeZone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false}"
+    username: "${DB_USERNAME:admin}"
+    password: "${DB_PASSWORD:admin}"
+    hikari:
+      pool-name: matching-engine-pool
+      minimum-idle: 2
+      maximum-pool-size: 10
+      connection-timeout: 3000
+      validation-timeout: 2000
+
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true
+    log-impl: org.apache.ibatis.logging.slf4j.Slf4jImpl
+  global-config:
+    banner: false
+    db-config:
+      # 表主键统一自增；不使用雪花 ID
+      id-type: auto
+
+app:
+  kafka:
+    # 关闭后不启动任何裸 consumer/topic initializer
+    enabled: true
+    # 诊断：逗号分隔禁用指定消费 stage，例如 order-command,marketdata,funds-flow；
+    # stage 名称见 KafkaConsumerConfiguration 的 runner 名。默认空 = 全部启用。
+    # disabled-consumers: ""
+    bootstrap-servers: "${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}"
+    # 事务型 producer 的唯一标识；多实例部署时每个实例必须不同（pod name / 序号）
+    instance-id: "${KAFKA_INSTANCE_ID:local}"
+    transaction-id-prefix: "${KAFKA_TRANSACTION_ID_PREFIX:funds-flow-tx-}"
+    poll-timeout-ms: 1000
+    # 整批失败后的重试间隔
+    retry-backoff-ms: 1000
+    # REST 下单/充值使用幂等、非事务 producer；池大小、借出超时、同步 ack 超时
+    rest-producer-pool-size: 32
+    rest-borrow-timeout-ms: 3000
+    rest-send-timeout-ms: 3000
+    # 仅 REST producer 覆盖全局 linger/batch：50ms 凑批；448KB ≈ 2000 条 OrderCommand
+    # （单条约 197B JSON + 8B key + Kafka record 开销，约 235B/条）
+    rest-producer-linger-ms: 50
+    rest-producer-batch-size-bytes: 458752
+    consumer:
+      # offset 只能通过事务提交，禁止自动提交
+      enable-auto-commit: false
+      isolation-level: read_committed
+      auto-offset-reset: earliest
+      # 禁止 broker 自动创建 topic（避免默认 1 分区）
+      allow-auto-create-topics: false
+      # 批量消费：逐条 topic（me.account.commands）单次 poll 最多 2000 条；
+      # broker 凑够约 1MB 或等待 50ms 即返回
+      max-poll-records: 2000
+      # 五个 -batch topic（下单入口 + 四个下游）的一条 record 内含 msgList，
+      # 限制每次 poll 的 record 数，避免一次事务处理过多元素
+      # （10 条 × 每条最多 2000 元素）。
+      batch-max-poll-records: 10
+      fetch-max-wait-ms: 50
+      # 资金流水归档 stage 单独覆盖：一次 poll 最多 100 条 record、fetch 等 200ms；
+      # FundsFlowConsumer 再把流水按 20k 行分块写入，摊薄 QWP ack 与 Kafka commit
+      # 的按批固定开销。其他 batch topic 不受影响。
+      funds-flow:
+        max-poll-records: 100
+        fetch-max-wait-ms: 200
+      fetch-min-size-bytes: 1048576
+      # 逐条 topic 处理 2000 条会阻塞 poll；给足余量，避免批次处理期间触发 rebalance
+      max-poll-interval-ms: 600000
+      session-timeout-ms: 45000
+      # 预取下一批的 poll 超时；0 = 非阻塞，只推动 fetch 管线（详见 account ingress）
+      prefetch-poll-timeout-ms: 0
+      # 各 stage 的并发 consumer 数，未配置默认 1。
+      # order-command 的消息体是 OrderCommandBatch，key=symbol，同一 symbol 只落一个分区、
+      # 由同一个 consumer 处理，因此按分区并行消费不破坏 symbol 内的价格-时间优先；
+      # 8 个 consumer 对应 8 个分区。
+      # account / freeze-result 等仍为单 consumer，保序语义不变。
+      concurrency:
+        order-command: 8
+        # 订单冻结按 symbol 分区后，账户冻结阶段可以按分区并行；同一 symbol 仍由单 consumer
+        # 串行处理，价格-时间优先不变。
+        account-order-freeze: 8
+        # 冻结回执 topic 已按 symbol 分区；撮合阶段可按分区并行，同一 symbol 只由一个
+        # consumer 处理，价格-时间优先不变。下游行情/结算也按 symbol 分组发送。
+        order-freeze-result: 2
+        # 清算命令按 symbol 分区；8 个 consumer 对应 8 分区，不同 symbol 的清算并行，
+        # 同一 symbol 仍由单 consumer 串行（同一用户的余额由账户分片锁保护）。
+        account-settlement: 8
+        # 资金流水按 userId 分区，8 个 consumer 并行写 QuestDB（topic 8 分区）。
+        funds-flow: 8
+    producer:
+      acks: all
+      enable-idempotence: true
+      # 一批一个事务；单批可达 2000 条，给足事务提交时间
+      transaction-timeout-ms: 180000
+      # broker 不可用时限制 send() 元数据等待，避免阻塞消费/HTTP 线程
+      max-block-ms: 5000
+      delivery-timeout-ms: 120000
+      # 同一批次的记录先全部入队，由客户端按 partition 聚合；少量 linger 提高批合并率
+      linger-ms: 2
+      batch-size-bytes: 32768
+    admin:
+      auto-create: true
+      fail-fast: false
+    topics:
+      # 下单入口与四个下游输出 topic 均为批量消息（一条 record 内含 msgList）；
+      # 只有充值等非冻结资金命令 me.account.commands 仍是逐条消息。
+      account-commands: me.account.commands
+      # ORDER_FREEZE 单独一条链路，key=symbol，每个 symbol 一条批量消息，与充值（key=userId）解耦
+      account-order-freeze-commands: me.account.order-freeze-commands-batch
+      order-commands: me.order.commands-batch
+      account-settlements: me.account.settlements-batch
+      order-freeze-results: me.order.freeze-results-batch
+      market-data: me.marketdata-batch
+      # 资金流水按 userId 分组、key=userId；8 个 consumer 并行归档
+      funds-flow: me.funds-batch
+    groups:
+      account: account-command-consumer
+      account-order-freeze: account-order-freeze-consumer
+      account-settlement: account-trade-settlement-consumer
+      order: order-command-consumer
+      order-freeze-result: order-freeze-result-consumer
+      marketdata: marketdata-trade-consumer
+      admin: admin-funds-flow
+    topic:
+      partitions: 8
+      replication-factor: 1
+
+  currency:
+    ingress:
+      # HTTP 下单先非阻塞写入 Disruptor，单 handler 线程按「2000 条或 20ms」聚合，
+      # 再按 symbol 分组发送 OrderCommandBatch 批量消息到 me.order.commands-batch（key=symbol）。
+      # ring 槽位数，必须是 2 的幂；满时下单接口返回 503，不无限排队。
+      ring-size: 65536
+      # 单个聚合批次的最大命令数；达到即发送
+      batch-size: 2000
+      # 聚合时间窗口（ms）；定时 tick 触发发送，命令最多等待这么久
+      flush-interval-ms: 20
+
+  account:
+    ingress:
+      # 压测结论：ring 无吞吐收益，且 account 侧端到端更慢（stage5 p50 563ms vs 55ms），
+      # 默认关闭，退回「poll 线程直连 listener」；要 A/B 时用 --app.account.ingress.disruptor-enabled=true 打开
+      disruptor-enabled: false
+      # 必须为 2 的幂；每个 slot 只放一个 poll 批次引用
+      ring-size: 1024
+      # poll 线程等待 handler 处理完一批的上限
+      handler-timeout-ms: 30000
+
+  marketdata:
+    # 需要多个周期时改成 1m,5m,15m,30m,1h,4h,1d
+    kline-intervals: 1m
+    # 同一分钟 K 线首次写入后，每 N 个消费批次再更新一次；跨分钟强制写最终快照。
+    # 1 = 每批都写；默认 5，用于减少 QuestDB 写入和 QWP ack 次数。
+    kline-write-every-batches: 5
+
+  questdb:
+    # JDBC（PostgreSQL wire）只用于查询/DDL，以及 write-mode=jdbc 时的写入回退
+    jdbc-url: "${QUESTDB_JDBC_URL:jdbc:postgresql://localhost:8812/qdb}"
+    username: "${QUESTDB_USER:admin}"
+    password: "${QUESTDB_PASSWORD:quest}"
+    # JDBC 连接池只服务查询/DDL 与 write-mode=jdbc 回退；QWP 写入使用客户端自己的连接池
+    pool-size: 8
+    connection-timeout-ms: 3000
+    # 官方 Java 客户端（QWP over WebSocket，批量写入 + 服务端 ack）
+    # write-mode=client 时资金流水/成交/K线/锚点写入走 QWP；jdbc 时退回 JDBC batch 便于 A/B
+    # sender_pool_max 必须 >= 并发 QWP 写入线程数（8 funds-flow + marketdata），
+    # 否则会等满 acquire_timeout 后抛 LineSenderException，造成消费停摆。
+    ingest-conf-string: "${QUESTDB_INGEST_CONF:ws::addr=localhost:9000;username=admin;password=quest;lazy_connect=on;sender_pool_min=1;sender_pool_max=16;auto_flush_rows=75000;auto_flush_interval=1000;acquire_timeout_ms=10000;}"
+    write-mode: "${QUESTDB_WRITE_MODE:client}"
