@@ -40,9 +40,10 @@ public interface OrderService {
 
     /**
      * 成交清算：把撮合成交对的两笔委托推进为部分成交 / 已成交，并生成一条包含买方、卖方
-     * 扣账与到账资金腿的双边结算命令。由委托侧进程内撮合编排同步调用（不再消费
-     * {@code me.trades}）。演示版不缓存成交对；重复调用时由订单状态（已全部成交）拒绝，
-     * 部分成交的重复回执不保证去重。
+     * 扣账与到账资金腿的双边结算命令。委托成交至 {@code FILLED} 时同时生成历史事件，
+     * 供监听器在同一个 Kafka 事务里发往 {@code me.order.history-batch}。
+     * 由委托侧进程内撮合编排同步调用（不再消费 {@code me.trades}）。演示版不缓存成交对；
+     * 重复调用时由订单状态（已全部成交）拒绝，部分成交的重复回执不保证去重。
      */
     OrderTradeApplyResult onTrade(TradeEvent trade);
 
@@ -52,7 +53,8 @@ public interface OrderService {
      *
      * <p>市价买入是「金额驱动」的即时单：撮合引擎按剩余预算限制成交量，未成交部分不再挂单。
      * 若委托在成交过程中已因数量全部成交（{@code FILLED}），退款已由最后一笔成交的买方
-     * 结算命令携带，本方法不会重复退款；重复调用同样幂等。
+     * 结算命令携带，本方法不会重复退款；重复调用同样幂等。首次推进为 {@code FILLED} 时
+     * 同时生成历史事件（撮合完成）。
      */
     OrderTradeApplyResult completeMarketBuy(long orderId);
 
@@ -92,6 +94,8 @@ public interface OrderService {
      *
      * <p>本方法由撤单监听器的更新线程池并发调用，按 orderId 在
      * {@link java.util.concurrent.ConcurrentHashMap#computeIfPresent} 中原子推进状态。
+     * 首次推进为 {@code CANCELED} 时同时生成历史事件，由监听器随撤单消费批次发往
+     * {@code me.order.history-batch}。
      */
     OrderCancelApplyResult applyCancel(OrderCancelContext context);
 

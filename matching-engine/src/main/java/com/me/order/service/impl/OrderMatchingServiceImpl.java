@@ -16,6 +16,7 @@ import com.me.order.service.OrderService;
 import com.me.shared.event.MarketDataEvent;
 import com.me.shared.event.TradeEvent;
 import com.me.shared.order.OrderCancelEvent;
+import com.me.shared.order.OrderHistoryEvent;
 import com.me.shared.order.OrderPlacedEvent;
 import com.me.shared.order.OrderSide;
 import com.me.shared.order.OrderType;
@@ -112,6 +113,7 @@ public class OrderMatchingServiceImpl implements OrderMatchingService {
         List<MarketDataEvent> marketDataEvents = new ArrayList<>(result.trades().size());
         List<TradeSettlementCommand> settlementCommands =
                 new ArrayList<>(result.trades().size() + 1);
+        List<OrderHistoryEvent> historyEvents = new ArrayList<>(2);
         List<IgnoredTrade> ignoredTrades = new ArrayList<>();
 
         for (Trade trade : result.trades()) {
@@ -120,6 +122,7 @@ public class OrderMatchingServiceImpl implements OrderMatchingService {
             OrderTradeApplyResult cleared = orderService.onTrade(toTradeEvent(trade, executedAt));
             if (cleared.handled()) {
                 settlementCommands.addAll(cleared.settlementCommands());
+                historyEvents.addAll(cleared.historyEvents());
             } else {
                 ignoredTrades.add(new IgnoredTrade(trade.tradeId(), cleared.reason()));
                 log.warn("trade clearing ignored inside in-process matching: orderId={}, "
@@ -136,6 +139,7 @@ public class OrderMatchingServiceImpl implements OrderMatchingService {
             OrderTradeApplyResult completed = orderService.completeMarketBuy(order.orderId());
             if (completed.handled()) {
                 settlementCommands.addAll(completed.settlementCommands());
+                historyEvents.addAll(completed.historyEvents());
             } else {
                 log.warn("market buy completion ignored: orderId={}, reason={}",
                         order.orderId(), completed.reason());
@@ -143,7 +147,7 @@ public class OrderMatchingServiceImpl implements OrderMatchingService {
         }
 
         return OrderMatchResult.matched(result.orderId(),
-                marketDataEvents, settlementCommands, ignoredTrades);
+                marketDataEvents, settlementCommands, historyEvents, ignoredTrades);
     }
 
     private static MarketDataEvent toMarketData(Trade trade, Instant executedAt) {

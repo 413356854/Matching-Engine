@@ -83,6 +83,15 @@ export function FlowIcon() {
   );
 }
 
+export function OrderIcon() {
+  return (
+    <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true">
+      <rect x="4" y="2.5" width="12" height="15" rx="2" fill="none" stroke="currentColor" strokeWidth="1.3" />
+      <path d="M7 6.5h6M7 10h6M7 13.5h3.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+    </svg>
+  );
+}
+
 export function CandleIcon() {
   return (
     <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true">

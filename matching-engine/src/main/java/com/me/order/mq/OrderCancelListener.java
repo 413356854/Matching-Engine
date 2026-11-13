@@ -10,6 +10,7 @@ import com.me.order.service.OrderMatchingService;
 import com.me.order.service.OrderService;
 import com.me.shared.order.OrderCancelBatch;
 import com.me.shared.order.OrderCancelCommand;
+import com.me.shared.order.OrderHistoryEvent;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ExecutionException;
@@ -55,16 +56,19 @@ public class OrderCancelListener {
     private final OrderService orderService;
     private final OrderMatchingService orderMatchingService;
     private final TradeSettlementCommandPublisher settlementPublisher;
+    private final OrderHistoryPublisher orderHistoryPublisher;
     private final ExecutorService workerPool;
 
     public OrderCancelListener(
             OrderService orderService,
             OrderMatchingService orderMatchingService,
             TradeSettlementCommandPublisher settlementPublisher,
+            OrderHistoryPublisher orderHistoryPublisher,
             @Qualifier("orderCancelExecutor") ExecutorService workerPool) {
         this.orderService = orderService;
         this.orderMatchingService = orderMatchingService;
         this.settlementPublisher = settlementPublisher;
+        this.orderHistoryPublisher = orderHistoryPublisher;
         this.workerPool = workerPool;
     }
 
@@ -122,8 +126,9 @@ public class OrderCancelListener {
         // 3) 线程池并发更新订单并生成清算单。
         List<OrderCancelApplyResult> applied = applyConcurrently(cancelingContexts);
 
-        // 4) 聚合清算单，在 poll 线程的事务内发送 settlementBatch 到账户模块。
+        // 4) 聚合清算单与委托历史，在 poll 线程的事务内发送到账户模块 / 委托历史 topic。
         List<TradeSettlementCommand> settlements = new ArrayList<>();
+        List<OrderHistoryEvent> historyEvents = new ArrayList<>(applied.size());
         for (int index = 0; index < applied.size(); index++) {
             OrderCancelApplyResult result = applied.get(index);
             OrderCancelContext context = cancelingContexts.get(index);
@@ -137,9 +142,15 @@ public class OrderCancelListener {
                         context.orderId(), context.symbol(), result.refundAmount());
             }
             settlements.addAll(result.settlementCommands());
+            if (result.historyEvent() != null) {
+                historyEvents.add(result.historyEvent());
+            }
         }
         if (!settlements.isEmpty()) {
             settlementPublisher.publishBatch(settlements);
+        }
+        if (!historyEvents.isEmpty()) {
+            orderHistoryPublisher.publishBatch(historyEvents);
         }
     }
 

@@ -16,6 +16,8 @@ import com.me.shared.order.OrderCancelBatch;
 import com.me.shared.order.OrderCancelCommand;
 import com.me.shared.order.OrderCommand;
 import com.me.shared.order.OrderCommandBatch;
+import com.me.shared.order.OrderHistoryBatch;
+import com.me.shared.order.OrderHistoryEvent;
 import com.me.shared.order.OrderPlacedEvent;
 import com.me.shared.order.OrderSide;
 import com.me.shared.order.OrderStatus;
@@ -58,6 +60,8 @@ public final class KafkaFory {
         fory.register(OrderCommandBatch.class, 105);
         fory.register(OrderCancelCommand.class, 106);
         fory.register(OrderCancelBatch.class, 107);
+        fory.register(OrderHistoryEvent.class, 108);
+        fory.register(OrderHistoryBatch.class, 109);
 
         fory.register(FundsCommand.class, 110);
         fory.register(FundsLogType.class, 111);

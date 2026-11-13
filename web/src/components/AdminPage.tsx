@@ -2,10 +2,11 @@ import { useState } from 'react';
 import type { Currency, TradingPair } from '../api';
 import { FundsFlowAdmin } from './FundsFlowAdmin';
 import { KlineAdmin } from './KlineAdmin';
-import { CandleIcon, FlowIcon } from './icons';
+import { OrderHistoryAdmin } from './OrderHistoryAdmin';
+import { CandleIcon, FlowIcon, OrderIcon } from './icons';
 import type { ToastKind } from './ToastStack';
 
-export type AdminSection = 'flows' | 'klines';
+export type AdminSection = 'flows' | 'orders' | 'klines';
 
 interface AdminPageProps {
   pairs: TradingPair[];
@@ -17,6 +18,7 @@ interface AdminPageProps {
 
 const SECTIONS = [
   { id: 'flows' as const, label: '流水管理', hint: 'funds_flow', Icon: FlowIcon },
+  { id: 'orders' as const, label: '委托历史', hint: 'ord_history', Icon: OrderIcon },
   { id: 'klines' as const, label: 'K 线管理', hint: 'md_kline', Icon: CandleIcon },
 ];
 
@@ -66,6 +68,8 @@ export function AdminPage({
             currencyScales={currencyScales}
             notify={notify}
           />
+        ) : section === 'orders' ? (
+          <OrderHistoryAdmin />
         ) : (
           <KlineAdmin pairs={pairs} currencyScales={currencyScales} notify={notify} />
         )}

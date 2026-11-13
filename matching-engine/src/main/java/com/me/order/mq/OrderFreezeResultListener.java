@@ -11,6 +11,7 @@ import com.me.order.service.OrderService;
 import com.me.shared.event.MarketDataEvent;
 import com.me.shared.event.OrderFreezeResultBatch;
 import com.me.shared.event.OrderFreezeResultEvent;
+import com.me.shared.order.OrderHistoryEvent;
 import com.me.shared.order.OrderPlacedEvent;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -67,6 +68,7 @@ public class OrderFreezeResultListener {
     private final MatchingEngine matchingEngine;
     private final MarketDataEventPublisher marketDataPublisher;
     private final TradeSettlementCommandPublisher settlementPublisher;
+    private final OrderHistoryPublisher orderHistoryPublisher;
     private final ExecutorService workerPool;
 
     public OrderFreezeResultListener(
@@ -75,12 +77,14 @@ public class OrderFreezeResultListener {
             MatchingEngine matchingEngine,
             MarketDataEventPublisher marketDataPublisher,
             TradeSettlementCommandPublisher settlementPublisher,
+            OrderHistoryPublisher orderHistoryPublisher,
             @Qualifier("orderFreezeResultExecutor") ExecutorService workerPool) {
         this.orderService = orderService;
         this.orderMatchingService = orderMatchingService;
         this.matchingEngine = matchingEngine;
         this.marketDataPublisher = marketDataPublisher;
         this.settlementPublisher = settlementPublisher;
+        this.orderHistoryPublisher = orderHistoryPublisher;
         this.workerPool = workerPool;
     }
 
@@ -173,6 +177,7 @@ public class OrderFreezeResultListener {
     private void publishOutputs(List<PlacedOrder> placed, List<OrderMatchResult> matches) {
         Map<String, List<MarketDataEvent>> marketDataBySymbol = new LinkedHashMap<>();
         List<TradeSettlementCommand> settlementCommands = new ArrayList<>();
+        List<OrderHistoryEvent> historyEvents = new ArrayList<>();
         for (int index = 0; index < matches.size(); index++) {
             OrderMatchResult match = matches.get(index);
             PlacedOrder source = placed.get(index);
@@ -191,6 +196,9 @@ public class OrderFreezeResultListener {
             if (!match.settlementCommands().isEmpty()) {
                 settlementCommands.addAll(match.settlementCommands());
             }
+            if (!match.historyEvents().isEmpty()) {
+                historyEvents.addAll(match.historyEvents());
+            }
             match.ignoredTrades().forEach(ignored ->
                     log.warn("trade clearing ignored: orderId={}, tradeId={}, reason={}",
                             match.orderId(), ignored.tradeId(), ignored.reason()));
@@ -200,6 +208,9 @@ public class OrderFreezeResultListener {
         }
         if (!settlementCommands.isEmpty()) {
             settlementPublisher.publishBatch(settlementCommands);
+        }
+        if (!historyEvents.isEmpty()) {
+            orderHistoryPublisher.publishBatch(historyEvents);
         }
     }
 

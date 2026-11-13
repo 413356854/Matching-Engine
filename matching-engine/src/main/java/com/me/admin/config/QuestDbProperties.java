@@ -22,13 +22,13 @@ public record QuestDbProperties(
     /**
      * 默认 QWP 连接串；lazy_connect 让 QuestDB 晚于应用启动也能启动。
      *
-     * <p>sender pool 要覆盖所有并发 QWP 写入线程：8 个 funds-flow consumer + marketdata
-     * consumer（行情/K线/anchor）。池子是 8 而写入线程有 9 个时，第 9 个会等满
-     * acquire_timeout（默认 10s）后抛 LineSenderException，导致消费停摆、lag 暴涨，
-     * 所以默认留到 16。
+     * <p>sender pool 要覆盖所有并发 QWP 写入线程：8 个 funds-flow consumer + 8 个
+     * order-history consumer + marketdata consumer（行情/K线/anchor），共 17 个。池子小于
+     * 并发写入线程数时，多出的线程会等满 acquire_timeout（默认 10s）后抛
+     * LineSenderException，导致消费停摆、lag 暴涨，所以默认留到 32。
      */
     private static final String DEFAULT_INGEST_CONF =
-            "ws::addr=localhost:9000;lazy_connect=on;sender_pool_min=1;sender_pool_max=16;"
+            "ws::addr=localhost:9000;lazy_connect=on;sender_pool_min=1;sender_pool_max=32;"
                     + "auto_flush_rows=75000;auto_flush_interval=1000;acquire_timeout_ms=10000;";
 
     public QuestDbProperties {

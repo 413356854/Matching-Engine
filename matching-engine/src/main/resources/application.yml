@@ -65,7 +65,7 @@ app:
       # 批量消费：逐条 topic（me.account.commands）单次 poll 最多 2000 条；
       # broker 凑够约 1MB 或等待 50ms 即返回
       max-poll-records: 2000
-      # 五个 -batch topic（下单入口 + 四个下游）的一条 record 内含 msgList，
+      # 七个 -batch topic（下单入口 + 六个下游）的一条 record 内含 msgList，
       # 限制每次 poll 的 record 数，避免一次事务处理过多元素
       # （10 条 × 每条最多 2000 元素）。
       batch-max-poll-records: 10
@@ -103,6 +103,9 @@ app:
         account-settlement: 8
         # 资金流水按 userId 分区，8 个 consumer 并行写 QuestDB（topic 8 分区）。
         funds-flow: 8
+        # 委托历史按 symbol 分区；8 个 consumer 对应 8 分区，不同 symbol 并行归档 QuestDB，
+        # 同一 symbol 仍由单 consumer 串行。
+        order-history: 8
     producer:
       acks: all
       enable-idempotence: true
@@ -131,6 +134,8 @@ app:
       market-data: me.marketdata-batch
       # 资金流水按 userId 分组、key=userId；8 个 consumer 并行归档
       funds-flow: me.funds-batch
+      # 委托历史：撤单 / 撮合完成的委托按 symbol 分组，key=symbol，admin 消费并归档 QuestDB
+      order-history: me.order.history-batch
     groups:
       account: account-command-consumer
       account-order-freeze: account-order-freeze-consumer
@@ -140,6 +145,7 @@ app:
       order-freeze-result: order-freeze-result-consumer
       marketdata: marketdata-trade-consumer
       admin: admin-funds-flow
+      order-history: admin-order-history
     topic:
       partitions: 8
       replication-factor: 1
@@ -200,7 +206,7 @@ app:
     connection-timeout-ms: 3000
     # 官方 Java 客户端（QWP over WebSocket，批量写入 + 服务端 ack）
     # write-mode=client 时资金流水/成交/K线/锚点写入走 QWP；jdbc 时退回 JDBC batch 便于 A/B
-    # sender_pool_max 必须 >= 并发 QWP 写入线程数（8 funds-flow + marketdata），
-    # 否则会等满 acquire_timeout 后抛 LineSenderException，造成消费停摆。
-    ingest-conf-string: "${QUESTDB_INGEST_CONF:ws::addr=localhost:9000;username=admin;password=quest;lazy_connect=on;sender_pool_min=1;sender_pool_max=16;auto_flush_rows=75000;auto_flush_interval=1000;acquire_timeout_ms=10000;}"
+    # sender_pool_max 必须 >= 并发 QWP 写入线程数（8 funds-flow + 8 order-history +
+    # marketdata），否则会等满 acquire_timeout 后抛 LineSenderException，造成消费停摆。
+    ingest-conf-string: "${QUESTDB_INGEST_CONF:ws::addr=localhost:9000;username=admin;password=quest;lazy_connect=on;sender_pool_min=1;sender_pool_max=32;auto_flush_rows=75000;auto_flush_interval=1000;acquire_timeout_ms=10000;}"
     write-mode: "${QUESTDB_WRITE_MODE:client}"

@@ -5,6 +5,7 @@ import {
   fetchKlines,
   fetchOpenOrders,
   fetchOrderBook,
+  fetchOrderHistory,
   fetchPairs,
   fetchTrades,
   fetchUserFundsFlows,
@@ -14,6 +15,7 @@ import {
   type FundsFlow,
   type Kline,
   type OrderBookDepth,
+  type OrderHistory,
   type OrderView,
   type Trade,
   type TradingPair,
@@ -51,6 +53,7 @@ function App() {
   const [klines, setKlines] = useState<Kline[]>([]);
   const [trades, setTrades] = useState<Trade[]>([]);
   const [openOrders, setOpenOrders] = useState<OrderView[]>([]);
+  const [orderHistory, setOrderHistory] = useState<OrderHistory[]>([]);
   const [fundsFlows, setFundsFlows] = useState<FundsFlow[]>([]);
   const [orderBook, setOrderBook] = useState<OrderBookDepth | null>(null);
   const [lastPrices, setLastPrices] = useState<Record<string, number>>({});
@@ -60,6 +63,7 @@ function App() {
   const [marketError, setMarketError] = useState<string | null>(null);
   const [orderBookError, setOrderBookError] = useState<string | null>(null);
   const [ordersError, setOrdersError] = useState<string | null>(null);
+  const [orderHistoryError, setOrderHistoryError] = useState<string | null>(null);
   const [fundsFlowsError, setFundsFlowsError] = useState<string | null>(null);
   const [refreshNonce, setRefreshNonce] = useState(0);
   const [balancesNonce, setBalancesNonce] = useState(0);
@@ -283,6 +287,28 @@ function App() {
     [userId, view],
   );
 
+  const loadOrderHistory = useCallback(
+    async (signal: AbortSignal) => {
+      if (view !== 'trade') {
+        return;
+      }
+      try {
+        const list = await fetchOrderHistory(userId, undefined, 50, signal);
+        if (signal.aborted) {
+          return;
+        }
+        setOrderHistory(list);
+        setOrderHistoryError(null);
+      } catch (error) {
+        if (isAbortError(error) || signal.aborted) {
+          return;
+        }
+        setOrderHistoryError(describeError(error));
+      }
+    },
+    [userId, view],
+  );
+
   const loadFundsFlows = useCallback(
     async (signal: AbortSignal) => {
       if (view !== 'trade') {
@@ -360,6 +386,8 @@ function App() {
     setBalancesError(null);
     setOpenOrders([]);
     setOrdersError(null);
+    setOrderHistory([]);
+    setOrderHistoryError(null);
     setFundsFlows([]);
     setFundsFlowsError(null);
   }, [userId]);
@@ -376,6 +404,7 @@ function App() {
   usePolling(loadKlines, 5_000, [selectedSymbol, refreshNonce, view]);
   usePolling(loadTrades, 3_000, [selectedSymbol, refreshNonce, view]);
   usePolling(loadOpenOrders, 3_000, [userId, refreshNonce, view]);
+  usePolling(loadOrderHistory, 5_000, [userId, refreshNonce, view]);
   usePolling(loadFundsFlows, 5_000, [userId, refreshNonce, view]);
   usePolling(loadOrderBook, 3_000, [selectedSymbol, refreshNonce, view]);
   usePolling(loadLastPrices, 15_000, [pairs, refreshNonce, view]);
@@ -445,6 +474,8 @@ function App() {
               pairs={pairs}
               orders={openOrders}
               ordersError={ordersError}
+              history={orderHistory}
+              historyError={orderHistoryError}
               flows={fundsFlows}
               flowsError={fundsFlowsError}
               currencyScales={currencyScales}
@@ -507,7 +538,7 @@ function App() {
           </>
         ) : (
           <>
-            <span>后台管理：QuestDB funds_flow / md_kline</span>
+            <span>后台管理：QuestDB funds_flow / ord_history / md_kline</span>
             <span>删除操作使用 TRUNCATE，不可恢复</span>
           </>
         )}

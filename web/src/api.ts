@@ -297,6 +297,66 @@ interface OrderQueryResponse {
   orders: OrderView[];
 }
 
+/**
+ * 一条历史委托（QuestDB ord_history）：只包含撤单（CANCELED）与撮合完成（FILLED）。
+ * 价格、数量、金额均为对应精度的最小单位整数。
+ */
+export interface OrderHistory {
+  orderId: number;
+  requestId: string;
+  userId: number;
+  symbol: string;
+  side: OrderSide;
+  type: OrderType;
+  status: OrderStatus;
+  price: number;
+  quantity: number;
+  filledQuantity: number;
+  frozenCurrency: string;
+  frozenAmount: number;
+  priceScale: number;
+  quantityScale: number;
+  quoteScale: number;
+  seq: number;
+  /** ISO-8601，UTC。 */
+  createdAt: string;
+  /** 委托进入终态的时间，ISO-8601，UTC。 */
+  finalAt: string;
+}
+
+interface OrderHistoryQueryResponse {
+  success: boolean;
+  reason: string | null;
+  userId: number;
+  symbol: string | null;
+  orders: OrderHistory[];
+}
+
+export interface AdminOrderHistoryQuery {
+  userId?: number | null;
+  symbol?: string;
+  status?: 'FILLED' | 'CANCELED';
+  limit?: number;
+}
+
+interface AdminOrderHistoryQueryResponse {
+  success: boolean;
+  reason: string | null;
+  userId: number | null;
+  symbol: string | null;
+  status: string | null;
+  orders: OrderHistory[];
+}
+
+/** 委托历史支持的终态筛选（与后端 ord_history.status 对齐）。 */
+export const ORDER_HISTORY_STATUSES: ReadonlyArray<{
+  value: 'FILLED' | 'CANCELED';
+  label: string;
+}> = [
+  { value: 'FILLED', label: '撮合完成' },
+  { value: 'CANCELED', label: '已撤销' },
+];
+
 export interface RechargeResponse {
   success: boolean;
   reason: string | null;
@@ -508,6 +568,33 @@ export async function fetchOpenOrders(
 }
 
 /**
+ * 查询当前用户的历史委托（QuestDB ord_history）：已撤单 / 已撮合完成，按最终时间倒序。
+ * symbol 可选；不传时返回该用户全部交易对的历史。
+ */
+export async function fetchOrderHistory(
+  userId: number,
+  symbol?: string,
+  limit = 50,
+  signal?: AbortSignal,
+): Promise<OrderHistory[]> {
+  const params = new URLSearchParams({
+    userId: String(userId),
+    limit: String(limit),
+  });
+  if (symbol) {
+    params.set('symbol', symbol);
+  }
+  const body = await request<OrderHistoryQueryResponse>(
+    `/api/v1/orders/history?${params.toString()}`,
+    { signal },
+  );
+  if (!body.success) {
+    throw new ApiError(body.reason ?? 'ORDER_HISTORY_REJECTED', 200, body);
+  }
+  return body.orders ?? [];
+}
+
+/**
  * 查询当前用户的历史资金流水（QuestDB funds_flow），按发生时间倒序（最新在前）。
  * 只返回该用户的记录，供交易页面的「历史流水」面板展示。
  */
@@ -607,6 +694,33 @@ export async function fetchAdminKlines(
     throw new ApiError(body.reason ?? 'ADMIN_KLINES_REJECTED', 200, body);
   }
   return body.klines ?? [];
+}
+
+/** 后台：查询委托历史（撤单 / 撮合完成，按最终时间倒序）。 */
+export async function fetchAdminOrderHistory(
+  query: AdminOrderHistoryQuery = {},
+  signal?: AbortSignal,
+): Promise<OrderHistory[]> {
+  const params = new URLSearchParams();
+  if (query.userId != null) {
+    params.set('userId', String(query.userId));
+  }
+  if (query.symbol) {
+    params.set('symbol', query.symbol);
+  }
+  if (query.status) {
+    params.set('status', query.status);
+  }
+  params.set('limit', String(query.limit ?? 100));
+
+  const body = await request<AdminOrderHistoryQueryResponse>(
+    `/api/v1/admin/order-history?${params.toString()}`,
+    { signal },
+  );
+  if (!body.success) {
+    throw new ApiError(body.reason ?? 'ORDER_HISTORY_REJECTED', 200, body);
+  }
+  return body.orders ?? [];
 }
 
 /** 后台：一键清空全部 K 线，返回清空前的记录数。 */

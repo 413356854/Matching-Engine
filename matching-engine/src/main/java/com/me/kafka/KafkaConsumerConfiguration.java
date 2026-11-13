@@ -7,6 +7,7 @@ import com.me.account.mq.AccountCommandListener;
 import com.me.account.mq.AccountFreezeCommandListener;
 import com.me.account.mq.AccountSettlementListener;
 import com.me.admin.mq.FundsFlowConsumer;
+import com.me.admin.mq.OrderHistoryConsumer;
 import com.me.marketdata.mq.MarketDataListener;
 import com.me.order.mq.OrderCancelListener;
 import com.me.order.mq.OrderCommandListener;
@@ -16,6 +17,7 @@ import com.me.shared.event.MarketDataBatch;
 import com.me.shared.event.OrderFreezeResultBatch;
 import com.me.shared.order.OrderCancelBatch;
 import com.me.shared.order.OrderCommandBatch;
+import com.me.shared.order.OrderHistoryBatch;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -28,7 +30,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
 /**
- * 八条消费链路的 runner 装配：topic / group / 目标类型 / 处理函数。
+ * 九条消费链路的 runner 装配：topic / group / 目标类型 / 处理函数。
  *
  * <p>topic 与 group 名称必须与 {@code app.kafka.topics} / {@code app.kafka.groups} 保持一致
  * （loadtest 和已有消费组 offset 都依赖它们）。
@@ -92,7 +94,8 @@ public class KafkaConsumerConfiguration {
             OrderFreezeResultListener orderFreezeResultListener,
             OrderCancelListener orderCancelListener,
             MarketDataListener marketDataListener,
-            FundsFlowConsumer fundsFlowConsumer) {
+            FundsFlowConsumer fundsFlowConsumer,
+            OrderHistoryConsumer orderHistoryConsumer) {
         List<KafkaConsumerRunner<?>> all = new ArrayList<>();
 
         all.addAll(createRunners(properties, clientFactory, sink,
@@ -134,6 +137,12 @@ public class KafkaConsumerConfiguration {
         all.addAll(createRunners(properties, clientFactory, sink,
                 "funds-flow", "funds-flow", "admin",
                 FundsFlowBatch.class, true, fundsFlowConsumer::onFundsFlow));
+
+        // 委托历史按 symbol 分区：8 个 consumer 并行归档 QuestDB，同一 symbol 由单 consumer
+        // 串行处理。历史事件由委托模块在撤单 / 成交清算的同一 Kafka 事务内产出。
+        all.addAll(createRunners(properties, clientFactory, sink,
+                "order-history", "order-history", "order-history",
+                OrderHistoryBatch.class, true, orderHistoryConsumer::onOrderHistory));
 
         return new KafkaConsumerRunners(all);
     }

@@ -16,6 +16,7 @@ import com.me.shared.event.OrderFreezeResultEvent;
 import com.me.shared.event.TradeEvent;
 import com.me.shared.money.Amounts;
 import com.me.shared.order.OrderCommand;
+import com.me.shared.order.OrderHistoryEvent;
 import com.me.shared.order.OrderPlacedEvent;
 import com.me.shared.order.OrderSide;
 import com.me.shared.order.OrderStatus;
@@ -125,6 +126,7 @@ public class OrderServiceImpl implements OrderService {
                 OrderStatus.ACCEPTED,
                 1L,
                 Instant.now(),
+                null,
                 command.priceScale(),
                 command.quantityScale(),
                 command.quoteScale(),
@@ -265,6 +267,13 @@ public class OrderServiceImpl implements OrderService {
 
         Order takerOrder = takerFill.order();
         Order makerOrder = makerFill.order();
+        List<OrderHistoryEvent> historyEvents = new ArrayList<>(2);
+        if (takerOrder.status() == OrderStatus.FILLED) {
+            historyEvents.add(takerOrder.toHistoryEvent());
+        }
+        if (makerOrder.status() == OrderStatus.FILLED) {
+            historyEvents.add(makerOrder.toHistoryEvent());
+        }
         boolean takerIsBuyer = trade.takerSide() == OrderSide.BUY;
         long buyerUserId = takerIsBuyer ? takerOrder.userId() : makerOrder.userId();
         long sellerUserId = takerIsBuyer ? makerOrder.userId() : takerOrder.userId();
@@ -312,7 +321,8 @@ public class OrderServiceImpl implements OrderService {
                 trade.makerOrderId(),
                 sellerLegs);
 
-        return OrderTradeApplyResult.handled(List.of(buyerCommand, sellerCommand));
+        return OrderTradeApplyResult.handled(
+                List.of(buyerCommand, sellerCommand), historyEvents);
     }
 
     @Override
@@ -337,8 +347,9 @@ public class OrderServiceImpl implements OrderService {
             long refund = order.frozenAmount() - order.settledQuoteAmount();
             // 市价买入按预算成交：撮合结束即完成，剩余数量不再挂单。
             Order completed = order.withStatus(OrderStatus.FILLED);
+            List<OrderHistoryEvent> historyEvents = List.of(completed.toHistoryEvent());
             if (refund <= 0) {
-                resultRef.set(OrderTradeApplyResult.handled(List.of()));
+                resultRef.set(OrderTradeApplyResult.handled(List.of(), historyEvents));
                 return completed;
             }
 
@@ -352,7 +363,8 @@ public class OrderServiceImpl implements OrderService {
                     List.of(new TradeSettlementCommand.SettlementLeg(
                             order.userId(), order.frozenCurrency(),
                             FundsLogType.ORDER_UNFREEZE, refund)));
-            resultRef.set(OrderTradeApplyResult.handled(List.of(refundCommand)));
+            resultRef.set(OrderTradeApplyResult.handled(
+                    List.of(refundCommand), historyEvents));
             return completed;
         });
         OrderTradeApplyResult result = resultRef.get();
@@ -459,8 +471,10 @@ public class OrderServiceImpl implements OrderService {
             }
 
             Order canceled = order.withStatus(OrderStatus.CANCELED);
+            OrderHistoryEvent historyEvent = canceled.toHistoryEvent();
             if (refund == 0) {
-                resultRef.set(OrderCancelApplyResult.canceled(0L, List.of()));
+                resultRef.set(OrderCancelApplyResult.canceled(
+                        0L, List.of(), historyEvent));
                 log.info("order canceled without refund: orderId={}, status={}",
                         orderId, order.status());
                 return canceled;
@@ -476,7 +490,8 @@ public class OrderServiceImpl implements OrderService {
                     List.of(new TradeSettlementCommand.SettlementLeg(
                             order.userId(), order.frozenCurrency(),
                             FundsLogType.ORDER_UNFREEZE, refund)));
-            resultRef.set(OrderCancelApplyResult.canceled(refund, List.of(command)));
+            resultRef.set(OrderCancelApplyResult.canceled(
+                    refund, List.of(command), historyEvent));
             log.info("order canceled: orderId={}, filledQuantity={}, refund={} {}",
                     orderId, order.filledQuantity(), refund, order.frozenCurrency());
             return canceled;
@@ -671,6 +686,7 @@ public class OrderServiceImpl implements OrderService {
             OrderStatus status,
             long seq,
             Instant createdAt,
+            Instant finalAt,
             int priceScale,
             int quantityScale,
             int quoteScale,
@@ -679,8 +695,8 @@ public class OrderServiceImpl implements OrderService {
         private Order withStatus(OrderStatus newStatus) {
             return new Order(requestId, orderId, userId, symbol, side, type, price, quantity,
                     frozenCurrency, frozenAmount, filledQuantity, settledQuoteAmount,
-                    newStatus, seq + 1, createdAt, priceScale, quantityScale, quoteScale,
-                    cancelRequested);
+                    newStatus, seq + 1, createdAt, terminalTime(newStatus, finalAt),
+                    priceScale, quantityScale, quoteScale, cancelRequested);
         }
 
         /**
@@ -691,7 +707,7 @@ public class OrderServiceImpl implements OrderService {
         private Order withCancelRequested() {
             return new Order(requestId, orderId, userId, symbol, side, type, price, quantity,
                     frozenCurrency, frozenAmount, filledQuantity, settledQuoteAmount,
-                    status, seq, createdAt, priceScale, quantityScale, quoteScale, true);
+                    status, seq, createdAt, finalAt, priceScale, quantityScale, quoteScale, true);
         }
 
         /**
@@ -711,14 +727,35 @@ public class OrderServiceImpl implements OrderService {
                     : 0L;
             return new Order(requestId, orderId, userId, symbol, side, type, price, quantity,
                     frozenCurrency, frozenAmount, filled, nextSettledQuote,
-                    nextStatus, seq + 1, createdAt, priceScale, quantityScale, quoteScale,
-                    cancelRequested);
+                    nextStatus, seq + 1, createdAt, terminalTime(nextStatus, finalAt),
+                    priceScale, quantityScale, quoteScale, cancelRequested);
         }
 
         private OrderView toView() {
             return new OrderView(
                     orderId, userId, symbol, side, type, price, quantity, filledQuantity,
                     frozenCurrency, frozenAmount, status, seq, createdAt);
+        }
+
+        /**
+         * 进入终态（撤单 / 撮合完成）时固定 {@code finalAt}；部分成交、已支付等中间状态
+         * 保持 {@code null}。固定时间戳让同一委托重复投递的历史事件在 QuestDB 中可去重。
+         */
+        private static Instant terminalTime(OrderStatus status, Instant current) {
+            if (current != null) {
+                return current;
+            }
+            return status == OrderStatus.CANCELED || status == OrderStatus.FILLED
+                    ? Instant.now()
+                    : null;
+        }
+
+        /** 终态委托的历史快照；由调用方保证 {@code status} 是 CANCELED / FILLED。 */
+        private OrderHistoryEvent toHistoryEvent() {
+            return new OrderHistoryEvent(
+                    orderId, requestId, userId, symbol, side, type, status, price, quantity,
+                    filledQuantity, frozenCurrency, frozenAmount, priceScale, quantityScale,
+                    quoteScale, seq, createdAt, finalAt);
         }
 
         private OrderPlacedEvent toPlacedEvent() {
