@@ -37,7 +37,7 @@
 
 | # | 模块 | 包 / 文件夹 | 职责 | 关键类 | 向外依赖 |
 |---|---|---|---|---|---|
-| ① | **账户模块** | `com.me.account` | 开户、余额（available / frozen）、冻结与解冻、资金流水、对账口径 | `AccountService`、`AccountController`、`AccountIngressRing` | `shared` |
+| ① | **账户模块** | `com.me.account` | 开户、余额（available / frozen）、冻结与解冻、资金流水、对账口径 | `AccountService`、`AccountController` | `shared` |
 | ② | **币币模块** | `com.me.currency` | 币种、交易对（symbol）、价格/数量精度、最小下单量、费率档位、上下架；**下单接入**（同步校验后写入 Disruptor，聚合为 `OrderCommandBatch` 投递 `me.order.commands-batch`，不直接调用委托模块）；**用户历史流水查询**（经 shared 只读查询端口读取 QuestDB `funds_flow`，最新在前） | `PairService`、`OrderPlacementController`、`OrderCommandPublisher`、`OrderIngressRing`、`CurrencyConfigCache`、`UserFundsFlowController` | `shared` + `com.me.kafka` 基础设施 |
 | ③④ | **委托与撮合模块** | `com.me.order` + 内部纯 JDK 子包 `com.me.matching` | 消费 `me.order.commands-batch`（**唯一接单入口**）、参数与幂等校验、订单状态机、委托查询；撤单/改单（规划）；订单簿、价格-时间优先、成交生成；冻结回执后进程内撮合与成交清算 | `OrderCommandListener`、`OrderService`、`OrderMatchingService`、`MatchingEngine`、`OrderBook` | account、currency、`shared` |
 | ⑤ | **结算中心** | `com.me.settlement` | （规划）双边记账、手续费、资金划转、清算幂等、日终对账；当前仅保留包结构，结算逻辑在 account / order 内 | 规划 | account、order |
@@ -72,10 +72,10 @@ Client
   │ POST /api/v1/currency/orders
   ▼
 ② 币币模块 currency（校验：交易对/精度/最小下单量）
-  │ 命令写入 Disruptor；单聚合线程按「2000 条或 20ms」组装 OrderCommandBatch
+  │ 命令写入 Disruptor；单聚合线程按 symbol 放入 Map，任一 symbol 2000 条或 50ms 组装 OrderCommandBatch
   ▼
 Kafka me.order.commands-batch（8 分区，key=symbol，每个 symbol 一条批量消息）
-  │ ③④ 委托模块唯一接单入口 OrderCommandListener 消费，批内按列表顺序处理
+  │ ③④ 委托模块唯一接单入口 OrderCommandListener 消费，线程池并发保存委托，冻结命令按原顺序聚合
   ▼
 ③④ 委托与撮合模块 order（保存委托 → 发出冻结命令）
   │ 冻结资金
@@ -89,18 +89,19 @@ Kafka me.account.order-freeze-commands-batch（8 分区，key=symbol，每个 sy
 Kafka me.order.freeze-results-batch（8 分区，key=symbol，每个 symbol 一条批量回执）
   │ ③④ 委托与撮合模块消费冻结回执批量消息
   ▼
-③④ 委托模块 order 收到冻结成功回执
-  │ 进程内直接调用 MatchingEngine.place()
+③④ 委托模块 order 冻结回执消费端
+  │ 线程池并发推进委托（ACCEPTED → PAID / REJECTED），生成撮合单
+  │ 聚合撮合单，在引擎对象锁内调用 MatchingEngine.place()
   ▼
 MatchingEngine（订单簿，价格-时间优先，M0 集合版）
   │ 同步返回 MatchResult 成交对
   ▼
-③④ 委托模块 order 成交清算：PAID → PARTIALLY_FILLED / FILLED
+③④ 委托模块 order 线程池并发成交清算：PAID → PARTIALLY_FILLED / FILLED
   │
   ├─ 行情 Kafka me.marketdata-batch（key=symbol，每个 symbol 一条批量行情）
   │     ─▶ ⑥ 行情模块 marketdata（→ 成交明细 / K 线 → QuestDB）
   │
-  └─ 结算 Kafka me.account.settlements-batch（key=symbol，每个 symbol 一条批量结算消息，内含买方/卖方单用户命令）
+  └─ 结算 Kafka me.account.settlements-batch（按 userId slot 分区，每个 slot 一条批量结算消息，内含单用户命令）
         │
         ▼
      ① 账户模块 account（买方/卖方两条单用户命令分别结清，产出 me.funds-batch）
@@ -128,10 +129,10 @@ MatchingEngine（订单簿，价格-时间优先，M0 集合版）
 
 **七个关键决策**
 
-1. 撮合在委托模块冻结回执流程中进程内执行；冻结回执 runner 单线程，按消费顺序撮合，保证按 symbol 过滤后的价格-时间优先；`me.order.commands-batch` 与 `me.account.order-freeze-commands-batch` 都按 symbol 分区并可多 consumer 并行，同一 symbol 仍由单分区/单 consumer 串行处理；充值等非冻结资金命令留在 `me.account.commands`（key=userId）
+1. 撮合在委托模块冻结回执流程中进程内执行；冻结回执消费端用线程池并发推进委托状态与成交清算，撮合阶段在引擎对象锁内按回执顺序串行，保证按 symbol 过滤后的价格-时间优先；`me.order.commands-batch` 与 `me.account.order-freeze-commands-batch` 都按 symbol 分区并可多 consumer 并行，同一 symbol 仍由单分区/单 consumer 串行处理；充值等非冻结资金命令留在 `me.account.commands`（key=userId）
 2. 撮合在冻结回执线程内同步完成；行情、结算、K 线通过 Kafka 异步解耦
 3. 订单簿**先集合版、后数组化**：M0 用 `TreeMap` 价格梯 + `LinkedHashMap` FIFO + `HashMap` 索引，先把正确性与确定性跑通；数组化（分页价格梯 + 两级位图 + 64B 订单槽 + 侵入式 FIFO，全 O(1)、零分配）列为 M3，换实现不动 `OrderBook` 接口
-4. 批量：下单入口 Disruptor 按「2000 条或 20ms」聚合为 `OrderCommandBatch`；批量 topic 消费 `max.poll.records=10`（逐条的 `me.account.commands` 仍为 2000）+ `fetch.max.wait.ms=50ms` + `fetch.min.bytes≈1MB`，每个 poll 批次一个 Kafka 事务；整批回滚后在**新事务**中重投，账户拒绝按记录身份缓存、资金流水按 eventId 去重、QuestDB 按 poll 批次批量写入
+4. 批量：下单入口 Disruptor 按 symbol 维护 `Map<String, List<Order>>`，任一 symbol 达到 2000 条或 50ms 窗口到达时，把 map 中所有 symbol 的订单分别封装为 `OrderCommandBatch`；批量 topic 消费 `max.poll.records=10`（逐条的 `me.account.commands` 仍为 2000）+ `fetch.max.wait.ms=50ms` + `fetch.min.bytes≈1MB`，每个 poll 批次一个 Kafka 事务；整批回滚后在**新事务**中重投，账户拒绝按记录身份缓存、资金流水按 eventId 去重、QuestDB 按 poll 批次批量写入
 5. 确定性：冻结回执按 symbol 分区并行消费（同一 symbol 内仍单线程）、进程内按 symbol 串行撮合、整数运算；演示版**不缓存撮合输出**，同一订单的重复回执由匹配引擎按 `orderId` 去重，不再产生行情/结算；冻结按 symbol 分区后，同一用户的充值（key=userId）与冻结（key=symbol）可能由不同线程并发处理，余额正确性由账户分片锁保证，但两者先后不再全局确定；快照/内存恢复列为后续计划
 6. 资金预占前置，撮合器只接收已冻结订单
 7. 背压快速失败（Kafka buffer / consumer lag 水位），绝不无限排队
@@ -245,16 +246,17 @@ pwsh -File .\stop-kafka.ps1
 
 | topic | 分区 | 用途 |
 |---|---|---|
-| `me.order.commands-batch` | 8 | 委托命令批量消息（`key=symbol`，每个 symbol 一条，body=`OrderCommandBatch`；币币 REST 经 Disruptor 按「2000 条或 20ms」聚合，外部生产者需按同样格式写入；委托模块唯一接单入口，批内按列表顺序处理） |
+| `me.order.commands-batch` | 8 | 委托命令批量消息（`key=symbol`，每个 symbol 一条，body=`OrderCommandBatch`；币币 REST 经 Disruptor 按 symbol 攒批，任一 symbol 2000 条或 50ms flush，外部生产者需按同样格式写入；委托模块唯一接单入口，消费端线程池并发保存、冻结命令按原顺序聚合） |
+| `me.order.cancels-batch` | 8 | 撤单批量消息（`key=symbol`，每个 symbol 一条，body=`OrderCancelBatch`；币币 REST 经**独立撤单 Disruptor** 按「单 symbol 1000 条或 20ms」聚合，委托模块消费后撤销挂单并解冻剩余资金） |
 | `me.account.commands` | 8 | 充值 / 扣账等**非冻结**资金命令（`key=userId`，`logType` 指定业务日志类型；逐条消息） |
 | `me.account.order-freeze-commands-batch` | 8 | 下单冻结命令批量消息（`logType=ORDER_FREEZE`，`key=symbol`；每个 symbol 一条，body=`OrderFreezeCommandsBatch`；账户冻结按 symbol 分区并行，同一 symbol 内保序） |
 | `me.order.freeze-results-batch` | 8 | 下单冻结回执批量消息（`key=symbol`，每个 symbol 一条，body=`OrderFreezeResultBatch`；触发进程内撮合） |
 | `me.marketdata-batch` | 8 | 行情批量消息（`key=symbol`，每个 symbol 一条，body=`MarketDataBatch`；行情模块消费并落 QuestDB） |
-| `me.account.settlements-batch` | 8 | 单用户成交结算批量消息（`key=symbol`，每个 symbol 一条，body=`TradeSettlementBatch`；每笔成交拆成买方 `-b`、卖方 `-s` 两条命令，每个元素只含一个用户的资金腿） |
+| `me.account.settlements-batch` | 8 | 单用户成交结算批量消息（`key/partition=slot(userId)`，每个 slot 一条，body=`TradeSettlementBatch`；每笔成交拆成买方 `-b`、卖方 `-s` 两条命令，每个元素只含一个用户的资金腿） |
 | `me.funds-batch` | 8 | 资金流水批量消息（按 userId 哈希分区，每个分区每批一条，body=`FundsFlowBatch`；8 个 admin consumer 并行归档 QuestDB） |
 | `me.depth` | 8 | 深度 / BBO 事件（规划；当前代码未使用） |
 
-> 冻结回执、行情、结算按 symbol 分组（`key=symbol`），同一 symbol 的批次落在同一分区并保持顺序；资金流水按 userId 哈希分区，每个分区每批聚合一条批量消息。单条批量消息最多封装 2000 个元素，超过时拆成多条。旧的 `me.account.order-freeze-commands` / `me.order.freeze-results` / `me.marketdata` / `me.account.settlements` / `me.funds` topic 已由上述 `-batch` topic 取代，broker 中可能保留历史消息。
+> 下单、撤单、冻结回执、行情按 symbol 分组（`key=symbol`），同一 symbol 的批次落在同一分区并保持顺序；结算按 `slot(userId)` 分组（`key/partition=slot`），同一 slot 的清算命令保持顺序；资金流水按 userId 哈希分区，每个分区每批聚合一条批量消息。单条批量消息最多封装 2000 个元素，超过时拆成多条。旧的 `me.account.order-freeze-commands` / `me.order.freeze-results` / `me.marketdata` / `me.account.settlements` / `me.funds` topic 已由上述 `-batch` topic 取代，broker 中可能保留历史消息。
 
 > `me.orders` / `me.trades` 已从撮合链路退役（撮合改为委托模块进程内调用），broker 中可能仍保留历史消息；不再有消费者，可按需在停 broker 后清理。
 
@@ -266,16 +268,17 @@ pwsh -File .\stop-kafka.ps1
 2. **不要在 Windows 上删 topic**：删除要把 `topic-partition` 目录重命名成 `*-delete`，Windows 不允许重命名仍有打开句柄的目录，Kafka 会把整个 log dir 标记 failed 并**直接关闭 broker**（`Shutdown broker because all log dirs ... have failed`）。需要重建就停 broker 后手工删 `data\kraft-combined-logs\<topic>-*` 再启。
 3. 单节点 RF 只能 1，`acks=all` 的语义与 3 副本不同；吞吐/延迟的生产验收计划按 Linux 物理机口径（当前为本机 4C/8T 压测）。
 
-## 已实现：下单入口 Disruptor 批量聚合（2000 条或 20ms）
+## 已实现：下单入口 Disruptor 批量聚合（单 symbol 2000 条或 50ms）
 
 `POST /api/v1/currency/orders` 不再直接调用 producer，而是把命令非阻塞写入
 `OrderIngressRing`（LMAX Disruptor，多生产者 / 单 handler）：
 
 1. HTTP 线程：`tryPublishEvent` 入队，ring 满或未启动时返回 503，不阻塞、不无限排队；
-2. `order-ingress-handler` 单线程：把命令攒进待发送列表，达到
-   `app.currency.ingress.batch-size`（默认 **2000**）立即 flush；定时 tick 每
-   `app.currency.ingress.flush-interval-ms`（默认 **20ms**）触发一次 flush；
-3. flush 时按 symbol 分组，每个 symbol 一条 `OrderCommandBatch`（`key=symbol`），
+2. `order-ingress-handler` 单线程：维护 `Map<String, List<OrderCommand>>`，把订单按
+   symbol 放入对应列表；**任一** symbol 的列表达到
+   `app.currency.ingress.batch-size`（默认 **2000**）立即把整个 map flush；定时 tick 每
+   `app.currency.ingress.flush-interval-ms`（默认 **50ms**）触发一次 flush；
+3. flush 时把 map 中所有 symbol 分别封装成一条 `OrderCommandBatch`（`key=symbol`），
    由单实例幂等 producer 异步发送到 `me.order.commands-batch`，不等待 broker ack。
 
 同一 symbol 的命令在批次内保序，批次之间也按聚合线程的发送顺序进入同一分区；
@@ -293,7 +296,8 @@ pwsh -File .\stop-kafka.ps1
 `funds-flow=8` 起多个 runner，同组内按分区分配、并行消费。前三条按 symbol 分区，同一 symbol 内顺序不变；
 资金流水按 userId 哈希分区，8 个 consumer 并行写 QuestDB。撮合产出的行情与结算也按 symbol 分组发送。
 处理方法与原来一致，接收 `List<ConsumerRecord<...>>`，按顺序处理一个 poll 批次；
-下单 topic 的每条 record 是 `OrderCommandBatch`，批内再按 `msgList` 顺序逐条保存委托：
+下单 topic 的每条 record 是 `OrderCommandBatch`，批内订单提交线程池并发保存，结果再按
+`msgList` 顺序收集并聚合冻结命令：
 
 | 配置 | 值 | 说明 |
 |---|---|---|
@@ -430,10 +434,12 @@ curl "http://localhost:8080/api/v1/currency/funds-flows?userId=1001&limit=50"
 委托模块完成「接单 → 资金冻结 → 进程内撮合 → 成交清算」的闭环（余额、委托与订单簿仍是内存态，进程重启后丢失）：
 
 1. **接单入口**：币币模块 `POST /api/v1/currency/orders` 只做同步校验，把命令写入
-   `OrderIngressRing`，由聚合线程按「2000 条或 20ms」组装成 `OrderCommandBatch`
+   `OrderIngressRing`，由聚合线程按 symbol 攒入 `Map<String, List<OrderCommand>>`，
+   任一 symbol 达到 2000 条或 50ms 窗口到达时把 map 中所有 symbol 分别组装成 `OrderCommandBatch`
    投递 `me.order.commands-batch`（`key=symbol`），不直接调用委托模块；委托模块
-   `OrderCommandListener` 消费该 topic，是**唯一的下单方式与入口**。消费后按批内列表顺序
-   逐条生成委托并保存在内存 `ConcurrentHashMap<orderId, Order>`，初始状态 `ACCEPTED`（`seq=1`）。
+   `OrderCommandListener` 消费该 topic，是**唯一的下单方式与入口**。消费端把批内命令提交
+   线程池并发校验并保存在内存 `ConcurrentHashMap<orderId, Order>`，初始状态 `ACCEPTED`
+   （`seq=1`）；结果按批内原顺序收集，保证同一 symbol 的冻结命令顺序与下单顺序一致。
 2. **发出冻结命令**：委托模块按 symbol 分组，向 `me.account.order-freeze-commands-batch`
    （`key=symbol`）发送 `OrderFreezeCommandsBatch`（每个 symbol 一条，元素为 `FundsCommand`）：
    - `logType=ORDER_FREEZE`，`requestId=order-freeze:<orderId>`，`refId=orderId`；
@@ -446,10 +452,13 @@ curl "http://localhost:8080/api/v1/currency/funds-flows?userId=1001&limit=50"
    `me.funds-batch` 流水同事务提交。
 4. **更新为已支付**：委托模块消费回执，成功时 `ACCEPTED → PAID`（`seq+1`）；
    余额不足时 `ACCEPTED → REJECTED`，不撮合。
-5. **进程内撮合**：已支付委托以 `OrderPlacedEvent` 由 `OrderMatchingService` **直接调用**
-   `MatchingEngine.place()`，同步拿到 `MatchResult` 成交对；不再写 `me.orders`，也不再由 matching
-   模块消费 Kafka。撮合返回后委托模块立即做成交清算，并在同一个冻结回执监听事务里发布
-   `me.marketdata-batch` 与 `me.account.settlements-batch`。
+5. **进程内撮合与并发清算**：冻结回执消费端把回执提交线程池并发推进委托状态
+   （`ACCEPTED → PAID / REJECTED`），生成撮合单；按原回执顺序聚合后由
+   `OrderMatchingService.matchBatch` 在引擎对象锁内调用 `MatchingEngine.place()`，收集成交对；
+   再把成交清算提交线程池并发调用 `OrderMatchingService.clear`（内部 `OrderService.onTrade` /
+   `completeMarketBuy`），最后在同一个冻结回执监听事务里发布 `me.marketdata-batch` 与
+   `me.account.settlements-batch`。不再写 `me.orders`，也不再由 matching 模块消费 Kafka。
+   引擎对象锁覆盖撮合与清算两个阶段，撤单的引擎阶段会等待，避免与清算交错。
    - 冻结回执重复是正常路径：账户模块对重复 `requestId` 会再次发布回执，并可能再次执行冻结
      （演示版不做 requestId 防重）。委托已 `PAID` / `PARTIALLY_FILLED` / `FILLED` 时仍返回
      `placedEvent`，由撮合引擎按 `orderId` 返回 duplicate，**不再产生行情/结算**
@@ -470,7 +479,9 @@ curl "http://localhost:8080/api/v1/currency/funds-flows?userId=1001&limit=50"
 - **查询**：`OrderService.view(orderId)`，委托不存在返回 `null`；`OrderView` 携带状态、
   委托内状态序号 `seq`，以及冻结的币种和金额。`OrderService.openOrders(userId, symbol, limit)`
   返回用户当前未完成委托。
-- **未实现**：撤单 / 改单、手续费缓冲、委托记录持久化、日终对账。
+- **撤单**：`POST /api/v1/currency/orders/cancel`，独立 Disruptor + `me.order.cancels-batch`
+  批量消息，消费端线程池并发查询 / 更新委托，详见下文「撤单」。
+- **未实现**：改单、手续费缓冲、委托记录持久化、日终对账。
 
 ### 查询用户当前委托
 
@@ -489,18 +500,61 @@ curl "http://localhost:8080/api/v1/orders?userId=1001&limit=20"
 
 错误响应（400）：`USER_ID_REQUIRED` / `USER_ID_INVALID` / `SYMBOL_INVALID` / `LIMIT_INVALID`。
 
+### 撤单
+
+`POST /api/v1/currency/orders/cancel`（币币模块）。`symbol` 与 `orderId` 由前端提供，
+`requestId` 缺省由服务端生成，`userId` 可选（传入时校验委托归属）。接口只做同步校验并把
+撤单命令非阻塞写入**独立的撤单 Disruptor**；委托模块的 `OrderCancelListener` 消费
+`me.order.cancels-batch`，是系统唯一的撤单入口。
+
+```bash
+curl -X POST http://localhost:8080/api/v1/currency/orders/cancel \
+  -H "Content-Type: application/json" \
+  -d '{"requestId":"cancel-1","userId":1001,"symbol":"BTC-USDT","orderId":5002}'
+```
+
+成功返回 `202 Accepted`：
+
+```json
+{"success":true,"reason":null,"requestId":"cancel-1","orderId":5002,"symbol":"BTC-USDT"}
+```
+
+- **可撤状态**：`PAID`（已冻结、已进入撮合）与 `PARTIALLY_FILLED`；`ACCEPTED` 仍在冻结
+  回执途中，异步返回 `ORDER_NOT_PAID_YET`，前端稍后重试即可；`FILLED` / `CANCELED` /
+  `REJECTED` 不再产生解冻。
+- **撤单链路**（与下单一致，但使用独立 Disruptor 与 topic）：
+  1. HTTP 线程 `tryPublishEvent` 写入 `OrderCancelIngressRing`，ring 满或未启动返回 503；
+  2. `order-cancel-ingress-handler` 单线程把撤单按 symbol 放入 `Map<String,List>`；
+     任一 symbol 达到 1000 条或 20ms tick 到达时，把 map 中所有 symbol 的撤单分别封装成
+     `OrderCancelBatch`，按 `key=symbol` 发往 `me.order.cancels-batch`；
+  3. `OrderCancelListener` 消费批量消息：线程池并发查询委托并生成撮合撤消单 → 聚合后
+     在**引擎对象锁**内调用 `MatchingEngine.cancel` 并收集被撤销挂单 → 线程池并发把委托
+     推进为 `CANCELED` 并生成 `ORDER_UNFREEZE` 清算单 → 聚合清算单发送
+     `me.account.settlements-batch`；
+  4. 账户模块按 userId slot 结算解冻，资金流水 `logType=ORDER_UNFREEZE`。
+- **并发安全**：`MatchingEngine.place` 与 `cancel` 都是 `synchronized` 实例方法（引擎对象锁），
+  下单撮合与撤单不会同时修改订单簿。撤单在同一个锁内把委托标记为“撤单中”，
+  `OrderMatchingService.matchBatch` 在锁内检查该标记后才挂单，避免“撤单先生效、下单后挂单”
+  的幽灵挂单竞争。订单更新线程池按 orderId 原子推进，重复撤单不会重复解冻。
+- **解冻金额**：买单 `frozenAmount - settledQuoteAmount`（冻结计价币减已成交消耗），
+  卖单 `quantity - filledQuantity`（冻结基础币减已成交量）。
+- **消息契约**：`me.order.cancels-batch`（8 分区，`key=symbol`，body=`OrderCancelBatch`，
+  元素为 `OrderCancelCommand`）；消费组 `order-cancel-consumer`，8 个 consumer 按分区并行。
+- **演示版取舍**：与成交清算相同，Kafka 事务回滚后的重投可能丢失上一次未提交的解冻命令；
+  后续由备份消息与内存状态恢复解决。
+
 ### 本地验证
 
-先给用户充值，再下单。两种下单方式最终都写入同一个 `me.order.commands-batch` topic：
+先给用户充值，再下单。所有下单入口最终都写入同一个 `me.order.commands-batch` topic：
 
 ```powershell
 # 1) 充值 100000 USDT（topic me.account.commands，key=1001）
 #    {"requestId":"dep-1","userId":1001,"currency":"USDT","logType":"DEPOSIT","amount":100000,"refId":0}
-# 2a) 推荐：走币币模块 REST 下单（写入 Disruptor 聚合，返回 202）
+# 2a) 推荐：走币币模块 REST 单笔下单（写入 Disruptor 聚合，返回 202，orderId 由服务端生成）
 #     curl -X POST http://localhost:8080/api/v1/currency/orders -H "Content-Type: application/json" -d '{...}'
-# 2b) 或直接向 topic 生产批量命令（适合压测 / 外部接入）
-#     value 必须是 Fory 序列化的 OrderCommandBatch，key=symbol；
-#     历史压测方法与结果见 loadtest/TEST-REPORT.md（压测工具已清理）
+# 2b) 压测 / 外部批量接入：POST /api/v1/currency/orders/kafka-test-batch
+#     每批最多 10000 条，服务端逐单生成 orderId，见下文「批量下单测试接口（压测）」
+#     历史压测方法与结果见 loadtest/TEST-REPORT.md、loadtest/RESULTS-2026-11-13.md
 ```
 
 > 旧 topic `me.order.commands`（单条 `OrderCommand`）已由 `me.order.commands-batch`
@@ -510,13 +564,14 @@ curl "http://localhost:8080/api/v1/orders?userId=1001&limit=20"
 下单后的可观测信号：`me.marketdata-batch` 可消费到成交行情，`me.account.settlements-batch`
 可消费到结算命令，`me.orders` / `me.trades` 不再有新增消息。未充值或余额不足时，委托状态为
 `REJECTED`，不会撮合，可通过 `GET /api/v1/orders` 查询。
-重复发送同一个 `requestId` 只保存一次；同一 `orderId` 换 `requestId` 重复提交返回
-`ORDER_ID_ALREADY_EXISTS`。
+下单接口每次请求都由服务端生成新的 `orderId`，重复发送同一个 `requestId` 会产生新委托；
+委托模块内部的 `orderId + requestId` 去重只对直接写 Kafka 的外部生产者生效。
 
 ## 已实现：撮合内核 M0（集合版订单簿，委托模块进程内）
 
 `com.me.matching` 是**委托与撮合模块内部的纯 JDK 撮合内核**：冻结回执成功后，委托模块的
-`OrderMatchingService` 直接调用 `MatchingEngine.place()`，同步拿回 `MatchResult` 成交对并立即清算。
+`OrderMatchingService.matchBatch` 在引擎对象锁内调用 `MatchingEngine.place()` 收集成交对，
+`OrderMatchingService.clear` 在线程池中并发完成成交清算。
 撮合内核（`entity` / `service`）零 Spring、零 Kafka；`com.me.matching.mq` 已删除，只保留
 `matching.controller` 只读订单簿查询接口。`MatchingEngine` bean 仍由
 `com.me.config.MatchingConfig` 注册。
@@ -571,9 +626,11 @@ curl "http://localhost:8080/api/v1/orders?userId=1001&limit=20"
 ### 事件链路
 
 - 委托模块冻结回执 consumer（group `order-freeze-result-consumer`，当前 2 个 runner，
-  按 symbol 分区分配）调用 `OrderMatchingService.match(OrderPlacedEvent, partition, offset)`；
+  按 symbol 分区分配）先在线程池中并发推进委托状态，再调用
+  `OrderMatchingService.matchBatch(List<OrderPlacedEvent>)`，按原顺序在引擎对象锁内撮合；
 - `MatchingEngine.place()` 同步返回 `MatchResult`，按 `orderId` 幂等去重；
-- 委托模块先按 symbol 分组发布 `me.marketdata-batch` 行情批量消息，再发布
+- 成交清算在线程池中并发调用 `OrderMatchingService.clear`，委托状态推进后再聚合发送输出；
+- 委托模块先按 symbol 分组发布 `me.marketdata-batch` 行情批量消息，再按 userId slot 分组发布
   `me.account.settlements-batch` 结算批量消息（`amount` 已按交易对 / 币种精度换算成计价币最小单位）；
 - 行情/结算发送与 `me.order.freeze-results-batch` 消费 offset 在同一个 Kafka 事务内提交；
   行情模块按独立消费组消费 `me.marketdata-batch`（见「行情模块 M0」）。
@@ -584,22 +641,25 @@ curl "http://localhost:8080/api/v1/orders?userId=1001&limit=20"
 
 1. **撮合出成交对**：`MatchingEngine.place()` 同步返回每笔成交（taker / maker、价格、数量、金额），
    不再写入 `me.trades`。
-2. **委托清算**：`OrderMatchingService` 在冻结回执监听线程中逐笔调用 `OrderService.onTrade()`，
-   不再消费 `me.trades`：
+2. **委托清算**：`OrderMatchingService.clear` 在冻结回执消费端的订单更新线程池中并发调用
+   `OrderService.onTrade()`，不再消费 `me.trades`：
    - taker、maker 两笔委托同时推进 `filledQuantity`；
    - 状态 `PAID → PARTIALLY_FILLED → FILLED`，每次推进 `seq + 1`；
    - 成交对不做内存幂等缓存；重复清算由订单状态（已全部成交）拒绝，部分成交的重复回执不保证去重。
-3. **两条单用户命令**：每笔成交拆成买方、卖方两条 `TradeSettlementCommand` 写入
-   `me.account.settlements-batch`（group `account-trade-settlement-consumer`），
-   `requestId` 分别为 `<结算ID>-b` / `<结算ID>-s`：
+3. **两条单用户命令**：每笔成交拆成买方、卖方两条 `TradeSettlementCommand`，按 userId slot
+   分组、以 `key/partition=slot` 写入 `me.account.settlements-batch`
+   （group `account-trade-settlement-consumer`），`requestId` 分别为 `<结算ID>-b` / `<结算ID>-s`：
    - 买方：冻结计价币扣账（`TRADE_SETTLE_OUT`）、可用基础币到账（`TRADE_SETTLE_IN`）；
    - 卖方：冻结基础币扣账、可用计价币到账；
    - 买单全部成交且成交价优于限价时，买方命令附一条 `ORDER_UNFREEZE` 把多冻结的计价币释放回可用。
-4. **账户按命令原子结算**：账户模块对每条单用户命令涉及的账户分片锁内、先在副本上顺序执行
-   该命令的全部资金腿，全部腿成功后才写回余额；任一腿余额不足则该条命令不生效并抛错重试。
+4. **账户按命令原子结算**：`AccountSettlementListener` 把 poll 批次内的清算单按
+   `slot(第一腿 userId)` 分成最多 8 组，提交 `accountSettlementExecutor` 线程池并发结算；
+   同一 slot 的命令在组内按输入顺序串行。每条命令在涉及的账户分片锁内、先在副本上顺序执行
+   全部资金腿，全部腿成功后才写回余额；任一腿余额不足则该条命令不生效并抛错重试。
+   全部完成后按原始命令顺序汇合资金流水，发送 `me.funds-batch`（`FundsFlowBatch`）。
    买卖两侧是两条独立命令，不保证跨用户原子性，可能出现一侧已结算、另一侧重试中的短暂状态。
 
-### 消息示例（`me.account.settlements-batch` 中的 `TradeSettlementCommand` 元素，每笔成交两条，key=symbol）
+### 消息示例（`me.account.settlements-batch` 中的 `TradeSettlementCommand` 元素，每笔成交两条，key/partition=slot）
 
 ```json
 [
@@ -848,7 +908,8 @@ mysql --default-character-set=utf8mb4 -uadmin -padmin db_exchange < doc/mysql/pa
 ### 下单
 
 `POST /api/v1/currency/orders`（币币模块）。该接口只做同步校验，并把委托命令非阻塞写入
-Disruptor；聚合线程按「2000 条或 20ms」组装成 `OrderCommandBatch`，按 symbol 分组写入
+Disruptor；聚合线程按 symbol 维护 `Map<String, List<OrderCommand>>`，任一 symbol 达到
+2000 条或 50ms 后将 map 中所有 symbol 分别组装成 `OrderCommandBatch`，按 symbol 写入
 Kafka `me.order.commands-batch`（`key=symbol`，**不同步创建委托、不冻结资金**）；委托模块的
 `OrderCommandListener` 消费命令，是**唯一接单入口**。价格按 `10^-priceScale`、数量按
 `10^-quantityScale` 的整数提交；冻结 / 成交金额由后端按
@@ -857,7 +918,7 @@ Kafka `me.order.commands-batch`（`key=symbol`，**不同步创建委托、不�
 ```bash
 curl -X POST http://localhost:8080/api/v1/currency/orders \
   -H "Content-Type: application/json" \
-  -d '{"requestId":"req-1","orderId":5002,"userId":1001,
+  -d '{"requestId":"req-1","userId":1001,
        "symbol":"BTC-USDT","side":"BUY","type":"LIMIT","price":50000,"quantity":2}'
 ```
 
@@ -868,35 +929,66 @@ curl -X POST http://localhost:8080/api/v1/currency/orders \
   "success": true,
   "reason": null,
   "requestId": "req-1",
-  "orderId": 5002,
+  "orderId": 1794568772000001,
   "symbol": "BTC-USDT"
 }
 ```
 
 - **接口内同步部分**：基础字段校验 → 交易对存在且上线 → 最小下单量 / 金额 → 金额溢出 →
-  `requestId` / `orderId` 缺省生成 → 非阻塞写入 Disruptor（**不等待 Kafka 聚合或
-  broker ack**；202 只表示命令已进入 ring，ring 满时返回 503）。
+  `orderId` 由币币模块生成（`OrderIdGenerator`）、`requestId` 缺省生成 → 非阻塞写入
+  Disruptor（**不等待 Kafka 聚合或 broker ack**；202 只表示命令已进入 ring，ring 满时返回 503）。
 - **异步部分**：Kafka broker ack、委托保存、`ACCEPTED → PAID / REJECTED`、进程内撮合、
-  成交清算全部由委托模块消费 `me.order.commands-batch` 后推进。重复 `requestId`、同一 `orderId`
-  换 `requestId`（`ORDER_ID_ALREADY_EXISTS`）、余额不足（`REJECTED`）、成交状态都不会通过
-  本接口返回，可通过 `GET /api/v1/orders` 观察。
+  成交清算全部由委托模块消费 `me.order.commands-batch` 后推进。余额不足（`REJECTED`）、
+  成交状态、冻结失败等都不会通过本接口返回，可通过 `GET /api/v1/orders` 观察；
+  外部生产者直接写 Kafka 时，同一 `orderId` 换 `requestId` 会返回 `ORDER_ID_ALREADY_EXISTS`。
 - **模块边界**：币币模块不 import / 调用任何 `com.me.order` 类型或服务；
   `OrderCommandListener` 是唯一接单入口。
-- **字段**：`requestId` 缺省时服务端生成 UUID，客户端重试应带上；`orderId` 缺省时服务端生成，
-  也可显式传入（压测 / 对账场景）。
+- **字段**：`requestId` 缺省时服务端生成 UUID，客户端重试应带上；<b>`orderId` 始终由币币模块
+  生成，请求不接受客户端指定</b>。
 - **校验错误**（`400 Bad Request`）：`SYMBOL_NOT_FOUND`、`SYMBOL_NOT_TRADING`、
   `BELOW_MIN_ORDER_QUANTITY`、`BELOW_MIN_ORDER_AMOUNT`、`PRICE_REQUIRED_FOR_LIMIT`、
   `PRICE_NOT_ALLOWED_FOR_MARKET`、`QUANTITY_INVALID`、`AMOUNT_OVERFLOW`、
   `AMOUNT_REQUIRED_FOR_MARKET_BUY`、`AMOUNT_NOT_ALLOWED` 等。
 - **同步入队失败**（producer 已关闭、序列化失败、缓冲区满等）返回
   `503 Service Unavailable` + `ORDER_COMMAND_PUBLISH_FAILED`；入队后的 broker 侧发送失败
-  只在服务端记录错误日志，不会返回给调用方。客户端可用同一 `requestId` 重试；演示版委托模块只在
-  同一 `orderId + requestId` 时返回已有委托，不做 requestId 级别缓存。
+  只在服务端记录错误日志，不会返回给调用方。客户端重试会得到新的 `orderId`（即新委托）；
+  演示版委托模块不做 requestId 级别缓存，调用方需要幂等时应在接入层自行去重。
 - **REST 线程没有消费批次事务**：`OrderCommandPublisher` 通过 `KafkaRestPublisher` 的幂等、
   **非事务** producer 池异步发送（`enable.idempotence=true` + `acks=all`，只调用 `send`
   入队、不等待 ack）。下游消费端仍为 `read_committed`：非事务消息对 read_committed 消费者可见，
   不冲突；只有排在未提交事务之后的非事务消息会等到该事务结束（LSO），不会丢消息或乱序。
-- **未实现**：撤单、鉴权、小数价格 / 数量的精度换算（接口只收最小单位整数）。
+- **未实现**：鉴权、小数价格 / 数量的精度换算（接口只收最小单位整数）。撤单接口见上文
+  「撤单」。
+
+### 批量下单测试接口（压测）
+
+`POST /api/v1/currency/orders/kafka-test-batch`（兼容 `/kafkaTestBatch`）用于压测 / 外部批量接入：
+一次提交多条下单请求，服务端逐单校验并由币币模块生成 `orderId`，再写入与单笔下单相同的
+Disruptor，后续 Kafka 聚合、冻结、撮合链路完全一致。请求同样**不携带 `orderId`**。
+
+```bash
+curl -X POST http://localhost:8080/api/v1/currency/orders/kafka-test-batch \
+  -H "Content-Type: application/json" \
+  -d '{"orders":[
+        {"requestId":"b-1","userId":1001,"symbol":"BTC-USDT","side":"BUY","type":"LIMIT","price":1000000,"quantity":1000000},
+        {"requestId":"b-2","userId":1001,"symbol":"ETH-USDT","side":"SELL","type":"LIMIT","price":300000,"quantity":10000000}
+      ]}'
+```
+
+成功返回 `202 Accepted`：
+
+```json
+{"success":true,"reason":null,"accepted":2,"rejected":0,
+ "firstOrderId":1794572489845001,"lastOrderId":1794572489845002,
+ "firstRejectReason":null}
+```
+
+- 单条校验失败不影响其它条目，`accepted` / `rejected` 分别计数，`firstRejectReason` 返回
+  第一条拒绝原因；
+- 单次请求上限 10,000 条，超过返回 `400 BATCH_TOO_LARGE`；空数组返回 `400 ORDERS_REQUIRED`；
+- 命令进入 ring 后异步推进，202 不代表委托已保存或已冻结；ring 满或发布失败返回
+  `503 ORDER_COMMAND_PUBLISH_FAILED`，已受理条数仍会回传；
+- 该接口与单笔接口共用同一套校验、委托号生成与 Kafka 聚合链路，仅用于压测 / 批量接入。
 
 ### 账户余额查询
 
@@ -987,6 +1079,7 @@ curl -X POST http://localhost:8080/api/v1/admin/recharges \
 | 资产余额 | `GET /api/v1/accounts/{userId}/balances` | 5s |
 | 币种精度 | `GET /api/v1/currencies` | 60s |
 | 下单委托 | `POST /api/v1/currency/orders`（202，异步提交） | 手动 |
+| 撤单委托 | `POST /api/v1/currency/orders/cancel`（202，异步提交） | 手动 |
 | 模拟登录 / 充值 | `POST /api/v1/admin/recharges` | 手动 |
 | 用户历史流水 | `GET /api/v1/currency/funds-flows` | 5s |
 | 后台流水管理 | `GET/DELETE /api/v1/admin/funds-flows` | 手动 |
@@ -999,7 +1092,8 @@ curl -X POST http://localhost:8080/api/v1/admin/recharges \
   累计深度条，中间行展示最新成交价、买卖盘上下各半空间；最新成交展示价格 / 数量 / 时间，
   均 3 秒轮询）；1m 蜡烛图 + 成交量柱
   （缩放 / 拖拽、十字光标 OHLC 图例）；图表下方「当前委托 / 历史流水」面板通过顶部标签
-  切换：当前委托显示方向、价格、数量、已成交与状态（3 秒轮询），历史流水展示当前用户
+  切换：当前委托显示方向、价格、数量、已成交、状态与「撤单」操作（3 秒轮询；`PAID` /
+  `PARTIALLY_FILLED` 可撤，`ACCEPTED` 等待冻结完成后可撤），历史流水展示当前用户
   QuestDB `funds_flow` 记录，按发生时间倒序、最新在前（5 秒轮询）；资产余额
   （可用 / 冻结，按币种精度换算）；限价 / 市价、
   买入 / 卖出表单（25% / 50% / 75% / 100% 快捷填量，提交前校验最小下单量与最小金额，

@@ -80,7 +80,7 @@ app:
       # 逐条 topic 处理 2000 条会阻塞 poll；给足余量，避免批次处理期间触发 rebalance
       max-poll-interval-ms: 600000
       session-timeout-ms: 45000
-      # 预取下一批的 poll 超时；0 = 非阻塞，只推动 fetch 管线（详见 account ingress）
+      # 预取下一批的 poll 超时；0 = 非阻塞，只推动 fetch 管线
       prefetch-poll-timeout-ms: 0
       # 各 stage 的并发 consumer 数，未配置默认 1。
       # order-command 的消息体是 OrderCommandBatch，key=symbol，同一 symbol 只落一个分区、
@@ -89,6 +89,9 @@ app:
       # account / freeze-result 等仍为单 consumer，保序语义不变。
       concurrency:
         order-command: 8
+        # 撤单 topic 按 symbol 分区：8 个 consumer 对应 8 分区，不同 symbol 的撤单并行处理，
+        # 同一 symbol 仍由单 consumer 串行（消费端再用线程池并发查询 / 更新委托）。
+        order-cancel: 8
         # 订单冻结按 symbol 分区后，账户冻结阶段可以按分区并行；同一 symbol 仍由单 consumer
         # 串行处理，价格-时间优先不变。
         account-order-freeze: 8
@@ -121,6 +124,8 @@ app:
       # ORDER_FREEZE 单独一条链路，key=symbol，每个 symbol 一条批量消息，与充值（key=userId）解耦
       account-order-freeze-commands: me.account.order-freeze-commands-batch
       order-commands: me.order.commands-batch
+      # 撤单批量消息：独立 Disruptor 按「单 symbol 1000 条或 20ms」聚合，key=symbol
+      order-cancels: me.order.cancels-batch
       account-settlements: me.account.settlements-batch
       order-freeze-results: me.order.freeze-results-batch
       market-data: me.marketdata-batch
@@ -131,6 +136,7 @@ app:
       account-order-freeze: account-order-freeze-consumer
       account-settlement: account-trade-settlement-consumer
       order: order-command-consumer
+      order-cancel: order-cancel-consumer
       order-freeze-result: order-freeze-result-consumer
       marketdata: marketdata-trade-consumer
       admin: admin-funds-flow
@@ -140,24 +146,42 @@ app:
 
   currency:
     ingress:
-      # HTTP 下单先非阻塞写入 Disruptor，单 handler 线程按「2000 条或 20ms」聚合，
-      # 再按 symbol 分组发送 OrderCommandBatch 批量消息到 me.order.commands-batch（key=symbol）。
+      # HTTP 下单先非阻塞写入 Disruptor，handler 维护 Map<symbol, List<订单>>；
+      # 任一 symbol 达到 batch-size 或定时 tick 到达时，把 map 中所有 symbol 的订单
+      # 分别封装成 OrderCommandBatch（key=symbol）发往 me.order.commands-batch。
       # ring 槽位数，必须是 2 的幂；满时下单接口返回 503，不无限排队。
       ring-size: 65536
-      # 单个聚合批次的最大命令数；达到即发送
+      # 单个 symbol 的待发送订单达到该数量即 flush 整个 map
       batch-size: 2000
       # 聚合时间窗口（ms）；定时 tick 触发发送，命令最多等待这么久
+      flush-interval-ms: 50
+
+    # 撤单入口：与下单入口独立的 Disruptor。handler 维护 Map<symbol, List<撤单>>，
+    # 任一 symbol 达到 batch-size 或定时 tick 到达时，把 map 中所有 symbol 的撤单
+    # 分别封装成 OrderCancelBatch（key=symbol）发往 me.order.cancels-batch。
+    cancel-ingress:
+      # ring 槽位数，必须是 2 的幂；满时撤单接口返回 503
+      ring-size: 65536
+      # 单个 symbol 的待发送撤单达到该数量即 flush 整个 map
+      batch-size: 1000
+      # 聚合时间窗口（ms）；命令最多等待这么久
       flush-interval-ms: 20
 
+  order:
+    command:
+      # 下单消费端并发保存订单 / 生成冻结命令的线程池大小
+      worker-threads: 8
+    freeze-result:
+      # 冻结回执消费端并发推进订单 / 成交清算的线程池大小
+      worker-threads: 8
+    cancel:
+      # 撤单消费端查询委托 / 更新委托的线程池大小
+      worker-threads: 8
+
   account:
-    ingress:
-      # 压测结论：ring 无吞吐收益，且 account 侧端到端更慢（stage5 p50 563ms vs 55ms），
-      # 默认关闭，退回「poll 线程直连 listener」；要 A/B 时用 --app.account.ingress.disruptor-enabled=true 打开
-      disruptor-enabled: false
-      # 必须为 2 的幂；每个 slot 只放一个 poll 批次引用
-      ring-size: 1024
-      # poll 线程等待 handler 处理完一批的上限
-      handler-timeout-ms: 30000
+    settlement:
+      # 成交清算消费端按 userId slot 分组并发结算的线程池大小
+      worker-threads: 8
 
   marketdata:
     # 需要多个周期时改成 1m,5m,15m,30m,1h,4h,1d

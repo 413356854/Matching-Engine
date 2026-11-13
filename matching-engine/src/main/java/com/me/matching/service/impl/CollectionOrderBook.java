@@ -132,6 +132,30 @@ public final class CollectionOrderBook implements OrderBook {
     }
 
     /**
+     * 从订单簿移除挂单：市价单直接查对应方向的 FIFO 映射；限价单按方向 + 价格直接定位
+     * 价格档位，再按 orderId 移除。价格档位被撤空时同步删除该档位，避免深度快照出现
+     * 0 数量的空档。撤单不移除去重集合中的 orderId，重复的冻结回执仍会返回 duplicate，
+     * 不会把已撤委托重新挂回订单簿。
+     */
+    @Override
+    public synchronized BookOrder cancel(long orderId, OrderSide side, OrderType type,
+                                         long price) {
+        if (type == OrderType.MARKET) {
+            return marketBook(side).remove(orderId);
+        }
+        NavigableMap<Long, LinkedHashMap<Long, BookOrder>> book = limitBook(side);
+        LinkedHashMap<Long, BookOrder> level = book.get(price);
+        if (level == null) {
+            return null;
+        }
+        BookOrder removed = level.remove(orderId);
+        if (removed != null && level.isEmpty()) {
+            book.remove(price);
+        }
+        return removed;
+    }
+
+    /**
      * 与对手方限价价格梯撮合。买盘吃卖盘（价格从低到高），卖盘吃买盘（价格从高到低）；
      * 新委托是限价单时只吃到自己的限价为止，市价单则一路吃到没有可成交的限价单。
      */

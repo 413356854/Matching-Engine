@@ -11,16 +11,17 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * 唯一的订单聚合线程：把 RingBuffer 中的命令攒成批量消息。
+ * 下单 Disruptor 的唯一聚合线程：把订单按 symbol 攒进 {@code Map<String, List>}。
  *
- * <p>flush 触发条件：
+ * <p>flush 触发条件（任一满足即把 map 中<b>所有 symbol</b> 的订单打包发送）：
  * <ul>
- *   <li>待发送命令达到 {@code app.currency.ingress.batch-size}（默认 2000）；</li>
- *   <li>收到定时 tick（默认每 20ms）且有待发送命令。</li>
+ *   <li>任一 symbol 的待发送列表达到 {@code app.currency.ingress.batch-size}
+ *       （默认 2000）；</li>
+ *   <li>收到定时 tick（默认每 50ms）且 map 非空。</li>
  * </ul>
  *
  * <p>一次 flush 按 symbol 分组，每个 symbol 一条 {@code OrderCommandBatch}（{@code key=symbol}）。
- * 同一 symbol 的命令顺序在批次内保持不变，批次之间也按本线程的发送顺序进入同一分区，
+ * 同一 symbol 的订单顺序在批次内保持不变，批次之间也按本线程的发送顺序进入同一分区，
  * 因此价格-时间优先依赖的下单顺序不变。
  *
  * <p>本线程只做内存聚合和 Kafka {@code send} 入队，不等待 broker ack；发送失败记日志后
@@ -32,12 +33,11 @@ final class OrderIngressHandler implements EventHandler<OrderIngressEvent> {
 
     private final int batchSize;
     private final OrderBatchSender sender;
-    private final List<PendingCommand> pending;
+    private final Map<String, List<OrderCommand>> pendingBySymbol = new LinkedHashMap<>();
 
     OrderIngressHandler(OrderIngressProperties properties, OrderBatchSender sender) {
         this.batchSize = properties.batchSize();
         this.sender = sender;
-        this.pending = new ArrayList<>(properties.batchSize());
     }
 
     @Override
@@ -59,8 +59,10 @@ final class OrderIngressHandler implements EventHandler<OrderIngressEvent> {
         if (command == null) {
             return;
         }
-        pending.add(new PendingCommand(command));
-        if (pending.size() >= batchSize) {
+        List<OrderCommand> orders = pendingBySymbol.computeIfAbsent(
+                command.symbol(), ignored -> new ArrayList<>());
+        orders.add(command);
+        if (orders.size() >= batchSize) {
             flush();
         }
     }
@@ -70,43 +72,21 @@ final class OrderIngressHandler implements EventHandler<OrderIngressEvent> {
         flush();
     }
 
-    /** 把当前待发送命令按 symbol 分组发送。 */
+    /** 把当前 map 中所有 symbol 的订单按 symbol 分组发送，并清空 map。 */
     void flush() {
-        if (pending.isEmpty()) {
+        if (pendingBySymbol.isEmpty()) {
             return;
         }
-        Map<String, Group> groups = new LinkedHashMap<>();
-        for (PendingCommand pendingCommand : pending) {
-            OrderCommand command = pendingCommand.command();
-            groups.computeIfAbsent(command.symbol(), ignored -> new Group())
-                    .add(command);
-        }
-        pending.clear();
+        Map<String, List<OrderCommand>> batch = new LinkedHashMap<>(pendingBySymbol);
+        pendingBySymbol.clear();
 
-        for (Map.Entry<String, Group> entry : groups.entrySet()) {
-            Group group = entry.getValue();
+        for (Map.Entry<String, List<OrderCommand>> entry : batch.entrySet()) {
             try {
-                sender.send(entry.getKey(), group.commands());
+                sender.send(entry.getKey(), entry.getValue());
             } catch (RuntimeException e) {
                 log.error("order command batch send failed: symbol={}, size={}",
-                        entry.getKey(), group.commands().size(), e);
+                        entry.getKey(), entry.getValue().size(), e);
             }
-        }
-    }
-
-    private record PendingCommand(OrderCommand command) {
-    }
-
-    private static final class Group {
-
-        private final List<OrderCommand> commands = new ArrayList<>();
-
-        void add(OrderCommand command) {
-            commands.add(command);
-        }
-
-        List<OrderCommand> commands() {
-            return commands;
         }
     }
 }

@@ -5,13 +5,15 @@ import com.me.matching.entity.BookOrder;
 import com.me.matching.vo.DepthSnapshot;
 import com.me.shared.order.OrderPlacedEvent;
 import com.me.shared.order.OrderSide;
+import com.me.shared.order.OrderType;
 
 /**
  * 单个交易对的订单簿。
  *
- * <p>撮合写入仍由单线程驱动：生产形态下 Kafka key=symbol 保证同一交易对落在同一分区、
- * 由单线程消费（见 README「七个关键决策」）。实现需要额外保证 REST 深度查询和撮合写入
- * 不会同时修改 / 遍历内部结构，具体同步策略由实现决定。
+ * <p>撮合写入由 {@code MatchingEngine} 的引擎对象锁串行化：下单撮合与撤单不会同时进入
+ * 同一订单簿；生产形态下 Kafka key=symbol 还保证同一交易对的命令落在同一分区、按序消费。
+ * 实现需要额外保证 REST 深度查询和撮合写入不会同时修改 / 遍历内部结构，具体同步策略
+ * 由实现决定。
  */
 public interface OrderBook {
 
@@ -22,6 +24,16 @@ public interface OrderBook {
      * 同一 {@code orderId} 重复投递时返回 {@link MatchResult#duplicate}，不会二次撮合。
      */
     MatchResult place(OrderPlacedEvent order);
+
+    /**
+     * 撤单：从订单簿移除指定 orderId 的挂单。
+     *
+     * <p>{@code side} / {@code type} / {@code price} 用于直接定位挂单所在的价格梯或市价簿；
+     * 委托的方向、类型、价格在生命周期内不变。返回被移除的挂单（携带撤消时的剩余数量）；
+     * 委托不在簿中（已全部成交、尚未挂单或重复撤单）时返回 {@code null}。已成交过的
+     * orderId 仍会保留在去重集合中，防止重复下单事件在撤单后再次挂单。
+     */
+    BookOrder cancel(long orderId, OrderSide side, OrderType type, long price);
 
     /**
      * 只读深度快照：按价格聚合前 {@code levels} 个价位。

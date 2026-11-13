@@ -19,7 +19,8 @@ import org.springframework.stereotype.Component;
  * 按 userId slot 拆给 8 个线程并发执行；冻结、清算、充值仍共用 {@code slot(userId)}
  * 的账户锁。
  *
- * <p>只由委托模块的 Kafka 消费链路在冻结回执批次事务内发送；REST 下单不再直接触发冻结。
+ * <p>只由 {@code OrderCommandListener} 在委托命令消费批次的事务内发送；REST 下单不再直接
+ * 触发冻结。
  */
 @Component
 public class OrderFreezeCommandPublisher {

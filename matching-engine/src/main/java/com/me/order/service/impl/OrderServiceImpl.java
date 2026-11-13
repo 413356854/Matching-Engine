@@ -3,6 +3,10 @@ package com.me.order.service.impl;
 import com.me.account.dto.FundsCommand;
 import com.me.account.dto.TradeSettlementCommand;
 import com.me.order.dto.OrderApplyResult;
+import com.me.order.dto.OrderCancelApplyResult;
+import com.me.order.dto.OrderCancelBeginResult;
+import com.me.order.dto.OrderCancelContext;
+import com.me.order.dto.OrderCancelPrepareResult;
 import com.me.order.dto.OrderFreezeApplyResult;
 import com.me.order.dto.OrderTradeApplyResult;
 import com.me.order.service.OrderService;
@@ -123,7 +127,8 @@ public class OrderServiceImpl implements OrderService {
                 Instant.now(),
                 command.priceScale(),
                 command.quantityScale(),
-                command.quoteScale());
+                command.quoteScale(),
+                false);
 
         Order existing = orders.putIfAbsent(order.orderId(), order);
         if (existing != null) {
@@ -354,6 +359,132 @@ public class OrderServiceImpl implements OrderService {
         return result == null ? OrderTradeApplyResult.ignored("ORDER_NOT_FOUND") : result;
     }
 
+    @Override
+    public OrderCancelPrepareResult prepareCancel(long orderId, long userId, String symbol) {
+        if (orderId <= 0) {
+            return OrderCancelPrepareResult.rejected("ORDER_ID_INVALID");
+        }
+        if (symbol == null || symbol.isBlank()) {
+            return OrderCancelPrepareResult.rejected("SYMBOL_REQUIRED");
+        }
+        String normalizedSymbol = symbol.strip().toUpperCase(Locale.ROOT);
+        Order order = orders.get(orderId);
+        if (order == null) {
+            return OrderCancelPrepareResult.rejected("ORDER_NOT_FOUND");
+        }
+        if (!order.symbol().equals(normalizedSymbol)) {
+            return OrderCancelPrepareResult.rejected("SYMBOL_MISMATCH");
+        }
+        if (userId > 0 && order.userId() != userId) {
+            return OrderCancelPrepareResult.rejected("USER_MISMATCH");
+        }
+        return switch (order.status()) {
+            case PAID, PARTIALLY_FILLED -> OrderCancelPrepareResult.ready(new OrderCancelContext(
+                    order.orderId(), order.userId(), order.symbol(), order.side(), order.type(),
+                    order.price(), order.status(), order.quantity(), order.filledQuantity(),
+                    order.frozenCurrency(), order.frozenAmount(), order.settledQuoteAmount()));
+            // 已受理但冻结回执未到：此时撤销会与回执竞争，拒绝并让调用方稍后重试。
+            case ACCEPTED -> OrderCancelPrepareResult.rejected("ORDER_NOT_PAID_YET");
+            case CANCELED -> OrderCancelPrepareResult.rejected("ORDER_ALREADY_CANCELED");
+            case FILLED -> OrderCancelPrepareResult.rejected("ORDER_ALREADY_FILLED");
+            case REJECTED -> OrderCancelPrepareResult.rejected("ORDER_REJECTED");
+        };
+    }
+
+    @Override
+    public OrderCancelBeginResult beginCancel(OrderCancelContext context) {
+        if (context == null || context.orderId() <= 0) {
+            return OrderCancelBeginResult.rejected("CANCEL_CONTEXT_INVALID");
+        }
+        AtomicReference<OrderCancelBeginResult> resultRef = new AtomicReference<>();
+        orders.computeIfPresent(context.orderId(), (orderId, order) -> {
+            if (!order.symbol().equals(context.symbol())) {
+                resultRef.set(OrderCancelBeginResult.rejected("SYMBOL_MISMATCH"));
+                return order;
+            }
+            if (order.cancelRequested()) {
+                // 同一撤单命令重试 / 批内重复：标记已存在，继续交给更新阶段（幂等）。
+                resultRef.set(OrderCancelBeginResult.allowed());
+                return order;
+            }
+            if (order.status() != OrderStatus.PAID
+                    && order.status() != OrderStatus.PARTIALLY_FILLED) {
+                resultRef.set(OrderCancelBeginResult.rejected(
+                        "ORDER_STATUS_" + order.status()));
+                return order;
+            }
+            resultRef.set(OrderCancelBeginResult.allowed());
+            return order.withCancelRequested();
+        });
+        OrderCancelBeginResult result = resultRef.get();
+        return result == null
+                ? OrderCancelBeginResult.rejected("ORDER_NOT_FOUND")
+                : result;
+    }
+
+    @Override
+    public boolean isCancelPending(long orderId) {
+        Order order = orders.get(orderId);
+        return order != null && order.cancelRequested();
+    }
+
+    @Override
+    public OrderCancelApplyResult applyCancel(OrderCancelContext context) {
+        if (context == null || context.orderId() <= 0) {
+            return OrderCancelApplyResult.ignored("CANCEL_CONTEXT_INVALID");
+        }
+        AtomicReference<OrderCancelApplyResult> resultRef = new AtomicReference<>();
+        orders.computeIfPresent(context.orderId(), (orderId, order) -> {
+            if (!order.symbol().equals(context.symbol())) {
+                resultRef.set(OrderCancelApplyResult.ignored("SYMBOL_MISMATCH"));
+                return order;
+            }
+            if (order.status() != OrderStatus.PAID
+                    && order.status() != OrderStatus.PARTIALLY_FILLED) {
+                // 撤单准备后可能被成交清算或另一条撤单命令抢先推进；不重复解冻。
+                resultRef.set(OrderCancelApplyResult.ignored("ORDER_STATUS_" + order.status()));
+                return order;
+            }
+
+            // 买单冻结计价币，已成交部分按 settledQuoteAmount 扣减；卖单冻结基础币，
+            // 已成交部分按 filledQuantity 扣减。剩余冻结在撤单时全部退回可用。
+            long consumed = order.side() == OrderSide.BUY
+                    ? order.settledQuoteAmount()
+                    : order.filledQuantity();
+            long refund = order.frozenAmount() - consumed;
+            if (refund < 0) {
+                log.warn("cancel refund negative, clamp to zero: orderId={}, frozen={}, consumed={}",
+                        orderId, order.frozenAmount(), consumed);
+                refund = 0L;
+            }
+
+            Order canceled = order.withStatus(OrderStatus.CANCELED);
+            if (refund == 0) {
+                resultRef.set(OrderCancelApplyResult.canceled(0L, List.of()));
+                log.info("order canceled without refund: orderId={}, status={}",
+                        orderId, order.status());
+                return canceled;
+            }
+
+            long settlementId = tradeSettlementIdGenerator.getAndIncrement();
+            TradeSettlementCommand command = new TradeSettlementCommand(
+                    Long.toString(settlementId) + "-c",
+                    0L,
+                    order.symbol(),
+                    order.orderId(),
+                    0L,
+                    List.of(new TradeSettlementCommand.SettlementLeg(
+                            order.userId(), order.frozenCurrency(),
+                            FundsLogType.ORDER_UNFREEZE, refund)));
+            resultRef.set(OrderCancelApplyResult.canceled(refund, List.of(command)));
+            log.info("order canceled: orderId={}, filledQuantity={}, refund={} {}",
+                    orderId, order.filledQuantity(), refund, order.frozenCurrency());
+            return canceled;
+        });
+        OrderCancelApplyResult result = resultRef.get();
+        return result == null ? OrderCancelApplyResult.ignored("ORDER_NOT_FOUND") : result;
+    }
+
     private OrderFill fillOrder(long orderId, TradeEvent trade) {
         AtomicReference<OrderFill> resultRef = new AtomicReference<>();
         orders.computeIfPresent(orderId, (id, order) -> {
@@ -542,12 +673,25 @@ public class OrderServiceImpl implements OrderService {
             Instant createdAt,
             int priceScale,
             int quantityScale,
-            int quoteScale) {
+            int quoteScale,
+            boolean cancelRequested) {
 
         private Order withStatus(OrderStatus newStatus) {
             return new Order(requestId, orderId, userId, symbol, side, type, price, quantity,
                     frozenCurrency, frozenAmount, filledQuantity, settledQuoteAmount,
-                    newStatus, seq + 1, createdAt, priceScale, quantityScale, quoteScale);
+                    newStatus, seq + 1, createdAt, priceScale, quantityScale, quoteScale,
+                    cancelRequested);
+        }
+
+        /**
+         * 标记撤单开始：在引擎对象锁内原子设置，阻止后续撮合把委托重新挂回订单簿。
+         * 该标记不改变对外可见状态与 seq，真正的 {@code CANCELED} 推进由
+         * {@code applyCancel} 完成。
+         */
+        private Order withCancelRequested() {
+            return new Order(requestId, orderId, userId, symbol, side, type, price, quantity,
+                    frozenCurrency, frozenAmount, filledQuantity, settledQuoteAmount,
+                    status, seq, createdAt, priceScale, quantityScale, quoteScale, true);
         }
 
         /**
@@ -567,7 +711,8 @@ public class OrderServiceImpl implements OrderService {
                     : 0L;
             return new Order(requestId, orderId, userId, symbol, side, type, price, quantity,
                     frozenCurrency, frozenAmount, filled, nextSettledQuote,
-                    nextStatus, seq + 1, createdAt, priceScale, quantityScale, quoteScale);
+                    nextStatus, seq + 1, createdAt, priceScale, quantityScale, quoteScale,
+                    cancelRequested);
         }
 
         private OrderView toView() {

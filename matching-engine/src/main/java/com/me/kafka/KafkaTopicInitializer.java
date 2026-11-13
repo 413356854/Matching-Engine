@@ -18,7 +18,7 @@ import org.springframework.stereotype.Component;
 import static org.apache.kafka.clients.admin.AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG;
 
 /**
- * 用裸 {@link AdminClient} 创建 6 个 topic（8 分区、RF=1）。
+ * 用裸 {@link AdminClient} 创建 {@code app.kafka.topics} 中配置的全部 topic（默认 8 分区、RF=1）。
  *
  * <p>后台线程执行、失败每 5s 重试，不阻塞应用启动；已存在的 topic 只校验分区数，
  * 避免 broker 自动创建成默认 1 分区。对应原 Spring Kafka 的 {@code KafkaAdmin} +

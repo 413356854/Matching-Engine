@@ -1,6 +1,15 @@
 import { useMemo, useState } from 'react';
-import type { FundsFlow, OrderStatus, OrderView, TradingPair } from '../api';
+import {
+  ApiError,
+  cancelOrder,
+  type FundsFlow,
+  type OrderStatus,
+  type OrderView,
+  type TradingPair,
+} from '../api';
+import { describeError } from '../errors';
 import { formatDateTime, formatPrice, formatQuantity, formatUnits } from '../format';
+import type { ToastKind } from './ToastStack';
 
 interface AccountActivityPanelProps {
   pairs: TradingPair[];
@@ -9,6 +18,9 @@ interface AccountActivityPanelProps {
   flows: FundsFlow[];
   flowsError: string | null;
   currencyScales: Record<string, number>;
+  userId: number;
+  onOrderCanceled: () => void;
+  notify: (kind: ToastKind, text: string) => void;
 }
 
 type ActivityTab = 'orders' | 'flows';
@@ -61,13 +73,46 @@ export function AccountActivityPanel({
   flows,
   flowsError,
   currencyScales,
+  userId,
+  onOrderCanceled,
+  notify,
 }: AccountActivityPanelProps) {
   const [tab, setTab] = useState<ActivityTab>('orders');
+  const [cancelingOrderId, setCancelingOrderId] = useState<number | null>(null);
 
   const pairMap = useMemo(
     () => new Map(pairs.map((item) => [item.symbol, item])),
     [pairs],
   );
+
+  // 与后端可撤状态一致：已冻结进入撮合（PAID）或部分成交的委托可以撤单；
+  // ACCEPTED 仍在冻结回执途中，点击后由后端返回 ORDER_NOT_PAID_YET，前端先禁用。
+  const cancelable = (order: OrderView) =>
+    order.status === 'PAID' || order.status === 'PARTIALLY_FILLED';
+
+  const handleCancel = async (order: OrderView) => {
+    if (cancelingOrderId !== null) {
+      return;
+    }
+    setCancelingOrderId(order.orderId);
+    try {
+      const response = await cancelOrder({
+        requestId: crypto.randomUUID(),
+        userId,
+        symbol: order.symbol,
+        orderId: order.orderId,
+      });
+      if (!response.success) {
+        throw new ApiError(response.reason ?? 'CANCEL_REJECTED', 400, response);
+      }
+      notify('success', `撤单指令已提交：#${order.orderId}`);
+      onOrderCanceled();
+    } catch (error) {
+      notify('error', describeError(error));
+    } finally {
+      setCancelingOrderId(null);
+    }
+  };
 
   const count = tab === 'orders' ? orders.length : flows.length;
   const error = tab === 'orders' ? ordersError : flowsError;
@@ -117,6 +162,7 @@ export function AccountActivityPanel({
                 <th className="align-right">数量</th>
                 <th className="align-right">已成交</th>
                 <th>状态</th>
+                <th className="align-right">操作</th>
               </tr>
             </thead>
             <tbody>
@@ -153,6 +199,23 @@ export function AccountActivityPanel({
                       <span className={`order-status ${STATUS_CLASS[order.status]}`}>
                         {STATUS_LABEL[order.status]}
                       </span>
+                    </td>
+                    <td className="align-right">
+                      <button
+                        type="button"
+                        className="cancel-order-button"
+                        disabled={!cancelable(order) || cancelingOrderId !== null}
+                        onClick={() => void handleCancel(order)}
+                        title={
+                          cancelable(order)
+                            ? '撤销该委托并解冻剩余资金'
+                            : order.status === 'ACCEPTED'
+                              ? '等待资金冻结完成，暂不能撤单'
+                              : '当前状态不可撤单'
+                        }
+                      >
+                        {cancelingOrderId === order.orderId ? '撤单中…' : '撤单'}
+                      </button>
                     </td>
                   </tr>
                 );

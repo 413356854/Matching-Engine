@@ -12,6 +12,8 @@ import com.me.shared.event.MarketDataBatch;
 import com.me.shared.event.MarketDataEvent;
 import com.me.shared.event.OrderFreezeResultBatch;
 import com.me.shared.event.OrderFreezeResultEvent;
+import com.me.shared.order.OrderCancelBatch;
+import com.me.shared.order.OrderCancelCommand;
 import com.me.shared.order.OrderCommand;
 import com.me.shared.order.OrderCommandBatch;
 import com.me.shared.order.OrderPlacedEvent;
@@ -54,6 +56,8 @@ public final class KafkaFory {
         fory.register(OrderStatus.class, 103);
         fory.register(OrderPlacedEvent.class, 104);
         fory.register(OrderCommandBatch.class, 105);
+        fory.register(OrderCancelCommand.class, 106);
+        fory.register(OrderCancelBatch.class, 107);
 
         fory.register(FundsCommand.class, 110);
         fory.register(FundsLogType.class, 111);

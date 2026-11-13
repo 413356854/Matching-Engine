@@ -448,6 +448,10 @@ function App() {
               flows={fundsFlows}
               flowsError={fundsFlowsError}
               currencyScales={currencyScales}
+              userId={userId}
+              // 撤单与下单一样异步生效：先刷新一次，1.5s 后再刷新，等待解冻与状态落定。
+              onOrderCanceled={handleOrderPlaced}
+              notify={notify}
             />
           </div>
 

@@ -67,8 +67,8 @@ public class AccountCommandListener {
     /**
      * 纯业务处理：只更新余额并收集要发送的事件，不触碰 Kafka。
      *
-     * <p>由 account ingress handler 线程调用；输出由 {@link #publish(AccountCommandBatch)}
-     * 在 poll 线程的 Kafka 事务内发送。
+     * <p>由 poll 线程调用；输出由 {@link #publish(AccountCommandBatch)} 在同一线程的
+     * Kafka 事务内发送。
      */
     public AccountCommandBatch process(List<ConsumerRecord<String, FundsCommand>> records) {
         List<FundsFlowEvent> flows = new ArrayList<>(records.size());

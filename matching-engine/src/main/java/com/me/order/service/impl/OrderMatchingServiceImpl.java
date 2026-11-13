@@ -1,9 +1,13 @@
 package com.me.order.service.impl;
 
 import com.me.account.dto.TradeSettlementCommand;
+import com.me.matching.dto.CancelResult;
 import com.me.matching.dto.MatchResult;
 import com.me.matching.entity.Trade;
 import com.me.matching.service.MatchingEngine;
+import com.me.order.dto.OrderCancelBeginResult;
+import com.me.order.dto.OrderCancelContext;
+import com.me.order.dto.OrderCancelMatchResult;
 import com.me.order.dto.OrderMatchResult;
 import com.me.order.dto.OrderMatchResult.IgnoredTrade;
 import com.me.order.dto.OrderTradeApplyResult;
@@ -11,6 +15,7 @@ import com.me.order.service.OrderMatchingService;
 import com.me.order.service.OrderService;
 import com.me.shared.event.MarketDataEvent;
 import com.me.shared.event.TradeEvent;
+import com.me.shared.order.OrderCancelEvent;
 import com.me.shared.order.OrderPlacedEvent;
 import com.me.shared.order.OrderSide;
 import com.me.shared.order.OrderType;
@@ -24,8 +29,11 @@ import org.springframework.stereotype.Service;
 /**
  * 委托侧撮合编排实现：进程内撮合 → 成交清算 → 生成行情/结算输出。
  *
- * <p><b>调用约束</b>：只由 {@code OrderFreezeResultListener} 调用；同一 symbol 的冻结回执
- * 由同一分区/consumer 串行处理。
+ * <p><b>调用约束</b>：下单由 {@code OrderFreezeResultListener} 调用，撤单由
+ * {@code OrderCancelListener} 调用；两个入口来自不同 topic / consumer，可能并发。
+ * 冻结回执的 {@link #matchBatch} 与 {@link #clear} 由监听器放在同一个引擎对象锁临界区内
+ * （clear 分发到线程池执行），{@link #cancel} 使用同一把锁，因此下单撮合、成交清算、
+ * 撤单移除与“撤单中”标记不会交错修改订单簿和委托状态。
  *
  * <p><b>演示版重投语义</b>：不做撮合结果缓存/重放。Kafka 事务正常提交时输出与 offset
  * 原子提交；事务回滚后的重投会再次调用 {@link MatchingEngine#place}，引擎按 orderId
@@ -50,16 +58,53 @@ public class OrderMatchingServiceImpl implements OrderMatchingService {
     }
 
     @Override
-    public OrderMatchResult match(OrderPlacedEvent order, int sourcePartition, long sourceOffset,
-                                  int sourceIndex) {
-        MatchResult result = matchingEngine.place(order);
-        if (result.duplicate()) {
-            log.warn("matching duplicate ignored without replay: orderId={}, symbol={}, "
-                            + "partition={}, offset={}, index={}",
-                    order.orderId(), order.symbol(), sourcePartition, sourceOffset, sourceIndex);
-            return OrderMatchResult.duplicateIgnored(order.orderId());
+    public List<MatchResult> matchBatch(List<OrderPlacedEvent> orders) {
+        if (orders == null || orders.isEmpty()) {
+            return List.of();
+        }
+        List<MatchResult> results = new ArrayList<>(orders.size());
+        // 整批委托在同一个引擎对象锁临界区内按输入顺序撮合；已撤单中的委托不再挂单。
+        synchronized (matchingEngine) {
+            for (OrderPlacedEvent order : orders) {
+                if (orderService.isCancelPending(order.orderId())) {
+                    log.warn("matching skipped, order is being canceled: orderId={}, symbol={}",
+                            order.orderId(), order.symbol());
+                    results.add(MatchResult.duplicate(order.orderId(), order.quantity()));
+                    continue;
+                }
+                results.add(matchingEngine.place(order));
+            }
+        }
+        return results;
+    }
+
+    @Override
+    public OrderMatchResult clear(OrderPlacedEvent order, MatchResult result) {
+        if (order == null || result == null || result.duplicate()) {
+            return OrderMatchResult.duplicateIgnored(order == null ? 0L : order.orderId());
         }
         return buildOutputs(order, result, Instant.now());
+    }
+
+    @Override
+    public List<OrderCancelMatchResult> cancel(List<OrderCancelContext> contexts) {
+        if (contexts == null || contexts.isEmpty()) {
+            return List.of();
+        }
+        List<OrderCancelMatchResult> results = new ArrayList<>(contexts.size());
+        // 引擎对象锁：与 place 共用同一把锁。整批撤消单在一个临界区内依次移除挂单并标记
+        // “撤单中”，避免与冻结回执线程的下单撮合交错修改订单簿与委托状态。
+        synchronized (matchingEngine) {
+            for (OrderCancelContext context : contexts) {
+                CancelResult engineResult = matchingEngine.cancel(new OrderCancelEvent(
+                        context.orderId(), context.symbol(), context.side(),
+                        context.type(), context.price()));
+                OrderCancelBeginResult beginResult = orderService.beginCancel(context);
+                results.add(new OrderCancelMatchResult(context, engineResult,
+                        beginResult.accepted(), beginResult.reason()));
+            }
+        }
+        return results;
     }
 
     private OrderMatchResult buildOutputs(OrderPlacedEvent order, MatchResult result,

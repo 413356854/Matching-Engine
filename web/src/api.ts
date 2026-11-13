@@ -273,6 +273,22 @@ export interface PlaceOrderResponse {
   symbol: string | null;
 }
 
+/** 撤单请求：symbol 与 orderId 由前端提供，orderId 定位待撤销委托。 */
+export interface CancelOrderRequest {
+  requestId: string;
+  userId: number;
+  symbol: string;
+  orderId: number;
+}
+
+export interface CancelOrderResponse {
+  success: boolean;
+  reason: string | null;
+  requestId: string | null;
+  orderId: number | null;
+  symbol: string | null;
+}
+
 interface OrderQueryResponse {
   success: boolean;
   reason: string | null;
@@ -455,6 +471,21 @@ export function placeOrder(
   return request<PlaceOrderResponse>('/api/v1/currency/orders', {
     method: 'POST',
     body: JSON.stringify(order),
+    signal,
+  });
+}
+
+/**
+ * 提交撤单命令：只写入独立撤单 Disruptor 并返回 202 命令回执；
+ * 委托是否可撤、解冻结果由「当前委托」与「资产余额」轮询观察。
+ */
+export function cancelOrder(
+  cancel: CancelOrderRequest,
+  signal?: AbortSignal,
+): Promise<CancelOrderResponse> {
+  return request<CancelOrderResponse>('/api/v1/currency/orders/cancel', {
+    method: 'POST',
+    body: JSON.stringify(cancel),
     signal,
   });
 }

@@ -21,8 +21,9 @@ import org.springframework.context.SmartLifecycle;
  * 下单命令的 Disruptor 入口：HTTP 线程是生产者，单 handler 线程聚合后批量发 Kafka。
  *
  * <p><b>为什么批量</b>：逐条 {@code OrderCommand} 在高 TPS 下把大量记录压给消费者，
- * poll / 反序列化 / 事务提交的每记录成本成为瓶颈。这里把「2000 条或 20ms」内的命令
- * 组装成 {@code OrderCommandBatch}，消费者一次处理一整批，记录数下降几个数量级。
+ * poll / 反序列化 / 事务提交的每记录成本成为瓶颈。handler 把订单按 symbol 放入
+ * {@code Map<String, List>}，任一 symbol 达到 2000 条或 50ms 定时窗口到达时，把 map 中
+ * 所有 symbol 的命令分别组装成 {@code OrderCommandBatch}，消费者一次处理一整批。
  *
  * <p><b>顺序</b>：flush 按 symbol 分组发送，key=symbol，同一 symbol 的批次始终进入同一
  * 分区；聚合线程是唯一发送者，批次之间也按命令入队顺序写入，因此价格-时间优先不变。
@@ -85,7 +86,7 @@ public final class OrderIngressRing implements OrderIngress, SmartLifecycle {
                 TimeUnit.MILLISECONDS);
     }
 
-    /** 定时发布一个空事件，唤醒聚合线程检查 20ms 窗口。 */
+    /** 定时发布一个空事件，唤醒聚合线程检查 50ms 窗口。 */
     private void publishTick() {
         RingBuffer<OrderIngressEvent> buffer = ringBuffer;
         if (!running || buffer == null) {

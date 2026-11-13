@@ -1134,6 +1134,25 @@ button:disabled {
   background: var(--red-soft);
 }
 
+.cancel-order-button {
+  padding: 1px 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.6;
+}
+
+.cancel-order-button:hover:not(:disabled) {
+  color: var(--red);
+  border-color: var(--red-line);
+}
+
+.cancel-order-button:disabled {
+  opacity: 0.4;
+}
+
 .orders-empty {
   padding: 28px 14px;
 }

@@ -7,8 +7,9 @@ import org.springframework.stereotype.Component;
 /**
  * 下单命令入口：把委托命令提交到进程内 Disruptor。
  *
- * <p>{@code OrderIngressRing} 的单 handler 线程按「2000 条或 20ms」把命令聚合为
- * {@code OrderCommandBatch}，按 symbol 分组后发送到 {@code me.order.commands-batch}
+ * <p>{@code OrderIngressRing} 的单 handler 线程把订单按 symbol 放入
+ * {@code Map<String, List>}，任一 symbol 达到 2000 条或 50ms 窗口到达时，把 map 中所有
+ * symbol 的订单分别聚合为 {@code OrderCommandBatch} 发送到 {@code me.order.commands-batch}
  * （key=symbol，保证同一交易对按序处理）。委托模块的 {@code OrderCommandListener}
  * 是该 topic 的唯一消费者，也是系统唯一的下单入口。
  *
