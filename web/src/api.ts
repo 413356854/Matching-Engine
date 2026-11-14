@@ -357,6 +357,53 @@ export const ORDER_HISTORY_STATUSES: ReadonlyArray<{
   { value: 'CANCELED', label: '已撤销' },
 ];
 
+/** 用户成交记录中的角色：主动成交 / 被动成交。 */
+export type UserTradeRole = 'TAKER' | 'MAKER';
+
+/**
+ * 一条用户成交记录（QuestDB user_trade）：每个撮合对拆成 taker / maker 两条。
+ * 价格、数量、金额均为对应精度的最小单位整数。
+ */
+export interface UserTrade {
+  tradeId: number;
+  symbol: string;
+  userId: number;
+  /** 当前用户自己的委托号。 */
+  orderId: number;
+  role: UserTradeRole;
+  /** 成交对手的委托号。 */
+  counterOrderId: number;
+  /** 当前用户这一侧的方向；历史数据缺失时可能为 null。 */
+  side: OrderSide | null;
+  price: number;
+  quantity: number;
+  amount: number;
+  /** ISO-8601，UTC。 */
+  executedAt: string;
+}
+
+export interface AdminUserTradeQuery {
+  userId?: number | null;
+  symbol?: string;
+  role?: UserTradeRole;
+  limit?: number;
+}
+
+interface AdminUserTradeQueryResponse {
+  success: boolean;
+  reason: string | null;
+  userId: number | null;
+  symbol: string | null;
+  role: string | null;
+  trades: UserTrade[];
+}
+
+/** 用户成交记录支持的角色筛选（与后端 user_trade.role 对齐）。 */
+export const USER_TRADE_ROLES: ReadonlyArray<{ value: UserTradeRole; label: string }> = [
+  { value: 'TAKER', label: 'TAKER' },
+  { value: 'MAKER', label: 'MAKER' },
+];
+
 export interface RechargeResponse {
   success: boolean;
   reason: string | null;
@@ -594,6 +641,41 @@ export async function fetchOrderHistory(
   return body.orders ?? [];
 }
 
+interface UserTradeHistoryQueryResponse {
+  success: boolean;
+  reason: string | null;
+  userId: number;
+  symbol: string | null;
+  trades: UserTrade[];
+}
+
+/**
+ * 查询当前用户的历史成交（QuestDB user_trade），按成交时间倒序（最新在前）。
+ * 每个撮合对只返回当前用户自己的一侧（taker 或 maker）；symbol 可选。
+ */
+export async function fetchUserTrades(
+  userId: number,
+  symbol?: string,
+  limit = 50,
+  signal?: AbortSignal,
+): Promise<UserTrade[]> {
+  const params = new URLSearchParams({
+    userId: String(userId),
+    limit: String(limit),
+  });
+  if (symbol) {
+    params.set('symbol', symbol);
+  }
+  const body = await request<UserTradeHistoryQueryResponse>(
+    `/api/v1/currency/user-trades?${params.toString()}`,
+    { signal },
+  );
+  if (!body.success) {
+    throw new ApiError(body.reason ?? 'USER_TRADES_REJECTED', 200, body);
+  }
+  return body.trades ?? [];
+}
+
 /**
  * 查询当前用户的历史资金流水（QuestDB funds_flow），按发生时间倒序（最新在前）。
  * 只返回该用户的记录，供交易页面的「历史流水」面板展示。
@@ -721,6 +803,33 @@ export async function fetchAdminOrderHistory(
     throw new ApiError(body.reason ?? 'ORDER_HISTORY_REJECTED', 200, body);
   }
   return body.orders ?? [];
+}
+
+/** 后台：查询用户成交记录（撮合对拆分后的 taker / maker 两条，按成交时间倒序）。 */
+export async function fetchAdminUserTrades(
+  query: AdminUserTradeQuery = {},
+  signal?: AbortSignal,
+): Promise<UserTrade[]> {
+  const params = new URLSearchParams();
+  if (query.userId != null) {
+    params.set('userId', String(query.userId));
+  }
+  if (query.symbol) {
+    params.set('symbol', query.symbol);
+  }
+  if (query.role) {
+    params.set('role', query.role);
+  }
+  params.set('limit', String(query.limit ?? 100));
+
+  const body = await request<AdminUserTradeQueryResponse>(
+    `/api/v1/admin/user-trades?${params.toString()}`,
+    { signal },
+  );
+  if (!body.success) {
+    throw new ApiError(body.reason ?? 'USER_TRADES_REJECTED', 200, body);
+  }
+  return body.trades ?? [];
 }
 
 /** 后台：一键清空全部 K 线，返回清空前的记录数。 */

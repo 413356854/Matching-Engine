@@ -13,7 +13,7 @@ import com.me.order.dto.OrderMatchResult.IgnoredTrade;
 import com.me.order.dto.OrderTradeApplyResult;
 import com.me.order.service.OrderMatchingService;
 import com.me.order.service.OrderService;
-import com.me.shared.event.MarketDataEvent;
+import com.me.shared.event.MatchPairEvent;
 import com.me.shared.event.TradeEvent;
 import com.me.shared.order.OrderCancelEvent;
 import com.me.shared.order.OrderHistoryEvent;
@@ -28,7 +28,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 /**
- * 委托侧撮合编排实现：进程内撮合 → 成交清算 → 生成行情/结算输出。
+ * 委托侧撮合编排实现：进程内撮合 → 成交清算 → 生成撮合对/结算输出。
  *
  * <p><b>调用约束</b>：下单由 {@code OrderFreezeResultListener} 调用，撤单由
  * {@code OrderCancelListener} 调用；两个入口来自不同 topic / consumer，可能并发。
@@ -38,7 +38,7 @@ import org.springframework.stereotype.Service;
  *
  * <p><b>演示版重投语义</b>：不做撮合结果缓存/重放。Kafka 事务正常提交时输出与 offset
  * 原子提交；事务回滚后的重投会再次调用 {@link MatchingEngine#place}，引擎按 orderId
- * 返回 duplicate，此时不再产生行情/结算（{@link OrderMatchResult.Outcome#DUPLICATE_IGNORED}）。
+ * 返回 duplicate，此时不再产生撮合对/结算（{@link OrderMatchResult.Outcome#DUPLICATE_IGNORED}）。
  * 这也意味着回滚重投可能丢失上一次未提交的输出——演示版接受该取舍，后续会补备份消息与
  * 内存状态恢复。
  *
@@ -110,14 +110,14 @@ public class OrderMatchingServiceImpl implements OrderMatchingService {
 
     private OrderMatchResult buildOutputs(OrderPlacedEvent order, MatchResult result,
                                           Instant executedAt) {
-        List<MarketDataEvent> marketDataEvents = new ArrayList<>(result.trades().size());
+        List<MatchPairEvent> matchPairEvents = new ArrayList<>(result.trades().size());
         List<TradeSettlementCommand> settlementCommands =
                 new ArrayList<>(result.trades().size() + 1);
         List<OrderHistoryEvent> historyEvents = new ArrayList<>(2);
         List<IgnoredTrade> ignoredTrades = new ArrayList<>();
 
         for (Trade trade : result.trades()) {
-            marketDataEvents.add(toMarketData(trade, executedAt));
+            matchPairEvents.add(toMatchPair(trade, executedAt));
 
             OrderTradeApplyResult cleared = orderService.onTrade(toTradeEvent(trade, executedAt));
             if (cleared.handled()) {
@@ -147,15 +147,17 @@ public class OrderMatchingServiceImpl implements OrderMatchingService {
         }
 
         return OrderMatchResult.matched(result.orderId(),
-                marketDataEvents, settlementCommands, historyEvents, ignoredTrades);
+                matchPairEvents, settlementCommands, historyEvents, ignoredTrades);
     }
 
-    private static MarketDataEvent toMarketData(Trade trade, Instant executedAt) {
-        return new MarketDataEvent(
+    private static MatchPairEvent toMatchPair(Trade trade, Instant executedAt) {
+        return new MatchPairEvent(
                 trade.tradeId(),
                 trade.symbol(),
                 trade.takerOrderId(),
                 trade.makerOrderId(),
+                trade.takerUserId(),
+                trade.makerUserId(),
                 trade.takerSide(),
                 trade.price(),
                 trade.quantity(),

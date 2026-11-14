@@ -2,7 +2,7 @@ package com.me.marketdata.service.impl;
 
 import com.me.marketdata.entity.Kline;
 import com.me.marketdata.entity.KlineInterval;
-import com.me.shared.event.MarketDataEvent;
+import com.me.shared.event.MatchPairEvent;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -55,7 +55,7 @@ public final class KlineAggregator {
      * @param currentCandle 当前 K 线，可为 {@code null}（新 symbol / 新 bucket）
      * @return 下一个快照；事件早于当前 bucket（迟到成交）时返回 {@code null}
      */
-    public Kline next(Kline currentCandle, MarketDataEvent trade,
+    public Kline next(Kline currentCandle, MatchPairEvent trade,
                       KlineInterval interval, Instant bucketStart,
                       int partition, long offset) {
         if (currentCandle == null) {

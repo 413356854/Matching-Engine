@@ -34,7 +34,7 @@ public interface OrderService {
      * 应用账户模块的冻结回执：成功时把委托推进为已支付，失败时推进为已拒绝。
      * 回执与委托不匹配时返回 {@code handled=false}，调用方可以忽略。
      * 委托已支付 / 已成交时，重复的冻结成功回执仍返回 {@code placedEvent}；撮合引擎按
-     * orderId 去重，不会重复产生行情/结算。
+     * orderId 去重，不会重复产生撮合对/结算。
      */
     OrderFreezeApplyResult onFreezeResult(OrderFreezeResultEvent event);
 

@@ -18,7 +18,7 @@ import org.springframework.stereotype.Component;
  * <p>一笔成交拆成买方、卖方两条单用户命令，因此每条命令只落在一个 slot；账户模块
  * 只锁该用户对应的账户锁，不依赖跨用户原子性（金额已在下单冻结阶段扣除）。
  *
- * <p>发送发生在冻结回执消费 runner 的事务内：冻结回执 offset、行情记录与结算命令一起提交。
+ * <p>发送发生在冻结回执消费 runner 的事务内：冻结回执 offset、撮合对记录与结算命令一起提交。
  * 演示版不缓存/重放结算命令。
  */
 @Component

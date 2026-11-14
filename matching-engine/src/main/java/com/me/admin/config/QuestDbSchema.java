@@ -61,6 +61,33 @@ public final class QuestDbSchema {
             DEDUP UPSERT KEYS(final_at, order_id)
             """;
 
+    /**
+     * 用户成交记录表：admin 消费 {@code me.match-pair-batch}，把每个撮合对拆成 taker / maker
+     * 两条记录写入。
+     *
+     * <p>指定时间戳 {@code executed_at} 是成交时间，同一撮合对重投时保持不变；按
+     * {@code (executed_at, trade_id, order_id)} DEDUP 后，Kafka 事务回滚重投不会产生重复行。
+     * {@code user_id} / {@code symbol} 建 SYMBOL 索引，支撑按用户 / 交易对查询；{@code side}
+     * 是当前用户这一侧的方向（maker 与 taker 相反）。
+     */
+    public static final String CREATE_USER_TRADE_TABLE = """
+            CREATE TABLE IF NOT EXISTS user_trade (
+                trade_id LONG,
+                symbol SYMBOL INDEX CAPACITY 1024,
+                user_id SYMBOL INDEX CAPACITY 65536,
+                order_id LONG,
+                role SYMBOL,
+                counter_order_id LONG,
+                side SYMBOL,
+                price LONG,
+                quantity LONG,
+                amount LONG,
+                executed_at TIMESTAMP,
+                archived_at TIMESTAMP
+            ) TIMESTAMP(executed_at) PARTITION BY DAY WAL
+            DEDUP UPSERT KEYS(executed_at, trade_id, order_id)
+            """;
+
     private QuestDbSchema() {
     }
 }

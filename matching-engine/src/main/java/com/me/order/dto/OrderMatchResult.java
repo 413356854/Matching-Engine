@@ -1,7 +1,7 @@
 package com.me.order.dto;
 
 import com.me.account.dto.TradeSettlementCommand;
-import com.me.shared.event.MarketDataEvent;
+import com.me.shared.event.MatchPairEvent;
 import com.me.shared.order.OrderHistoryEvent;
 import java.util.List;
 
@@ -11,14 +11,14 @@ import java.util.List;
  * <p>{@link Outcome#MATCHED} 表示首次撮合并生成了输出；{@link Outcome#DUPLICATE_IGNORED}
  * 表示撮合引擎按 orderId 返回 duplicate（重复回执/回滚重投），本次不产生输出。
  *
- * <p>{@code marketDataEvents} 对每笔成交都有一条（即使成交清算被忽略）；{@code settlementCommands}
+ * <p>{@code matchPairEvents} 对每笔成交都有一条（即使成交清算被忽略）；{@code settlementCommands}
  * 只包含清算成功（{@code handled=true}）的成交对；{@code historyEvents} 是本次清算中进入
  * {@code FILLED} 的 taker / maker 委托快照；{@code ignoredTrades} 记录无法清算的成交。
  */
 public record OrderMatchResult(
         long orderId,
         Outcome outcome,
-        List<MarketDataEvent> marketDataEvents,
+        List<MatchPairEvent> matchPairEvents,
         List<TradeSettlementCommand> settlementCommands,
         List<OrderHistoryEvent> historyEvents,
         List<IgnoredTrade> ignoredTrades) {
@@ -33,24 +33,24 @@ public record OrderMatchResult(
     }
 
     public OrderMatchResult {
-        marketDataEvents = List.copyOf(marketDataEvents);
+        matchPairEvents = List.copyOf(matchPairEvents);
         settlementCommands = List.copyOf(settlementCommands);
         historyEvents = List.copyOf(historyEvents);
         ignoredTrades = List.copyOf(ignoredTrades);
     }
 
-    /** 是否需要把行情/结算/委托历史消息发布出去。 */
+    /** 是否需要把撮合对/结算/委托历史消息发布出去。 */
     public boolean publishable() {
         return outcome == Outcome.MATCHED;
     }
 
     public static OrderMatchResult matched(long orderId,
-                                           List<MarketDataEvent> marketDataEvents,
+                                           List<MatchPairEvent> matchPairEvents,
                                            List<TradeSettlementCommand> settlementCommands,
                                            List<OrderHistoryEvent> historyEvents,
                                            List<IgnoredTrade> ignoredTrades) {
         return new OrderMatchResult(orderId, Outcome.MATCHED,
-                marketDataEvents, settlementCommands, historyEvents, ignoredTrades);
+                matchPairEvents, settlementCommands, historyEvents, ignoredTrades);
     }
 
     public static OrderMatchResult duplicateIgnored(long orderId) {

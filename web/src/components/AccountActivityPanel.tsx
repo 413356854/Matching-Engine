@@ -7,6 +7,7 @@ import {
   type OrderStatus,
   type OrderView,
   type TradingPair,
+  type UserTrade,
 } from '../api';
 import { describeError } from '../errors';
 import { formatDateTime, formatPrice, formatQuantity, formatUnits } from '../format';
@@ -18,6 +19,8 @@ interface AccountActivityPanelProps {
   ordersError: string | null;
   history: OrderHistory[];
   historyError: string | null;
+  trades: UserTrade[];
+  tradesError: string | null;
   flows: FundsFlow[];
   flowsError: string | null;
   currencyScales: Record<string, number>;
@@ -26,7 +29,7 @@ interface AccountActivityPanelProps {
   notify: (kind: ToastKind, text: string) => void;
 }
 
-type ActivityTab = 'orders' | 'history' | 'flows';
+type ActivityTab = 'orders' | 'history' | 'trades' | 'flows';
 
 /** 委托历史只包含两种终态，文案与「当前委托」状态机区分：FILLED 显示为撮合完成。 */
 const HISTORY_STATUS_LABEL: Partial<Record<OrderStatus, string>> = {
@@ -81,6 +84,8 @@ export function AccountActivityPanel({
   ordersError,
   history,
   historyError,
+  trades,
+  tradesError,
   flows,
   flowsError,
   currencyScales,
@@ -125,13 +130,31 @@ export function AccountActivityPanel({
     }
   };
 
-  const count = tab === 'orders' ? orders.length : tab === 'history' ? history.length : flows.length;
-  const error = tab === 'orders' ? ordersError : tab === 'history' ? historyError : flowsError;
+  const count =
+    tab === 'orders'
+      ? orders.length
+      : tab === 'history'
+        ? history.length
+        : tab === 'trades'
+          ? trades.length
+          : flows.length;
+  const error =
+    tab === 'orders'
+      ? ordersError
+      : tab === 'history'
+        ? historyError
+        : tab === 'trades'
+          ? tradesError
+          : flowsError;
 
   return (
     <section className="panel open-orders-panel">
       <div className="panel-header book-trades-header">
-        <div className="book-trades-tabs" role="tablist" aria-label="当前委托、历史委托与历史流水">
+        <div
+          className="book-trades-tabs"
+          role="tablist"
+          aria-label="当前委托、历史委托、历史成交与历史流水"
+        >
           <button
             type="button"
             role="tab"
@@ -149,6 +172,15 @@ export function AccountActivityPanel({
             onClick={() => setTab('history')}
           >
             历史委托
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={tab === 'trades'}
+            className={`book-trades-tab ${tab === 'trades' ? 'active' : ''}`}
+            onClick={() => setTab('trades')}
+          >
+            历史成交
           </button>
           <button
             type="button"
@@ -294,6 +326,61 @@ export function AccountActivityPanel({
               })}
             </tbody>
           </table>
+        ) : tab === 'trades' ? (
+          <table className="orders-table trade-history-table">
+            <thead>
+              <tr>
+                <th className="align-right">价格</th>
+                <th className="align-right">数量</th>
+                <th className="align-right">成交额</th>
+                <th>成交时间</th>
+                <th>交易对</th>
+                <th>方向</th>
+                <th>角色</th>
+              </tr>
+            </thead>
+            <tbody>
+              {trades.map((trade) => {
+                const tradePair = pairMap.get(trade.symbol);
+                const priceScale = tradePair?.priceScale ?? 0;
+                const quantityScale = tradePair?.quantityScale ?? 0;
+                const quoteCurrency =
+                  tradePair?.quoteCurrency ?? trade.symbol.split('-')[1] ?? '';
+                const amountScale = currencyScales[quoteCurrency] ?? 0;
+                return (
+                  <tr
+                    key={`${trade.tradeId}-${trade.orderId}`}
+                    className="order-row"
+                    title={`tradeId: ${trade.tradeId}\norderId: ${trade.orderId}\n对手单: ${trade.counterOrderId}\n${trade.role}`}
+                  >
+                    <td className="mono align-right">
+                      {formatPrice(trade.price, priceScale)}
+                    </td>
+                    <td className="mono align-right">
+                      {formatQuantity(trade.quantity, quantityScale)}
+                    </td>
+                    <td className="mono align-right">
+                      {formatUnits(trade.amount, amountScale)}
+                    </td>
+                    <td className="mono muted">{formatDateTime(trade.executedAt)}</td>
+                    <td>{trade.symbol}</td>
+                    <td>
+                      {trade.side ? (
+                        <span className={`side-pill ${trade.side === 'BUY' ? 'up' : 'down'}`}>
+                          {trade.side === 'BUY' ? '买入' : '卖出'}
+                        </span>
+                      ) : (
+                        <span className="muted">--</span>
+                      )}
+                    </td>
+                    <td>
+                      <span className="admin-type">{trade.role}</span>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
         ) : (
           <table className="orders-table flow-history-table">
             <thead>
@@ -358,7 +445,9 @@ export function AccountActivityPanel({
                 ? '暂无当前委托。下单成功后会自动出现在这里。'
                 : tab === 'history'
                   ? '暂无历史委托。撤单或撮合完成的委托会异步归档到这里。'
-                  : '暂无历史流水。充值、冻结或成交产生的流水会异步归档到这里。'}
+                  : tab === 'trades'
+                    ? '暂无历史成交。撮合产生的成交会异步归档到这里。'
+                    : '暂无历史流水。充值、冻结或成交产生的流水会异步归档到这里。'}
           </div>
         )}
       </div>

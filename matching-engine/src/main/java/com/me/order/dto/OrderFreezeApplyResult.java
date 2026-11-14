@@ -10,7 +10,7 @@ import com.me.shared.order.OrderPlacedEvent;
  * {@code handled=true} 且 {@code placedEvent == null} 表示委托已被冻结失败拒绝。
  *
  * <p>委托已经是 {@code PAID} / {@code PARTIALLY_FILLED} / {@code FILLED} 时，重复的冻结成功回执
- * 也会返回 {@code placedEvent}；撮合引擎按 orderId 去重，重复回执不会再次产生行情/结算。
+ * 也会返回 {@code placedEvent}；撮合引擎按 orderId 去重，重复回执不会再次产生撮合对/结算。
  */
 public record OrderFreezeApplyResult(
         boolean handled,

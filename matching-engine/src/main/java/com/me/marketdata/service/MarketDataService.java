@@ -3,12 +3,12 @@ package com.me.marketdata.service;
 import com.me.marketdata.entity.Kline;
 import com.me.marketdata.entity.KlineInterval;
 import com.me.marketdata.entity.TradeRecord;
-import com.me.shared.event.MarketDataEvent;
+import com.me.shared.event.MatchPairEvent;
 import java.util.Collections;
 import java.util.List;
 
 /**
- * 行情模块业务接口：消费成交行情，生成 K 线并归档到 QuestDB。
+ * 行情模块业务接口：消费撮合对，生成 K 线并归档到 QuestDB。
  */
 public interface MarketDataService {
 
@@ -34,11 +34,11 @@ public interface MarketDataService {
     /**
      * 处理一条行情记录的便捷方法，等价于只含一条记录的 {@link #ingestBatch(List)}。
      *
-     * @param trade     行情记录（一笔成交）
-     * @param partition 行情 topic 分区
-     * @param offset    行情 topic offset
+     * @param trade     撮合对记录（一笔成交）
+     * @param partition 撮合对 topic 分区
+     * @param offset    撮合对 topic offset
      */
-    default void ingest(MarketDataEvent trade, int partition, long offset) {
+    default void ingest(MatchPairEvent trade, int partition, long offset) {
         ingestBatch(Collections.singletonList(new MarketDataRecord(trade, partition, offset)));
     }
 

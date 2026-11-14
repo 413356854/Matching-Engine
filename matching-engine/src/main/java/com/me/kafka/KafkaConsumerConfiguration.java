@@ -8,12 +8,13 @@ import com.me.account.mq.AccountFreezeCommandListener;
 import com.me.account.mq.AccountSettlementListener;
 import com.me.admin.mq.FundsFlowConsumer;
 import com.me.admin.mq.OrderHistoryConsumer;
+import com.me.admin.mq.UserTradeConsumer;
 import com.me.marketdata.mq.MarketDataListener;
 import com.me.order.mq.OrderCancelListener;
 import com.me.order.mq.OrderCommandListener;
 import com.me.order.mq.OrderFreezeResultListener;
 import com.me.shared.event.FundsFlowBatch;
-import com.me.shared.event.MarketDataBatch;
+import com.me.shared.event.MatchPairBatch;
 import com.me.shared.event.OrderFreezeResultBatch;
 import com.me.shared.order.OrderCancelBatch;
 import com.me.shared.order.OrderCommandBatch;
@@ -30,7 +31,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
 /**
- * 九条消费链路的 runner 装配：topic / group / 目标类型 / 处理函数。
+ * 十条消费链路的 runner 装配：topic / group / 目标类型 / 处理函数。
  *
  * <p>topic 与 group 名称必须与 {@code app.kafka.topics} / {@code app.kafka.groups} 保持一致
  * （loadtest 和已有消费组 offset 都依赖它们）。
@@ -95,7 +96,8 @@ public class KafkaConsumerConfiguration {
             OrderCancelListener orderCancelListener,
             MarketDataListener marketDataListener,
             FundsFlowConsumer fundsFlowConsumer,
-            OrderHistoryConsumer orderHistoryConsumer) {
+            OrderHistoryConsumer orderHistoryConsumer,
+            UserTradeConsumer userTradeConsumer) {
         List<KafkaConsumerRunner<?>> all = new ArrayList<>();
 
         all.addAll(createRunners(properties, clientFactory, sink,
@@ -130,9 +132,14 @@ public class KafkaConsumerConfiguration {
                 "order-cancel", "order-cancels", "order-cancel",
                 OrderCancelBatch.class, true, orderCancelListener::onCancel));
 
+        // 撮合对 topic 有两个独立消费组：行情模块聚合 K 线，admin 归档用户成交记录。
         all.addAll(createRunners(properties, clientFactory, sink,
-                "marketdata", "market-data", "marketdata",
-                MarketDataBatch.class, true, marketDataListener::onMarketData));
+                "marketdata", "match-pair", "marketdata",
+                MatchPairBatch.class, true, marketDataListener::onMatchPair));
+
+        all.addAll(createRunners(properties, clientFactory, sink,
+                "user-trade", "match-pair", "user-trade",
+                MatchPairBatch.class, true, userTradeConsumer::onMatchPair));
 
         all.addAll(createRunners(properties, clientFactory, sink,
                 "funds-flow", "funds-flow", "admin",

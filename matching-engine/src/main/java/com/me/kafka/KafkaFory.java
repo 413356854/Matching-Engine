@@ -8,8 +8,8 @@ import com.me.shared.event.FundsFlowBatch;
 import com.me.shared.event.FundsFlowEvent;
 import com.me.shared.event.FundsLogType;
 import com.me.shared.event.FundsOp;
-import com.me.shared.event.MarketDataBatch;
-import com.me.shared.event.MarketDataEvent;
+import com.me.shared.event.MatchPairBatch;
+import com.me.shared.event.MatchPairEvent;
 import com.me.shared.event.OrderFreezeResultBatch;
 import com.me.shared.event.OrderFreezeResultEvent;
 import com.me.shared.order.OrderCancelBatch;
@@ -75,8 +75,8 @@ public final class KafkaFory {
         fory.register(TradeSettlementCommand.SettlementLeg.class, 131);
         fory.register(TradeSettlementBatch.class, 132);
 
-        fory.register(MarketDataEvent.class, 140);
-        fory.register(MarketDataBatch.class, 141);
+        fory.register(MatchPairEvent.class, 140);
+        fory.register(MatchPairBatch.class, 141);
 
         fory.register(FundsFlowEvent.class, 150);
         fory.register(FundsFlowBatch.class, 151);

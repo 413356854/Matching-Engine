@@ -8,7 +8,7 @@ import com.me.order.dto.OrderFreezeApplyResult;
 import com.me.order.dto.OrderMatchResult;
 import com.me.order.service.OrderMatchingService;
 import com.me.order.service.OrderService;
-import com.me.shared.event.MarketDataEvent;
+import com.me.shared.event.MatchPairEvent;
 import com.me.shared.event.OrderFreezeResultBatch;
 import com.me.shared.event.OrderFreezeResultEvent;
 import com.me.shared.order.OrderHistoryEvent;
@@ -37,8 +37,8 @@ import org.springframework.stereotype.Component;
  *   <li><b>聚合撮合</b>：按原回执顺序把整批撮合单交给 {@link OrderMatchingService#matchBatch}，
  *       在引擎对象锁内依次调用撮合引擎，收集成交对；</li>
  *   <li><b>并发清算</b>：线程池并发调用 {@link OrderMatchingService#clear}，逐笔更新 taker /
- *       maker 委托并生成行情、结算命令（含市价买入完成退款）；</li>
- *   <li><b>聚合发送</b>：按 symbol 聚合行情，聚合清算命令后发送
+ *       maker 委托并生成撮合对、结算命令（含市价买入完成退款）；</li>
+ *   <li><b>聚合发送</b>：按 symbol 聚合撮合对，聚合清算命令后发送
  *       {@code me.account.settlements-batch}。</li>
  * </ol>
  *
@@ -47,11 +47,11 @@ import org.springframework.stereotype.Component;
  * 不会出现“撤单已解冻、清算尚未推进委托”的竞争。清算任务只访问委托内存状态，可以并发执行。
  *
  * <p><b>批量消费</b>：一个 poll 批次一个 Kafka 事务；冻结回执 offset、
- * {@code me.marketdata-batch} 行情与 {@code me.account.settlements-batch} 结算命令一起提交/回滚。
+ * {@code me.match-pair-batch} 撮合对与 {@code me.account.settlements-batch} 结算命令一起提交/回滚。
  * 任一条失败都会回滚整批并重投。
  *
  * <p><b>演示版重投语义</b>：不缓存撮合输出。同一订单的重复（或回滚后重投）回执仍会交给
- * {@link OrderMatchingService}，撮合引擎按 orderId 返回 duplicate，因此不会重复产生行情/
+ * {@link OrderMatchingService}，撮合引擎按 orderId 返回 duplicate，因此不会重复产生撮合对/
  * 结算；若上一次事务未提交，这些输出会丢失。后续会补备份消息与内存状态恢复。
  *
  * <p><b>并发</b>：冻结回执批量消息按 symbol 分组、key=symbol，同一 symbol 的消息落在同一分区
@@ -66,7 +66,7 @@ public class OrderFreezeResultListener {
     private final OrderService orderService;
     private final OrderMatchingService orderMatchingService;
     private final MatchingEngine matchingEngine;
-    private final MarketDataEventPublisher marketDataPublisher;
+    private final MatchPairEventPublisher matchPairPublisher;
     private final TradeSettlementCommandPublisher settlementPublisher;
     private final OrderHistoryPublisher orderHistoryPublisher;
     private final ExecutorService workerPool;
@@ -75,14 +75,14 @@ public class OrderFreezeResultListener {
             OrderService orderService,
             OrderMatchingService orderMatchingService,
             MatchingEngine matchingEngine,
-            MarketDataEventPublisher marketDataPublisher,
+            MatchPairEventPublisher matchPairPublisher,
             TradeSettlementCommandPublisher settlementPublisher,
             OrderHistoryPublisher orderHistoryPublisher,
             @Qualifier("orderFreezeResultExecutor") ExecutorService workerPool) {
         this.orderService = orderService;
         this.orderMatchingService = orderMatchingService;
         this.matchingEngine = matchingEngine;
-        this.marketDataPublisher = marketDataPublisher;
+        this.matchPairPublisher = matchPairPublisher;
         this.settlementPublisher = settlementPublisher;
         this.orderHistoryPublisher = orderHistoryPublisher;
         this.workerPool = workerPool;
@@ -112,7 +112,7 @@ public class OrderFreezeResultListener {
             matches = clearConcurrently(placed, engineResults);
         }
 
-        // 4) 聚合行情与清算单，在 poll 线程的 Kafka 事务内发送。
+        // 4) 聚合撮合对与清算单，在 poll 线程的 Kafka 事务内发送。
         publishOutputs(placed, matches);
     }
 
@@ -175,7 +175,7 @@ public class OrderFreezeResultListener {
     }
 
     private void publishOutputs(List<PlacedOrder> placed, List<OrderMatchResult> matches) {
-        Map<String, List<MarketDataEvent>> marketDataBySymbol = new LinkedHashMap<>();
+        Map<String, List<MatchPairEvent>> matchPairsBySymbol = new LinkedHashMap<>();
         List<TradeSettlementCommand> settlementCommands = new ArrayList<>();
         List<OrderHistoryEvent> historyEvents = new ArrayList<>();
         for (int index = 0; index < matches.size(); index++) {
@@ -189,9 +189,9 @@ public class OrderFreezeResultListener {
                 continue;
             }
             String symbol = symbolKey(source.source().record());
-            if (!match.marketDataEvents().isEmpty()) {
-                marketDataBySymbol.computeIfAbsent(symbol, ignored -> new ArrayList<>())
-                        .addAll(match.marketDataEvents());
+            if (!match.matchPairEvents().isEmpty()) {
+                matchPairsBySymbol.computeIfAbsent(symbol, ignored -> new ArrayList<>())
+                        .addAll(match.matchPairEvents());
             }
             if (!match.settlementCommands().isEmpty()) {
                 settlementCommands.addAll(match.settlementCommands());
@@ -203,8 +203,8 @@ public class OrderFreezeResultListener {
                     log.warn("trade clearing ignored: orderId={}, tradeId={}, reason={}",
                             match.orderId(), ignored.tradeId(), ignored.reason()));
         }
-        if (!marketDataBySymbol.isEmpty()) {
-            marketDataPublisher.publishBatch(marketDataBySymbol);
+        if (!matchPairsBySymbol.isEmpty()) {
+            matchPairPublisher.publishBatch(matchPairsBySymbol);
         }
         if (!settlementCommands.isEmpty()) {
             settlementPublisher.publishBatch(settlementCommands);

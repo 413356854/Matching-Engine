@@ -92,6 +92,21 @@ export function OrderIcon() {
   );
 }
 
+export function TradeIcon() {
+  return (
+    <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true">
+      <path
+        d="M3 7h11M11.5 4.5 14 7l-2.5 2.5M17 13H6M8.5 10.5 6 13l2.5 2.5"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.4"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
 export function CandleIcon() {
   return (
     <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true">

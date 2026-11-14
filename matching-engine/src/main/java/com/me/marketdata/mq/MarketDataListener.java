@@ -2,17 +2,17 @@ package com.me.marketdata.mq;
 
 import com.me.marketdata.service.MarketDataRecord;
 import com.me.marketdata.service.MarketDataService;
-import com.me.shared.event.MarketDataBatch;
-import com.me.shared.event.MarketDataEvent;
+import com.me.shared.event.MatchPairBatch;
+import com.me.shared.event.MatchPairEvent;
 import java.util.ArrayList;
 import java.util.List;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.springframework.stereotype.Component;
 
 /**
- * 消费委托模块进程内撮合后输出的行情批量消息，生成 K 线并保存成交明细到 QuestDB。
+ * 消费委托模块进程内撮合后输出的撮合对批量消息，生成 K 线并保存成交明细到 QuestDB。
  *
- * <p>一条 {@link MarketDataBatch} 消息包含一个 symbol 的一批成交（生产端按 symbol 分组，
+ * <p>一条 {@link MatchPairBatch} 消息包含一个 symbol 的一批成交（生产端按 symbol 分组，
  * key=symbol），批内顺序即成交顺序。同一批次消息内的成交共享 {@code (partition, offset)}：
  * service 以整条 Kafka 记录为水位单位，首次遇到时判断该记录是否已聚合，避免同一批次内的
  * 后续成交被误判为重复。
@@ -29,14 +29,14 @@ public class MarketDataListener {
         this.marketDataService = marketDataService;
     }
 
-    public void onMarketData(List<ConsumerRecord<String, MarketDataBatch>> records) {
+    public void onMatchPair(List<ConsumerRecord<String, MatchPairBatch>> records) {
         List<MarketDataRecord> batch = new ArrayList<>();
-        for (ConsumerRecord<String, MarketDataBatch> record : records) {
-            MarketDataBatch message = record.value();
+        for (ConsumerRecord<String, MatchPairBatch> record : records) {
+            MatchPairBatch message = record.value();
             if (message == null) {
                 continue;
             }
-            for (MarketDataEvent event : message.getMsgList()) {
+            for (MatchPairEvent event : message.getMsgList()) {
                 batch.add(new MarketDataRecord(event, record.partition(), record.offset()));
             }
         }

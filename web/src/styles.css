@@ -2627,6 +2627,14 @@ button:disabled {
   .flow-history-table td:nth-child(1) {
     display: table-cell;
   }
+
+  /* 历史成交优先保留价格 / 数量 / 成交额，其余列靠横向滚动查看。 */
+  .trade-history-table th:nth-child(1),
+  .trade-history-table td:nth-child(1),
+  .trade-history-table th:nth-child(6),
+  .trade-history-table td:nth-child(6) {
+    display: table-cell;
+  }
 }
 
 @media (max-width: 820px) {

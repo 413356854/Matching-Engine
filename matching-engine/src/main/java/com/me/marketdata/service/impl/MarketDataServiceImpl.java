@@ -8,7 +8,7 @@ import com.me.marketdata.entity.TradeRecord;
 import com.me.marketdata.repository.MarketDataRepository;
 import com.me.marketdata.service.MarketDataRecord;
 import com.me.marketdata.service.MarketDataService;
-import com.me.shared.event.MarketDataEvent;
+import com.me.shared.event.MatchPairEvent;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -101,15 +101,15 @@ public class MarketDataServiceImpl implements MarketDataService {
             return;
         }
         for (MarketDataRecord record : records) {
-            MarketDataEvent trade = record == null ? null : record.event();
+            MatchPairEvent trade = record == null ? null : record.event();
             if (trade == null || trade.symbol() == null || trade.symbol().isBlank()) {
-                throw new IllegalArgumentException("market data trade and symbol are required");
+                throw new IllegalArgumentException("match pair trade and symbol are required");
             }
         }
 
         // 只归档本批最后 20 条成交；K 线仍使用全部 records 聚合。
         // DEDUP 键保证整批重投不会产生重复成交。
-        List<MarketDataEvent> trades =
+        List<MatchPairEvent> trades =
                 records.stream().map(MarketDataRecord::event).toList();
         int tradeFrom = Math.max(0, trades.size() - TRADE_ARCHIVE_LIMIT);
         repository.insertTrades(List.copyOf(trades.subList(tradeFrom, trades.size())));
@@ -129,7 +129,7 @@ public class MarketDataServiceImpl implements MarketDataService {
         Set<KlineRecordKey> includedRecords = new HashSet<>();
 
         for (MarketDataRecord record : records) {
-            MarketDataEvent trade = record.event();
+            MatchPairEvent trade = record.event();
             for (KlineInterval interval : aggregator.intervals()) {
                 KlineKey key = new KlineKey(trade.symbol(), interval);
                 Instant bucketStart = interval.bucketStart(trade.executedAt());

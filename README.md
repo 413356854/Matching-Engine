@@ -22,7 +22,7 @@
 | 接入层 | Spring MVC / Netty | — | REST 下单、交易对/余额/行情查询、管理端充值已实现（`/api/v1`）；Netty TCP/WS 网关（规划） |
 | 消息 / 持久化 | Apache Kafka | broker **4.4.0** / client **4.2.2** | 直接使用 `org.apache.kafka:kafka-clients`（不引入 Spring Kafka）；冻结回执、单用户结算与行情事件，详见「持久化组件（当前实现与规划）」；本地单节点已装，见「本地 Kafka 环境（4.4.0）」 |
 | 查询投影 | QuestDB（当前）/ ClickHouse / PostgreSQL | — | 异步写入，不进撮合热路径 |
-| 前端 | React + Vite + lightweight-charts | — | `web/` 演示前端（已实现）：币币交易（交易对、余额、下单、1m K 线、最新成交）+ 后台管理（流水管理、K 线管理） |
+| 前端 | React + Vite + lightweight-charts | — | `web/` 演示前端（已实现）：币币交易（交易对、余额、下单、1m K 线、最新成交）+ 后台管理（流水管理、委托历史、成交记录、K 线管理） |
 
 > **基线口径：JDK 21 + Spring Boot 4.1.2 + Maven 3.6.3+**。
 > 撮合内核（`com.me.matching.entity` / `service`）仍是零第三方依赖、纯 JDK，不引入 Spring/Kafka；它现在是**委托与撮合模块的进程内子包**，可独立编译、单测与压测。
@@ -41,10 +41,10 @@
 | # | 模块 | 包 / 文件夹 | 职责 | 关键类 | 向外依赖 |
 |---|---|---|---|---|---|
 | ① | **账户模块** | `com.me.account` | 开户、余额（available / frozen）、冻结与解冻、资金流水、对账口径 | `AccountService`、`AccountController` | `shared` |
-| ② | **币币模块** | `com.me.currency` | 币种、交易对（symbol）、价格/数量精度、最小下单量、费率档位、上下架；**下单接入**（同步校验后写入 Disruptor，聚合为 `OrderCommandBatch` 投递 `me.order.commands-batch`，不直接调用委托模块）；**用户历史流水查询**（经 shared 只读查询端口读取 QuestDB `funds_flow`，最新在前） | `PairService`、`OrderPlacementController`、`OrderCommandPublisher`、`OrderIngressRing`、`CurrencyConfigCache`、`UserFundsFlowController` | `shared` + `com.me.kafka` 基础设施 |
+| ② | **币币模块** | `com.me.currency` | 币种、交易对（symbol）、价格/数量精度、最小下单量、费率档位、上下架；**下单接入**（同步校验后写入 Disruptor，聚合为 `OrderCommandBatch` 投递 `me.order.commands-batch`，不直接调用委托模块）；**用户历史流水 / 历史成交查询**（经 shared 只读查询端口读取 QuestDB `funds_flow` / `user_trade`，最新在前） | `PairService`、`OrderPlacementController`、`OrderCommandPublisher`、`OrderIngressRing`、`CurrencyConfigCache`、`UserFundsFlowController`、`UserTradeController` | `shared` + `com.me.kafka` 基础设施 |
 | ③④ | **委托与撮合模块** | `com.me.order` + 内部纯 JDK 子包 `com.me.matching` | 消费 `me.order.commands-batch`（**唯一接单入口**）、参数与幂等校验、订单状态机、委托查询；撤单/改单（规划）；订单簿、价格-时间优先、成交生成；冻结回执后进程内撮合与成交清算；**终态委托历史收集**（撤单 `CANCELED` / 撮合完成 `FILLED` → `me.order.history-batch`）与用户历史委托查询 | `OrderCommandListener`、`OrderService`、`OrderMatchingService`、`MatchingEngine`、`OrderBook`、`OrderHistoryPublisher` | account、currency、`shared` |
 | ⑤ | **结算中心** | `com.me.settlement` | （规划）双边记账、手续费、资金划转、清算幂等、日终对账；当前仅保留包结构，结算逻辑在 account / order 内 | 规划 | account、order |
-| ⑥ | **行情模块** | `com.me.marketdata` | 成交行情、K 线聚合、成交 / 深度查询；落 QuestDB | `MarketDataListener`、`MarketDataService`、`MarketDataRepository`、`KlineAggregator` | 事件（order → marketdata） |
+| ⑥ | **行情模块** | `com.me.marketdata` | 消费撮合对、K 线聚合、成交 / 深度查询；落 QuestDB | `MarketDataListener`、`MarketDataService`、`MarketDataRepository`、`KlineAggregator` | 撮合对事件（order → marketdata） |
 
 ### 依赖方向（单向，无环）
 
@@ -53,8 +53,8 @@
 - `order` → `account`、`currency`；消费 `me.order.commands-batch` 接单；**进程内直接调用** `com.me.matching.service.MatchingEngine`（撮合内核属于本模块）
 - `matching` → 只依赖 `shared` 的命令/事件 DTO；**纯 JDK、零 Spring、零 Kafka**，不依赖 account / order / settlement
 - `settlement` → `account`、`order`
-- `marketdata` → 订阅 `order` 进程内撮合后输出的成交/深度事件（只认 `shared` 事件类型）
-- `admin` → `account.service`（管理端充值）、`currency.service`（币种校验），只调 service 接口，不直接访问对方 mapper / entity
+- `marketdata` → 订阅 `order` 进程内撮合后输出的撮合对事件（只认 `shared` 事件类型）
+- `admin` → `account.service`（管理端充值）、`currency.service`（币种校验），消费撮合对事件归档用户成交；只调 service 接口，不直接访问对方 mapper / entity
 
 ### 模块边界规则
 
@@ -101,8 +101,9 @@ MatchingEngine（订单簿，价格-时间优先，M0 集合版）
   ▼
 ③④ 委托模块 order 线程池并发成交清算：PAID → PARTIALLY_FILLED / FILLED
   │
-  ├─ 行情 Kafka me.marketdata-batch（key=symbol，每个 symbol 一条批量行情）
-  │     ─▶ ⑥ 行情模块 marketdata（→ 成交明细 / K 线 → QuestDB）
+  ├─ 撮合对 Kafka me.match-pair-batch（key=symbol，每个 symbol 一条批量撮合对）
+  │     ├─▶ ⑥ 行情模块 marketdata（→ 成交明细 / K 线 → QuestDB）
+  │     └─▶ admin（→ 用户成交记录 user_trade → QuestDB）
   │
   └─ 结算 Kafka me.account.settlements-batch（按 userId slot 分区，每个 slot 一条批量结算消息，内含单用户命令）
         │
@@ -113,9 +114,9 @@ MatchingEngine（订单簿，价格-时间优先，M0 集合版）
 
 **五个业务模块跑在同一个进程里**：Kafka 是同机部署的持久化与消息组件，不是服务边界；模块间同步调用走 `service` 接口，异步解耦走事件。撮合引擎不再是 Kafka 消费者/生产者，而是委托模块进程内的纯 JDK 组件。
 
-**接单与撮合**：`币币模块 REST（仅投递命令）→ me.order.commands-batch → 委托模块唯一接单入口 OrderCommandListener → 账户模块预占 → me.account.order-freeze-commands-batch → 账户回执 me.order.freeze-results-batch → 委托模块进程内调用 MatchingEngine → 委托清算 → me.account.settlements-batch / me.marketdata-batch`。
+**接单与撮合**：`币币模块 REST（仅投递命令）→ me.order.commands-batch → 委托模块唯一接单入口 OrderCommandListener → 账户模块预占 → me.account.order-freeze-commands-batch → 账户回执 me.order.freeze-results-batch → 委托模块进程内调用 MatchingEngine → 委托清算 → me.account.settlements-batch / me.match-pair-batch`。
 充值等非冻结资金命令仍走 `me.account.commands`（key=userId），与冻结链路分开；两条链路共用 `AccountService` 的分片锁。
-下单命令、冻结命令、冻结回执、行情、结算都按 symbol 分组，每个 symbol 一条批量消息（key=symbol）；资金流水按 userId 分组发送（key=userId），每个目标分区一条批量消息。消息体分别是 `OrderCommandBatch` / `OrderFreezeCommandsBatch` / `OrderFreezeResultBatch` / `MarketDataBatch` / `TradeSettlementBatch` / `FundsFlowBatch`；只有充值等非冻结资金命令 `me.account.commands` 仍是逐条消息。
+下单命令、冻结命令、冻结回执、撮合对、结算都按 symbol 分组，每个 symbol 一条批量消息（key=symbol）；资金流水按 userId 分组发送（key=userId），每个目标分区一条批量消息。消息体分别是 `OrderCommandBatch` / `OrderFreezeCommandsBatch` / `OrderFreezeResultBatch` / `MatchPairBatch` / `TradeSettlementBatch` / `FundsFlowBatch`；只有充值等非冻结资金命令 `me.account.commands` 仍是逐条消息。
 `me.orders` 与 `me.trades` 两个 topic 已从撮合链路移除；订单/订单簿状态仍是内存态（演示口径），生产化需另做持久化与快照。
 
 ## 持久化组件（当前实现与规划）
@@ -125,10 +126,10 @@ MatchingEngine（订单簿，价格-时间优先，M0 集合版）
 | **订单 / 撮合状态** | **进程内内存** | 委托状态机、订单簿、去重缓存；当前不持久化 | 进程重启丢失（演示口径） |
 | **冻结 / 结算消息** | **Kafka `me.account.commands` / `me.account.order-freeze-commands-batch` / `me.order.freeze-results-batch` / `me.account.settlements-batch` / `me.funds-batch` / `me.order.history-batch`** | 资金命令、冻结命令/回执、单用户结算命令、资金流水、委托历史；当前用于传输与审计，未实现回放恢复 | 8 分区；本地 RF=1，RF=3 为生产规划；`acks=all`，幂等 Producer |
 | **订单簿快照（温态）** | **本地 NVMe + 可选 S3** | 订单簿 + 活单 + 去重表 + offset，加速恢复 | 规划；每 1000 万条/15s，CRC 校验，保留 3 份 |
-| 行情输出 | Kafka `me.marketdata-batch`（order 生产） | 成交 tick（K 线由行情模块聚合后写 QuestDB） | 本地 RF=1；RF=3 为生产规划 |
-| 查询投影 | QuestDB（当前）/ ClickHouse / PostgreSQL（规划） | 流水、委托历史、成交 / K 线审计与查询 | 异步，不进热路径 |
+| 撮合对输出 | Kafka `me.match-pair-batch`（order 生产） | 成交 tick；行情模块聚合 K 线，admin 归档用户成交记录 | 本地 RF=1；RF=3 为生产规划 |
+| 查询投影 | QuestDB（当前）/ ClickHouse / PostgreSQL（规划） | 流水、委托历史、用户成交、成交 / K 线审计与查询 | 异步，不进热路径 |
 
-**一句话**：Kafka 负责冻结、结算、资金与行情的持久化/解耦；**订单与撮合状态是进程内内存态**（演示口径）。生产化恢复需要另做订单持久化 + 订单簿快照，不能依赖已移除的 `me.orders`。
+**一句话**：Kafka 负责冻结、结算、资金、撮合对与行情的持久化/解耦；**订单与撮合状态是进程内内存态**（演示口径）。生产化恢复需要另做订单持久化 + 订单簿快照，不能依赖已移除的 `me.orders`。
 
 **七个关键决策**
 
@@ -240,8 +241,8 @@ pwsh -File .\stop-kafka.ps1
 .\bin-local\kafka-tool.cmd org.apache.kafka.tools.TopicCommand --list --bootstrap-server localhost:9092
 .\bin-local\kafka-tool.cmd org.apache.kafka.tools.TopicCommand --create --topic me.order.freeze-results-batch --partitions 8 --replication-factor 1 --bootstrap-server localhost:9092
 # 生产 / 消费（value 是 Fory 二进制，ConsoleConsumer 只用于确认消息到达，不可读内容）
-.\bin-local\kafka-tool.cmd org.apache.kafka.tools.ConsoleProducer --bootstrap-server localhost:9092 --topic me.marketdata-batch
-.\bin-local\kafka-tool.cmd org.apache.kafka.tools.consumer.ConsoleConsumer --bootstrap-server localhost:9092 --topic me.marketdata-batch --from-beginning
+.\bin-local\kafka-tool.cmd org.apache.kafka.tools.ConsoleProducer --bootstrap-server localhost:9092 --topic me.match-pair-batch
+.\bin-local\kafka-tool.cmd org.apache.kafka.tools.consumer.ConsoleConsumer --bootstrap-server localhost:9092 --topic me.match-pair-batch --from-beginning
 # KRaft 元数据 quorum 状态（4.x 没有 ZooKeeper，元数据由 controller quorum 管）
 .\bin-local\kafka-tool.cmd org.apache.kafka.tools.MetadataQuorumCommand --bootstrap-server localhost:9092 describe --status
 ```
@@ -255,13 +256,13 @@ pwsh -File .\stop-kafka.ps1
 | `me.account.commands` | 8 | 充值 / 扣账等**非冻结**资金命令（`key=userId`，`logType` 指定业务日志类型；逐条消息） |
 | `me.account.order-freeze-commands-batch` | 8 | 下单冻结命令批量消息（`logType=ORDER_FREEZE`，`key=symbol`；每个 symbol 一条，body=`OrderFreezeCommandsBatch`；账户冻结按 symbol 分区并行，同一 symbol 内保序） |
 | `me.order.freeze-results-batch` | 8 | 下单冻结回执批量消息（`key=symbol`，每个 symbol 一条，body=`OrderFreezeResultBatch`；触发进程内撮合） |
-| `me.marketdata-batch` | 8 | 行情批量消息（`key=symbol`，每个 symbol 一条，body=`MarketDataBatch`；行情模块消费并落 QuestDB） |
+| `me.match-pair-batch` | 8 | 撮合对批量消息（`key=symbol`，每个 symbol 一条，body=`MatchPairBatch`；行情模块消费生成 K 线 / 成交明细，admin 以独立消费组 `admin-user-trade` 消费并归档用户成交记录 `user_trade`，建表脚本 `doc/questdb/user_trade.sql`） |
 | `me.account.settlements-batch` | 8 | 单用户成交结算批量消息（`key/partition=slot(userId)`，每个 slot 一条，body=`TradeSettlementBatch`；每笔成交拆成买方 `-b`、卖方 `-s` 两条命令，每个元素只含一个用户的资金腿） |
 | `me.funds-batch` | 8 | 资金流水批量消息（按 userId 哈希分区，每个分区每批一条，body=`FundsFlowBatch`；8 个 admin consumer 并行归档 QuestDB） |
 | `me.order.history-batch` | 8 | 委托历史批量消息（`key=symbol`，每个 symbol 一条，body=`OrderHistoryBatch`；只包含撤单 `CANCELED` 与撮合完成 `FILLED` 两种终态；admin 消费并归档 QuestDB `ord_history`，建表脚本 `doc/questdb/ord_history.sql`） |
 | `me.depth` | 8 | 深度 / BBO 事件（规划；当前代码未使用） |
 
-> 下单、撤单、冻结回执、行情、委托历史按 symbol 分组（`key=symbol`），同一 symbol 的批次落在同一分区并保持顺序；结算按 `slot(userId)` 分组（`key/partition=slot`），同一 slot 的清算命令保持顺序；资金流水按 userId 哈希分区，每个分区每批聚合一条批量消息。单条批量消息最多封装 2000 个元素，超过时拆成多条。旧的 `me.account.order-freeze-commands` / `me.order.freeze-results` / `me.marketdata` / `me.account.settlements` / `me.funds` topic 已由上述 `-batch` topic 取代，broker 中可能保留历史消息。
+> 下单、撤单、冻结回执、撮合对、委托历史按 symbol 分组（`key=symbol`），同一 symbol 的批次落在同一分区并保持顺序；结算按 `slot(userId)` 分组（`key/partition=slot`），同一 slot 的清算命令保持顺序；资金流水按 userId 哈希分区，每个分区每批聚合一条批量消息。单条批量消息最多封装 2000 个元素，超过时拆成多条。旧的 `me.account.order-freeze-commands` / `me.order.freeze-results` / `me.marketdata` / `me.marketdata-batch` / `me.account.settlements` / `me.funds` topic 已由上述 `-batch` topic 取代（行情批量 topic 现为 `me.match-pair-batch`），broker 中可能保留历史消息。
 
 > `me.orders` / `me.trades` 已从撮合链路退役（撮合改为委托模块进程内调用），broker 中可能仍保留历史消息；不再有消费者，可按需在停 broker 后清理。
 
@@ -366,7 +367,8 @@ pwsh -File .\stop-kafka.ps1
   PostgreSQL wire（8812）只用于查询、DDL 与 `write-mode=jdbc` 回退。
   `user_id` / `currency` / `log_type` 建 SYMBOL 索引，按天分区，WAL；
   同时保存 `op`（六种原子操作）和日志描述。QWP 每批等待服务端 ack 后才返回；
-  `me.marketdata-batch` 的 `md_trade` / `md_kline` / 锚点写入同样走 QWP。
+  `me.match-pair-batch` 的 `md_trade` / `md_kline` / 锚点，以及 admin 用户成交 `user_trade`
+  的写入同样走 QWP。
 - **QuestDB 写入配置**：`app.questdb.ingest-conf-string` 为官方客户端连接串
   （默认 `ws::addr=localhost:9000;...`），`app.questdb.write-mode=client|jdbc` 控制
   QWP / JDBC batch；已建 WAL 表在磁盘满时会 `suspended`，需用
@@ -391,7 +393,7 @@ curl -G http://localhost:9000/exec `
 `FROZEN_ADJUST_IN` 六条命令后，QuestDB 中应有 6 条流水，覆盖六种原子操作；余额不足的命令
 （如超额 `WITHDRAW`）被拒绝且不产生流水。
 
-### 管理端接口（流水 / 委托历史 / K 线）
+### 管理端接口（流水 / 委托历史 / 成交记录 / K 线）
 
 - **流水列表**：`GET /api/v1/admin/funds-flows?userId=1001&currency=USDT&logType=DEPOSIT&limit=100`
   - 四个参数都可选；`currency` / `logType` 不区分大小写，结果按 `occurred_at` 倒序。
@@ -408,6 +410,12 @@ curl -G http://localhost:9000/exec `
   - 数据来自 admin 模块消费 `me.order.history-batch` 后归档的 QuestDB `ord_history`；
     委托模块在撤单推进或成交清算到 `FILLED` 时产出事件，与消费 offset 同事务发送。
   - 建表脚本见 `doc/questdb/ord_history.sql`。
+- **成交记录列表**：`GET /api/v1/admin/user-trades?userId=1001&symbol=BTC-USDT&role=TAKER&limit=100`
+  - 参数均可选；`role` 只接受 `TAKER`（主动成交）/ `MAKER`（被动成交），结果按
+    `executed_at` 倒序；`limit` 缺省 100、上限 1000。
+  - 数据来自 admin 模块消费 `me.match-pair-batch` 后归档的 QuestDB `user_trade`：每个撮合对
+    拆成 taker / maker 两条，包含当前用户的委托号、对手单号、方向、价格、数量与成交额。
+  - 建表脚本见 `doc/questdb/user_trade.sql`。
 - **K 线列表**：`GET /api/v1/admin/klines?symbol=BTC-USDT&interval=1m&limit=100`
   - `symbol` / `interval` 可选，结果按 `bucket_start` 倒序；`interval` 支持
     `1m / 5m / 15m / 30m / 1h / 4h / 1d`，`limit` 缺省 100、上限 1000。
@@ -419,11 +427,12 @@ curl -G http://localhost:9000/exec `
 curl "http://localhost:8080/api/v1/admin/funds-flows?userId=1001&limit=50"
 curl -X DELETE "http://localhost:8080/api/v1/admin/funds-flows"
 curl "http://localhost:8080/api/v1/admin/order-history?userId=1001&status=FILLED&limit=50"
+curl "http://localhost:8080/api/v1/admin/user-trades?userId=1001&role=TAKER&limit=50"
 curl "http://localhost:8080/api/v1/admin/klines?symbol=BTC-USDT&interval=1m&limit=50"
 curl -X DELETE "http://localhost:8080/api/v1/admin/klines"
 ```
 
-### 交易端用户历史流水与委托历史
+### 交易端用户历史流水、委托历史与成交
 
 - `GET /api/v1/currency/funds-flows?userId=1001&currency=USDT&limit=50`
   - `userId` 必填；`currency` 可选（不区分大小写）；`limit` 缺省 50、服务端上限 1000。
@@ -441,13 +450,23 @@ curl -X DELETE "http://localhost:8080/api/v1/admin/klines"
   - 参数非法返回 400（`USER_ID_REQUIRED` / `USER_ID_INVALID` / `SYMBOL_INVALID` /
     `LIMIT_INVALID`）；QuestDB 不可用时返回 503 `QUERY_FAILED`。
 
+- `GET /api/v1/currency/user-trades?userId=1001&symbol=BTC-USDT&limit=50`
+  - `userId` 必填；`symbol` 可选（不区分大小写）；`limit` 缺省 50、服务端上限 1000。
+  - 返回该用户的成交记录（每个撮合对只返回当前用户自己的一侧），按 `executed_at` 倒序；
+    包含角色（主动 / 被动）、委托号、对手单号、方向、价格、数量与成交额。
+  - 币币模块通过 shared 的 `UserTradeQueryPort` 读取；QuestDB 访问层与 `user_trade`
+    表仍归 admin 模块，币币模块不直接访问表。
+  - 参数非法返回 400（`USER_ID_REQUIRED` / `USER_ID_INVALID` / `SYMBOL_INVALID` /
+    `LIMIT_INVALID`）；QuestDB 不可用时返回 503 `QUERY_FAILED`。
+
 ```powershell
 curl "http://localhost:8080/api/v1/currency/funds-flows?userId=1001&limit=50"
 curl "http://localhost:8080/api/v1/orders/history?userId=1001&limit=50"
+curl "http://localhost:8080/api/v1/currency/user-trades?userId=1001&limit=50"
 ```
 
 前端 `web/` 顶栏提供「币币交易 / 后台管理」两个并排栏目；进入后台管理后左侧子栏目为
-「流水管理 / 委托历史 / K 线管理」，分别对接上面三组接口。
+「流水管理 / 委托历史 / 成交记录 / K 线管理」，分别对接上面几组接口。
 
 > `admin` 是新增的支撑模块（独立包），不在五个业务模块链路中；后续可把查询投影
 > 从 QuestDB 扩展到 ClickHouse / 运营接口。
@@ -479,7 +498,7 @@ curl "http://localhost:8080/api/v1/orders/history?userId=1001&limit=50"
    （`ACCEPTED → PAID / REJECTED`），生成撮合单；按原回执顺序聚合后由
    `OrderMatchingService.matchBatch` 在引擎对象锁内调用 `MatchingEngine.place()`，收集成交对；
    再把成交清算提交线程池并发调用 `OrderMatchingService.clear`（内部 `OrderService.onTrade` /
-   `completeMarketBuy`），最后在同一个冻结回执监听事务里发布 `me.marketdata-batch` 与
+   `completeMarketBuy`），最后在同一个冻结回执监听事务里发布 `me.match-pair-batch` 与
    `me.account.settlements-batch`。不再写 `me.orders`，也不再由 matching 模块消费 Kafka。
    引擎对象锁覆盖撮合与清算两个阶段，撤单的引擎阶段会等待，避免与清算交错。
    - 冻结回执重复是正常路径：账户模块对重复 `requestId` 会再次发布回执，并可能再次执行冻结
@@ -584,7 +603,7 @@ curl -X POST http://localhost:8080/api/v1/currency/orders/cancel \
 > （批量 `OrderCommandBatch`）取代。升级时需删除 / 排空旧 topic；若消费组仍从旧 topic
 > 的 offset 启动，会因消息格式不匹配而反序列化失败。
 
-下单后的可观测信号：`me.marketdata-batch` 可消费到成交行情，`me.account.settlements-batch`
+下单后的可观测信号：`me.match-pair-batch` 可消费到撮合对，`me.account.settlements-batch`
 可消费到结算命令，`me.orders` / `me.trades` 不再有新增消息。未充值或余额不足时，委托状态为
 `REJECTED`，不会撮合，可通过 `GET /api/v1/orders` 查询。
 下单接口每次请求都由服务端生成新的 `orderId`，重复发送同一个 `requestId` 会产生新委托；
@@ -653,10 +672,10 @@ curl -X POST http://localhost:8080/api/v1/currency/orders/cancel \
   `OrderMatchingService.matchBatch(List<OrderPlacedEvent>)`，按原顺序在引擎对象锁内撮合；
 - `MatchingEngine.place()` 同步返回 `MatchResult`，按 `orderId` 幂等去重；
 - 成交清算在线程池中并发调用 `OrderMatchingService.clear`，委托状态推进后再聚合发送输出；
-- 委托模块先按 symbol 分组发布 `me.marketdata-batch` 行情批量消息，再按 userId slot 分组发布
+- 委托模块先按 symbol 分组发布 `me.match-pair-batch` 撮合对批量消息，再按 userId slot 分组发布
   `me.account.settlements-batch` 结算批量消息（`amount` 已按交易对 / 币种精度换算成计价币最小单位）；
-- 行情/结算发送与 `me.order.freeze-results-batch` 消费 offset 在同一个 Kafka 事务内提交；
-  行情模块按独立消费组消费 `me.marketdata-batch`（见「行情模块 M0」）。
+- 撮合对/结算发送与 `me.order.freeze-results-batch` 消费 offset 在同一个 Kafka 事务内提交；
+  行情模块与 admin 各自以独立消费组消费 `me.match-pair-batch`（见「行情模块 M0」与「用户成交记录」）。
 
 ## 已实现：成交清算 + 双边资金结清
 
@@ -717,23 +736,25 @@ curl -X POST http://localhost:8080/api/v1/currency/orders/cancel \
 - 成交对（演示版）：委托模块不缓存清算结果；重复回执由撮合引擎 `orderId` 去重，
   已全部成交的重复成交由订单状态拒绝；部分成交重投不保证去重。
 - 结算消息：`requestId` 由委托模块的进程内 `AtomicLong` 计数器生成（当前毫秒时间戳起步，避免每笔成交做两次 Long 转字符串 + 拼接），仅用于日志/审计/资金流水；演示版账户模块不做 requestId 防重，重投会再次执行。计数器后续随内存状态持久化/恢复。
-- `me.order.freeze-results-batch` 消费 offset、`me.marketdata-batch` 行情与结算批量消息同事务提交；发送失败回滚 offset，重投会重发同一批消息。
+- `me.order.freeze-results-batch` 消费 offset、`me.match-pair-batch` 撮合对与结算批量消息同事务提交；发送失败回滚 offset，重投会重发同一批消息。
 - 账户结算成功时每条资金腿生成一条 `me.funds-batch` 流水（4~5 条/成交），与消费 offset 同事务。
 
-## 已实现：行情模块 M0（成交行情 + K 线落 QuestDB）
+## 已实现：行情模块 M0（撮合对消费 + K 线落 QuestDB）
 
-委托模块在进程内撮合完成后，把每笔成交封装为 `MarketDataEvent` 写入
-`me.marketdata-batch`（key=symbol）；行情模块以独立消费组消费，生成 K 线并把近期成交（每个 poll 批次最后 20 条）保存到 QuestDB。
-行情写库与 K 线聚合在独立消费组中异步进行，不占用撮合/清算线程；行情消息与
+委托模块在进程内撮合完成后，把每笔成交封装为 `MatchPairEvent` 写入
+`me.match-pair-batch`（key=symbol）。行情模块与 admin 各以独立消费组消费同一 topic：
+行情模块生成 K 线并把近期成交（每个 poll 批次最后 20 条）保存到 QuestDB；admin 把每个
+撮合对拆成 taker / maker 两条用户成交记录归档到 QuestDB `user_trade`。
+行情写库与 K 线聚合在独立消费组中异步进行，不占用撮合/清算线程；撮合对消息与
 `me.account.settlements-batch` 结算批量消息、冻结回执消费 offset 在同一个 Kafka 事务内发送，
 任一发送失败会一起回滚并重投。
 
 ### 链路
 
-1. **撮合输出行情**：`OrderMatchingService` 为每笔成交生成 `MarketDataEvent`（tradeId、symbol、
-   taker / maker orderId、方向、价格、数量、金额、成交时间），由 `OrderFreezeResultListener`
-   与结算命令一起发布。
-2. **消费行情**：`com.me.marketdata.mq.MarketDataListener` 消费 `me.marketdata-batch`
+1. **撮合输出撮合对**：`OrderMatchingService` 为每笔成交生成 `MatchPairEvent`（tradeId、symbol、
+   taker / maker orderId、taker / maker userId、方向、价格、数量、金额、成交时间），由
+   `OrderFreezeResultListener` 与结算命令一起发布。
+2. **消费撮合对**：`com.me.marketdata.mq.MarketDataListener` 消费 `me.match-pair-batch`
    （group `marketdata-trade-consumer`），把记录与 `partition/offset` 交给 `MarketDataService`。
 3. **成交明细**：每个 poll 批次只取**最后 20 条**成交写入 QuestDB `md_trade`（近期成交查询口径，
    不为历史全量保留）。指定时间戳 `executed_at`，DEDUP 键
@@ -757,6 +778,25 @@ curl -X POST http://localhost:8080/api/v1/currency/orders/cancel \
 5. **周期配置**：`app.marketdata.kline-intervals`，默认 `1m`；可写
    `1m,5m,15m,30m,1h,4h,1d`，每个周期每个 bucket 按 `kline-write-every-batches` 节流写入
    （默认每 5 批更新一次，跨分钟写最终快照）。
+
+### 用户成交记录（admin 归档）
+
+admin 模块以消费组 `admin-user-trade` 消费同一个 `me.match-pair-batch`（8 个 consumer
+按 symbol 分区并行），把每个撮合对拆成 taker / maker 两条记录写入 QuestDB `user_trade`：
+
+- `role=TAKER` 行：`user_id=takerUserId`、`order_id=takerOrderId`、`side=takerSide`、
+  `counter_order_id=makerOrderId`；
+- `role=MAKER` 行：`user_id=makerUserId`、`order_id=makerOrderId`、`side` 与 taker 相反、
+  `counter_order_id=takerOrderId`；
+- 两行共享 `trade_id / symbol / price / quantity / amount / executed_at`。
+
+每个 poll 批次一个 Kafka 事务，按 20,000 个撮合对分块走 QWP 批量写入并等待服务端 ack；
+`user_trade` 按 `(executed_at, trade_id, order_id)` DEDUP，Kafka 重投不会产生重复行。
+消费端另用有界的 `symbol + tradeId` 集合跳过已成功归档的成交，减少重复写入。
+建表脚本：`doc/questdb/user_trade.sql`（应用首次写入前也会用同一 DDL 自动补建）。
+
+管理端查询：`GET /api/v1/admin/user-trades?userId=1001&symbol=BTC-USDT&role=TAKER&limit=100`
+（筛选参数均可选，按 `executed_at` 倒序），演示前端「后台管理 → 成交记录」子栏目已接入。
 
 ### 查询 K 线
 
@@ -872,8 +912,8 @@ curl "http://localhost:8080/api/v1/marketdata/orderbook?symbol=BTC-USDT&depth=5"
 ### 本地验证
 
 ```powershell
-# 下两笔可撮合委托（见上文 REST 下单）后，查看行情 topic
-kafka-console-consumer --bootstrap-server localhost:9092 --topic me.marketdata-batch --from-beginning
+# 下两笔可撮合委托（见上文 REST 下单）后，查看撮合对 topic
+kafka-console-consumer --bootstrap-server localhost:9092 --topic me.match-pair-batch --from-beginning
 
 # QuestDB：最新成交
 curl -G http://localhost:9000/exec `
@@ -1106,8 +1146,10 @@ curl -X POST http://localhost:8080/api/v1/admin/recharges \
 | 撤单委托 | `POST /api/v1/currency/orders/cancel`（202，异步提交） | 手动 |
 | 模拟登录 / 充值 | `POST /api/v1/admin/recharges` | 手动 |
 | 用户历史流水 | `GET /api/v1/currency/funds-flows` | 5s |
+| 用户历史成交 | `GET /api/v1/currency/user-trades` | 5s |
 | 后台流水管理 | `GET/DELETE /api/v1/admin/funds-flows` | 手动 |
 | 后台委托历史 | `GET /api/v1/admin/order-history` | 手动 |
+| 后台成交记录 | `GET /api/v1/admin/user-trades` | 手动 |
 | 后台 K 线管理 | `GET/DELETE /api/v1/admin/klines` | 手动 |
 
 前端功能：
@@ -1116,22 +1158,25 @@ curl -X POST http://localhost:8080/api/v1/admin/recharges \
   「订单簿 / 最新成交」共享栏目，通过顶部左右标签切换（订单簿展示价格档位与
   累计深度条，中间行展示最新成交价、买卖盘上下各半空间；最新成交展示价格 / 数量 / 时间，
   均 3 秒轮询）；1m 蜡烛图 + 成交量柱
-  （缩放 / 拖拽、十字光标 OHLC 图例）；图表下方「当前委托 / 历史委托 / 历史流水」面板通过
-  顶部标签切换：当前委托显示方向、价格、数量、已成交、状态与「撤单」操作（3 秒轮询；`PAID` /
-  `PARTIALLY_FILLED` 可撤，`ACCEPTED` 等待冻结完成后可撤），历史委托展示当前用户已撤单 /
-  已撮合完成的委托（QuestDB `ord_history`，按终态时间倒序，5 秒轮询），历史流水展示当前用户
-  QuestDB `funds_flow` 记录，按发生时间倒序、最新在前（5 秒轮询）；资产余额
+  （缩放 / 拖拽、十字光标 OHLC 图例）；图表下方「当前委托 / 历史委托 / 历史成交 / 历史流水」
+  面板通过顶部标签切换：当前委托显示方向、价格、数量、已成交、状态与「撤单」操作（3 秒轮询；
+  `PAID` / `PARTIALLY_FILLED` 可撤，`ACCEPTED` 等待冻结完成后可撤），历史委托展示当前用户
+  已撤单 / 已撮合完成的委托（QuestDB `ord_history`，按终态时间倒序，5 秒轮询），历史成交展示
+  当前用户每一笔成交（QuestDB `user_trade`，主动 / 被动、方向、价格、数量、成交额，按成交时间
+  倒序，5 秒轮询），历史流水展示当前用户 QuestDB `funds_flow` 记录，按发生时间倒序、最新在前
+  （5 秒轮询）；资产余额
   （可用 / 冻结，按币种精度换算）；限价 / 市价、
   买入 / 卖出表单（25% / 50% / 75% / 100% 快捷填量，提交前校验最小下单量与最小金额，
   提交前还用轮询到的余额快照校验冻结金额 / 数量：不足时展示「可用余额不足」及差额，
   并主动刷新余额后让用户重试；最终仍以后端冻结回执为准）；自动生成 `requestId` 仅作命令
   标识，演示版不用于防重。
-- **后台管理**：左侧为「流水管理 / 委托历史 / K 线管理」子栏目。流水管理按用户 / 币种 /
-  日志类型查询 QuestDB `funds_flow`，展示金额、余额前后值、原子操作与 `seq`；委托历史按
+- **后台管理**：左侧为「流水管理 / 委托历史 / 成交记录 / K 线管理」子栏目。流水管理按用户 /
+  币种 / 日志类型查询 QuestDB `funds_flow`，展示金额、余额前后值、原子操作与 `seq`；委托历史按
   用户 / 交易对 / 终态（撮合完成 / 已撤销）查询 `ord_history`，展示方向、价格、数量、成交量与
-  `seq`；K 线管理按交易对 / 周期查询 `md_kline`，展示 OHLC、成交量、成交额与笔数。
-  流水与 K 线子栏目提供「一键删除」，执行前二次确认，使用 `TRUNCATE TABLE` 清空对应投影；
-  委托历史只读。
+  `seq`；成交记录按用户 / 交易对 / 角色（主动 / 被动）查询 `user_trade`，展示成交号、委托号、
+  对手单号、方向、价格、数量与成交额；K 线管理按交易对 / 周期查询 `md_kline`，展示 OHLC、
+  成交量、成交额与笔数。流水与 K 线子栏目提供「一键删除」，执行前二次确认，使用
+  `TRUNCATE TABLE` 清空对应投影；委托历史与成交记录只读。
 - 「模拟登录 / 充值」弹框：「确认充值」调用 `POST /api/v1/admin/recharges` 为目标用户
   入账并切换为当前用户，弹框保持打开，可继续选择其他币种充值；「登录」只切换用户、
   不充值。资产面板提供「刷新余额」按钮。

@@ -16,7 +16,7 @@ import org.springframework.stereotype.Component;
  * （超过 2000 条时由 {@link KafkaSink} 拆成多条）。
  *
  * <p>发送发生在消费 runner 的 Kafka 事务内：撤单历史与撤单 offset 同事务提交/回滚；
- * 撮合产生的历史与冻结回执 offset、行情、结算命令同事务提交/回滚。
+ * 撮合产生的历史与冻结回执 offset、撮合对、结算命令同事务提交/回滚。
  */
 @Component
 public class OrderHistoryPublisher {

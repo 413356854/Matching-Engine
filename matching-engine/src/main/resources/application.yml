@@ -106,6 +106,9 @@ app:
         # 委托历史按 symbol 分区；8 个 consumer 对应 8 分区，不同 symbol 并行归档 QuestDB，
         # 同一 symbol 仍由单 consumer 串行。
         order-history: 8
+        # 撮合对按 symbol 分区，admin 用户成交归档与 order-history 一样按分区并行；
+        # 同一 symbol 的成交仍由单 consumer 串行写入 QuestDB。
+        user-trade: 8
     producer:
       acks: all
       enable-idempotence: true
@@ -131,7 +134,8 @@ app:
       order-cancels: me.order.cancels-batch
       account-settlements: me.account.settlements-batch
       order-freeze-results: me.order.freeze-results-batch
-      market-data: me.marketdata-batch
+      # 撮合对：key=symbol；行情模块消费生成 K 线，admin 消费归档用户成交记录
+      match-pair: me.match-pair-batch
       # 资金流水按 userId 分组、key=userId；8 个 consumer 并行归档
       funds-flow: me.funds-batch
       # 委托历史：撤单 / 撮合完成的委托按 symbol 分组，key=symbol，admin 消费并归档 QuestDB
@@ -144,6 +148,7 @@ app:
       order-cancel: order-cancel-consumer
       order-freeze-result: order-freeze-result-consumer
       marketdata: marketdata-trade-consumer
+      user-trade: admin-user-trade
       admin: admin-funds-flow
       order-history: admin-order-history
     topic:
@@ -207,6 +212,7 @@ app:
     # 官方 Java 客户端（QWP over WebSocket，批量写入 + 服务端 ack）
     # write-mode=client 时资金流水/成交/K线/锚点写入走 QWP；jdbc 时退回 JDBC batch 便于 A/B
     # sender_pool_max 必须 >= 并发 QWP 写入线程数（8 funds-flow + 8 order-history +
-    # marketdata），否则会等满 acquire_timeout 后抛 LineSenderException，造成消费停摆。
+    # marketdata + 8 user-trade），否则会等满 acquire_timeout 后抛 LineSenderException，
+    # 造成消费停摆。
     ingest-conf-string: "${QUESTDB_INGEST_CONF:ws::addr=localhost:9000;username=admin;password=quest;lazy_connect=on;sender_pool_min=1;sender_pool_max=32;auto_flush_rows=75000;auto_flush_interval=1000;acquire_timeout_ms=10000;}"
     write-mode: "${QUESTDB_WRITE_MODE:client}"

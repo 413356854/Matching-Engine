@@ -14,8 +14,10 @@ React 19 + TypeScript + Vite 的单页应用，对接 `matching-engine` 的 `/ap
 - 1m K 线蜡烛图 + 成交量柱（`lightweight-charts`，5s 轮询，支持缩放 / 拖拽 / 十字光标）
 - 最新成交：与订单簿同一栏目，通过顶部「订单簿 / 最新成交」标签左右切换，展示价格 /
   数量 / 时间（3s 轮询）
-- 当前委托：图表下方独立面板，展示用户未完成委托的方向、价格、数量、已成交和状态
-  （3s 轮询）
+- 账户活动面板：图表下方通过顶部标签切换「当前委托 / 历史委托 / 历史成交 / 历史流水」。
+  当前委托展示未完成委托的方向、价格、数量、已成交和状态（3s 轮询）；历史委托读取
+  QuestDB `ord_history`，历史成交读取 `user_trade`（主动 / 被动、方向、价格、数量、成交额），
+  历史流水读取 `funds_flow`，均按时间倒序、5s 轮询
 - 资产余额：可用 / 冻结，按 `pair_currency.scale` 换算；面板右上角提供「刷新余额」按钮
 - 下单：限价 / 市价，买入 / 卖出，25% / 50% / 75% / 100% 快捷填量，
   最小下单量 / 最小金额前端校验；余额由后端冻结时校验（前端余额是轮询快照，避免刚充值/
@@ -30,6 +32,11 @@ React 19 + TypeScript + Vite 的单页应用，对接 `matching-engine` 的 `/ap
 
 - **流水管理**：按用户 ID / 币种 / 日志类型查询 QuestDB `funds_flow`，按发生时间倒序展示
   金额、可用 / 冻结余额前后值、原子操作与 `seq`；支持一键清空全部流水。
+- **委托历史**：按用户 ID / 交易对 / 终态（撮合完成 / 已撤销）查询 QuestDB `ord_history`，
+  按终态时间倒序展示方向、价格、数量、成交量与 `seq`；只读。
+- **成交记录**：按用户 ID / 交易对 / 角色（主动 / 被动）查询 QuestDB `user_trade`，
+  按成交时间倒序展示成交号、委托号、对手单号、方向、价格、数量与成交额；只读。
+  每个撮合对拆成 taker / maker 两条记录。
 - **K 线管理**：按交易对 / 周期查询 QuestDB `md_kline`，按 bucket 起点倒序展示 OHLC、
   成交量、成交额与笔数；支持一键清空全部 K 线（成交明细 `md_trade` 不受影响）。
 
@@ -45,11 +52,14 @@ React 19 + TypeScript + Vite 的单页应用，对接 `matching-engine` 的 `/ap
 | `GET /api/v1/marketdata/klines?symbol=&interval=1m&limit=180` | 1m K 线 |
 | `GET /api/v1/marketdata/orderbook?symbol=&depth=10` | 内存订单簿深度（3s 轮询） |
 | `GET /api/v1/marketdata/trades?symbol=&limit=50` | 最新成交 |
+| `GET /api/v1/currency/user-trades?userId=&symbol=&limit=50` | 当前用户历史成交（QuestDB `user_trade`） |
 | `POST /api/v1/currency/orders` | 提交下单命令（202，异步写入 `me.order.commands`） |
 | `GET /api/v1/orders?userId=&symbol=&limit=100` | 用户当前未完成委托（3s 轮询） |
 | `POST /api/v1/admin/recharges` | 模拟登录 / 管理端充值（`amount` 为展示金额，默认 100 万） |
 | `GET /api/v1/admin/funds-flows` | 后台流水列表（`userId` / `currency` / `logType` / `limit` 可选） |
 | `DELETE /api/v1/admin/funds-flows` | 后台一键清空全部流水 |
+| `GET /api/v1/admin/order-history` | 后台委托历史（`userId` / `symbol` / `status` / `limit` 可选） |
+| `GET /api/v1/admin/user-trades` | 后台成交记录（`userId` / `symbol` / `role` / `limit` 可选） |
 | `GET /api/v1/admin/klines` | 后台 K 线列表（`symbol` / `interval` / `limit` 可选） |
 | `DELETE /api/v1/admin/klines` | 后台一键清空全部 K 线 |
 
@@ -107,6 +117,7 @@ src/
 │   ├── Header.tsx         # 顶栏、栏目切换、用户切换、连接状态
 │   ├── MarketPickerModal.tsx # 交易对选择弹框
 │   ├── BookTradesPanel.tsx # 订单簿 / 最新成交切换栏目
+│   ├── AccountActivityPanel.tsx # 当前委托 / 历史委托 / 历史成交 / 历史流水
 │   ├── OrderBookPanel.tsx # 订单簿深度内容（3s 轮询）
 │   ├── LatestTradesPanel.tsx # 最新成交内容（3s 轮询）
 │   ├── ChartPanel.tsx     # 1m K 线 + 成交量
@@ -115,6 +126,8 @@ src/
 │   ├── RechargeModal.tsx  # 模拟登录 / 充值弹框
 │   ├── AdminPage.tsx      # 后台管理左右布局与子栏目
 │   ├── FundsFlowAdmin.tsx # 流水管理（查询 / 一键删除）
+│   ├── OrderHistoryAdmin.tsx # 委托历史（查询）
+│   ├── UserTradeAdmin.tsx # 成交记录（查询）
 │   ├── KlineAdmin.tsx     # K 线管理（查询 / 一键删除）
 │   └── ToastStack.tsx     # 操作提示
 ├── App.tsx                # 数据轮询、栏目切换与页面布局

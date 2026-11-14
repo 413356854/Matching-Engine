@@ -9,11 +9,11 @@ import java.util.List;
 
 /**
  * 委托侧撮合编排：把已支付委托送入进程内 {@code MatchingEngine}，完成成交清算，
- * 返回需要在 Kafka 监听事务内发布的行情与结算消息；撤单时把一批撤消单聚合后送入
+ * 返回需要在 Kafka 监听事务内发布的撮合对与结算消息；撤单时把一批撤消单聚合后送入
  * 同一个撮合引擎，收集被撤销的挂单。
  *
  * <p><b>冻结回执两段式</b>：{@link #matchBatch} 聚合整批已支付委托调用撮合引擎并返回
- * 成交对，{@link #clear} 对每笔委托生成行情与结算命令。调用方（{@code OrderFreezeResultListener}）
+ * 成交对，{@link #clear} 对每笔委托生成撮合对与结算命令。调用方（{@code OrderFreezeResultListener}）
  * 在引擎对象锁内完成两段，再把 {@code clear} 分发到订单更新线程池并发执行，
  * 既保证撮合输入顺序，又允许成交清算并行。
  *
@@ -35,7 +35,7 @@ public interface OrderMatchingService {
     List<MatchResult> matchBatch(List<OrderPlacedEvent> orders);
 
     /**
-     * 成交清算：对一笔已撮合委托执行成交清算（含市价买入完成退款），生成行情与结算命令。
+     * 成交清算：对一笔已撮合委托执行成交清算（含市价买入完成退款），生成撮合对与结算命令。
      * 可在订单更新线程池中并发调用；与撤单的互斥由调用方持有的引擎对象锁临界区保证。
      */
     OrderMatchResult clear(OrderPlacedEvent order, MatchResult result);

@@ -182,7 +182,7 @@ public class OrderServiceImpl implements OrderService {
                     || order.status() == OrderStatus.PARTIALLY_FILLED
                     || order.status() == OrderStatus.FILLED) {
                 // 回执可能因事务重试/重复命令被再次投递。已支付（甚至已成交）时仍返回 placedEvent，
-                // 撮合引擎按 orderId 返回 duplicate，本次不再产生行情/结算（演示版不重放输出）。
+                // 撮合引擎按 orderId 返回 duplicate，本次不再产生撮合对/结算（演示版不重放输出）。
                 resultRef.set(OrderFreezeApplyResult.placed(order.toPlacedEvent()));
                 return order;
             }

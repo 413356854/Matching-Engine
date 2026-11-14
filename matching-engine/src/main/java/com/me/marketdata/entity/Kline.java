@@ -1,6 +1,6 @@
 package com.me.marketdata.entity;
 
-import com.me.shared.event.MarketDataEvent;
+import com.me.shared.event.MatchPairEvent;
 import java.time.Instant;
 
 /**
@@ -32,7 +32,7 @@ public record Kline(
      * <p>high/low 同时覆盖 open 与首笔成交价，保证 OHLC 始终有效（如上一根 close 高于
      * 首笔成交价时 low 不会高于 open）。成交量为该笔成交量，笔数为 1。
      */
-    public static Kline opened(MarketDataEvent trade, KlineInterval interval, Instant bucketStart,
+    public static Kline opened(MatchPairEvent trade, KlineInterval interval, Instant bucketStart,
                                long openPrice, int partition, long offset) {
         long price = trade.price();
         return new Kline(trade.symbol(), interval, bucketStart,
@@ -44,7 +44,7 @@ public record Kline(
     }
 
     /** 新线的第一根 K 线：没有上一根 close，四个价格都取成交价。 */
-    public static Kline opened(MarketDataEvent trade, KlineInterval interval, Instant bucketStart,
+    public static Kline opened(MatchPairEvent trade, KlineInterval interval, Instant bucketStart,
                                int partition, long offset) {
         return opened(trade, interval, bucketStart, trade.price(), partition, offset);
     }
@@ -62,7 +62,7 @@ public record Kline(
     }
 
     /** 同一 bucket 的后续成交：high/low 取极值，close 取最新成交价，量 / 额 / 笔数累加。 */
-    public Kline updated(MarketDataEvent trade, int partition, long offset) {
+    public Kline updated(MatchPairEvent trade, int partition, long offset) {
         return new Kline(symbol, interval, bucketStart,
                 openPrice,
                 Math.max(highPrice, trade.price()),

@@ -9,6 +9,7 @@ import {
   fetchPairs,
   fetchTrades,
   fetchUserFundsFlows,
+  fetchUserTrades,
   isAbortError,
   type AccountBalance,
   type Currency,
@@ -19,6 +20,7 @@ import {
   type OrderView,
   type Trade,
   type TradingPair,
+  type UserTrade,
 } from './api';
 import { AccountActivityPanel } from './components/AccountActivityPanel';
 import { AdminPage } from './components/AdminPage';
@@ -54,6 +56,7 @@ function App() {
   const [trades, setTrades] = useState<Trade[]>([]);
   const [openOrders, setOpenOrders] = useState<OrderView[]>([]);
   const [orderHistory, setOrderHistory] = useState<OrderHistory[]>([]);
+  const [userTrades, setUserTrades] = useState<UserTrade[]>([]);
   const [fundsFlows, setFundsFlows] = useState<FundsFlow[]>([]);
   const [orderBook, setOrderBook] = useState<OrderBookDepth | null>(null);
   const [lastPrices, setLastPrices] = useState<Record<string, number>>({});
@@ -64,6 +67,7 @@ function App() {
   const [orderBookError, setOrderBookError] = useState<string | null>(null);
   const [ordersError, setOrdersError] = useState<string | null>(null);
   const [orderHistoryError, setOrderHistoryError] = useState<string | null>(null);
+  const [userTradesError, setUserTradesError] = useState<string | null>(null);
   const [fundsFlowsError, setFundsFlowsError] = useState<string | null>(null);
   const [refreshNonce, setRefreshNonce] = useState(0);
   const [balancesNonce, setBalancesNonce] = useState(0);
@@ -309,6 +313,28 @@ function App() {
     [userId, view],
   );
 
+  const loadUserTrades = useCallback(
+    async (signal: AbortSignal) => {
+      if (view !== 'trade') {
+        return;
+      }
+      try {
+        const list = await fetchUserTrades(userId, undefined, 50, signal);
+        if (signal.aborted) {
+          return;
+        }
+        setUserTrades(list);
+        setUserTradesError(null);
+      } catch (error) {
+        if (isAbortError(error) || signal.aborted) {
+          return;
+        }
+        setUserTradesError(describeError(error));
+      }
+    },
+    [userId, view],
+  );
+
   const loadFundsFlows = useCallback(
     async (signal: AbortSignal) => {
       if (view !== 'trade') {
@@ -388,6 +414,8 @@ function App() {
     setOrdersError(null);
     setOrderHistory([]);
     setOrderHistoryError(null);
+    setUserTrades([]);
+    setUserTradesError(null);
     setFundsFlows([]);
     setFundsFlowsError(null);
   }, [userId]);
@@ -405,6 +433,7 @@ function App() {
   usePolling(loadTrades, 3_000, [selectedSymbol, refreshNonce, view]);
   usePolling(loadOpenOrders, 3_000, [userId, refreshNonce, view]);
   usePolling(loadOrderHistory, 5_000, [userId, refreshNonce, view]);
+  usePolling(loadUserTrades, 5_000, [userId, refreshNonce, view]);
   usePolling(loadFundsFlows, 5_000, [userId, refreshNonce, view]);
   usePolling(loadOrderBook, 3_000, [selectedSymbol, refreshNonce, view]);
   usePolling(loadLastPrices, 15_000, [pairs, refreshNonce, view]);
@@ -476,6 +505,8 @@ function App() {
               ordersError={ordersError}
               history={orderHistory}
               historyError={orderHistoryError}
+              trades={userTrades}
+              tradesError={userTradesError}
               flows={fundsFlows}
               flowsError={fundsFlowsError}
               currencyScales={currencyScales}
@@ -538,7 +569,7 @@ function App() {
           </>
         ) : (
           <>
-            <span>后台管理：QuestDB funds_flow / ord_history / md_kline</span>
+            <span>后台管理：QuestDB funds_flow / ord_history / user_trade / md_kline</span>
             <span>删除操作使用 TRUNCATE，不可恢复</span>
           </>
         )}

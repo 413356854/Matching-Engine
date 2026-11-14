@@ -6,7 +6,7 @@ import com.me.marketdata.entity.Kline;
 import com.me.marketdata.entity.KlineAnchor;
 import com.me.marketdata.entity.KlineInterval;
 import com.me.marketdata.entity.TradeRecord;
-import com.me.shared.event.MarketDataEvent;
+import com.me.shared.event.MatchPairEvent;
 import com.me.shared.order.OrderSide;
 import io.questdb.client.Sender;
 import java.sql.PreparedStatement;
@@ -137,7 +137,7 @@ public class MarketDataRepository {
     }
 
     /** 批量写入一个 Kafka poll 批次中的成交；DEDUP 键保证消费重投不会产生重复行。 */
-    public void insertTrades(List<MarketDataEvent> events) {
+    public void insertTrades(List<MatchPairEvent> events) {
         if (events.isEmpty()) {
             return;
         }
@@ -219,7 +219,7 @@ public class MarketDataRepository {
         });
     }
 
-    private static void bindTrade(PreparedStatement ps, MarketDataEvent event, Instant archivedAt)
+    private static void bindTrade(PreparedStatement ps, MatchPairEvent event, Instant archivedAt)
             throws SQLException {
         ps.setLong(1, event.tradeId());
         ps.setString(2, event.symbol());
@@ -251,7 +251,7 @@ public class MarketDataRepository {
     }
 
     /** 把一条成交追加到 QWP sender；{@code executed_at} 是表指定时间戳。 */
-    private static void appendTrade(Sender sender, MarketDataEvent event, Instant archivedAt) {
+    private static void appendTrade(Sender sender, MatchPairEvent event, Instant archivedAt) {
         Sender row = sender.table("md_trade")
                 .longColumn("trade_id", event.tradeId())
                 .symbol("symbol", event.symbol())
