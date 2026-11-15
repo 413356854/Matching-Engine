@@ -12,7 +12,6 @@ import com.me.shared.event.OrderFreezeResultEvent;
 import jakarta.annotation.PreDestroy;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -38,19 +37,12 @@ import org.springframework.stereotype.Component;
  * {@code me.order.freeze-results-batch}。并行只发生在账户写入/流水构建，不改变回执顺序。
  *
  * <p><b>批量消费</b>：一个 poll 批次一个 Kafka 事务，冻结命令 offset、资金流水与冻结回执
- * 一起提交/回滚。发布失败整批回滚重投，由 {@link AccountService} 按 requestId 幂等去重。
- *
- * <p><b>拒绝结果缓存</b>：整批回滚后内存状态不回滚，而同批后续记录或并发线程可能改变余额；
- * 按批量消息内位置 {@code (partition, offset, index)} 缓存拒绝结果，重投时复现原拒绝，
- * 保持 fail-stop 的确定性。
+ * 一起提交/回滚。发布失败整批回滚重投，同一批命令会再次执行（演示版不做 requestId 防重）。
  */
 @Component
 public class AccountFreezeCommandListener {
 
     private static final Logger log = LoggerFactory.getLogger(AccountFreezeCommandListener.class);
-
-    /** 批量重投时复现拒绝结果的缓存上限。 */
-    static final int REJECTED_CACHE_LIMIT = 65_536;
 
     private final AccountService accountService;
     private final FundsFlowPublisher flowPublisher;
@@ -58,14 +50,6 @@ public class AccountFreezeCommandListener {
 
     /** 批内按 userId slot 并发的固定线程池；同时最多 8 个账户写线程。 */
     private final ExecutorService slotExecutor;
-
-    private final Map<RecordKey, AccountApplyResult> rejected = Collections.synchronizedMap(
-            new LinkedHashMap<>(256, 0.75f, false) {
-                @Override
-                protected boolean removeEldestEntry(Map.Entry<RecordKey, AccountApplyResult> eldest) {
-                    return size() > REJECTED_CACHE_LIMIT;
-                }
-            });
 
     public AccountFreezeCommandListener(AccountService accountService,
                                         FundsFlowPublisher flowPublisher,
@@ -200,23 +184,16 @@ public class AccountFreezeCommandListener {
                             + "offset={}, index={}, key={}, command={}",
                     item.partition(), item.offset(), item.index(), item.groupKey(), command);
         } else {
-            RecordKey recordKey = new RecordKey(item.partition(), item.offset(), item.index());
-            AccountApplyResult cachedRejection = rejected.get(recordKey);
-            if (cachedRejection != null) {
-                freezeResult = freezeResult(item, command, false, cachedRejection.reason());
+            AccountApplyResult result = accountService.apply(command);
+            if (!result.success()) {
+                log.warn("account freeze rejected: partition={}, offset={}, index={}, "
+                                + "key={}, reason={}, command={}",
+                        item.partition(), item.offset(), item.index(), item.groupKey(),
+                        result.reason(), command);
+                freezeResult = freezeResult(item, command, false, result.reason());
             } else {
-                AccountApplyResult result = accountService.apply(command);
-                if (!result.success()) {
-                    rejected.put(recordKey, result);
-                    log.warn("account freeze rejected: partition={}, offset={}, index={}, "
-                                    + "key={}, reason={}, command={}",
-                            item.partition(), item.offset(), item.index(), item.groupKey(),
-                            result.reason(), command);
-                    freezeResult = freezeResult(item, command, false, result.reason());
-                } else {
-                    flow = result.flowEvent();
-                    freezeResult = freezeResult(item, command, true, null);
-                }
+                flow = result.flowEvent();
+                freezeResult = freezeResult(item, command, true, null);
             }
         }
         return new HandleOutcome(flow, freezeResult, resultKey);
@@ -246,12 +223,6 @@ public class AccountFreezeCommandListener {
         }
         String key = item.groupKey();
         return key == null || key.isBlank() ? KafkaSink.BATCH_KEY : key;
-    }
-
-    /**
-     * 批量消息内的消费位置；整批回滚后重投时复用同一位置的拒绝原因。
-     */
-    private record RecordKey(int partition, long offset, int index) {
     }
 
     /** 一条待处理的冻结命令及其原始位置。 */
