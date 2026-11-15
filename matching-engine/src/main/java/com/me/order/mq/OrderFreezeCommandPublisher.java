@@ -3,6 +3,7 @@ package com.me.order.mq;
 import com.me.account.dto.FundsCommand;
 import com.me.account.dto.OrderFreezeCommandsBatch;
 import com.me.kafka.KafkaSink;
+import com.me.order.dto.FreezeCommand;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -33,10 +34,6 @@ public class OrderFreezeCommandPublisher {
             @Value("${app.kafka.topics.account-order-freeze-commands}") String topic) {
         this.sink = sink;
         this.topic = topic;
-    }
-
-    /** 一条待发送的冻结命令及其 symbol；symbol 只用于 Kafka key 与批次分组。 */
-    public record FreezeCommand(String symbol, FundsCommand command) {
     }
 
     /** 在当前消费批次事务中发送一条冻结命令（封装成单元素批量消息）。 */

@@ -52,8 +52,13 @@ import org.springframework.context.annotation.Configuration;
  * 命中的 stage 不创建 runner，用于逐段压测定位吞吐拐点。stage 名称与 bean 中的
  * {@code order-command} / {@code account-order-freeze} 等一致。
  *
- * <p>account-command / account-settlement 两条链路固定走 poll 线程直连 listener：
- * 业务在 poll 线程内完成后，输出在同一个 Kafka 事务里发送。
+ * <p>账户的三条输入链路（account-command / account-order-freeze / account-settlement）
+ * 都走 poll 线程直连 listener：批次业务在 {@code AccountOperationService} 的全局锁内
+ * 串行执行，资金流水、冻结回执与 offset-seq 映射回到 poll 线程，在同一个 Kafka 事务里发送。
+ *
+ * <p>委托的三条输入链路（order-command / order-freeze-result / order-cancel）同理：
+ * 批次业务在 {@code OrderOperationService} 的全局锁内串行并分配 orderSeq，批内保留各
+ * 链路原有的线程池并发；输出与 order offset-seq 映射在 poll 线程的同一事务内发送。
  */
 @Configuration
 @ConditionalOnProperty(name = "app.kafka.enabled", havingValue = "true", matchIfMissing = true)
@@ -104,9 +109,9 @@ public class KafkaConsumerConfiguration {
                 "account-command", "account-commands", "account",
                 FundsCommand.class, false, accountCommandListener::onCommand));
 
-        // ORDER_FREEZE 独立链路：每个 symbol 一条批量消息，key=symbol，按分区并行；
+        // ORDER_FREEZE 独立链路：每个 symbol 一条批量消息，key=symbol，按分区消费；
         // 同一 symbol 仍由单 consumer 串行。这里固定走直连 listener，不接入 account
-        // ingress ring（ring 是单 handler 的，会把 symbol 级并行重新串行化）。
+        // ingress ring；批次业务统一由 AccountOperationService 的全局锁串行执行。
         all.addAll(createRunners(properties, clientFactory, sink,
                 "account-order-freeze", "account-order-freeze-commands", "account-order-freeze",
                 OrderFreezeCommandsBatch.class, true,
@@ -117,17 +122,20 @@ public class KafkaConsumerConfiguration {
                 TradeSettlementBatch.class, true, accountSettlementListener::onSettlement));
 
         // 下单入口已改为批量消息：每条 record 是一个 OrderCommandBatch（≤2000 条命令），
-        // 使用 batch-max-poll-records，避免一个事务处理过多元素。
+        // 使用 batch-max-poll-records，避免一个事务处理过多元素。批次业务由
+        // OrderOperationService 全局锁串行，批内仍逐条提交共享的 orderOperationExecutor。
         all.addAll(createRunners(properties, clientFactory, sink,
                 "order-command", "order-commands", "order",
                 OrderCommandBatch.class, true, orderCommandListener::onCommand));
 
+        // 冻结回执批次业务同样由 OrderOperationService 全局锁串行；批内先并发更新委托，
+        // 再在引擎对象锁内聚合撮合、并发清算。
         all.addAll(createRunners(properties, clientFactory, sink,
                 "order-freeze-result", "order-freeze-results", "order-freeze-result",
                 OrderFreezeResultBatch.class, true, orderFreezeResultListener::onFreezeResult));
 
         // 撤单链路与下单链路一致：批量消息按 symbol 分区，同一 symbol 的撤单由单 consumer
-        // 按序处理；消费端再把批内撤单交给线程池并发查询 / 更新委托。
+        // 按序处理；批内撤单交给线程池并发查询 / 更新委托，批次业务同样在全局锁内串行。
         all.addAll(createRunners(properties, clientFactory, sink,
                 "order-cancel", "order-cancels", "order-cancel",
                 OrderCancelBatch.class, true, orderCancelListener::onCancel));

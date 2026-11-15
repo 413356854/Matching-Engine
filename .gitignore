@@ -2,6 +2,7 @@
 matching-engine/target/
 web/node_modules/
 web/dist/
+loadtest/out/
 
 # IDE
 .idea/

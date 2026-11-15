@@ -65,7 +65,7 @@ app:
       # 批量消费：逐条 topic（me.account.commands）单次 poll 最多 2000 条；
       # broker 凑够约 1MB 或等待 50ms 即返回
       max-poll-records: 2000
-      # 七个 -batch topic（下单入口 + 六个下游）的一条 record 内含 msgList，
+      # 八个被消费的 -batch topic（下单入口 + 七个下游）的一条 record 内含 msgList，
       # 限制每次 poll 的 record 数，避免一次事务处理过多元素
       # （10 条 × 每条最多 2000 元素）。
       batch-max-poll-records: 10
@@ -140,6 +140,12 @@ app:
       funds-flow: me.funds-batch
       # 委托历史：撤单 / 撮合完成的委托按 symbol 分组，key=symbol，admin 消费并归档 QuestDB
       order-history: me.order.history-batch
+      # 账户操作全局序列：每条输入消费记录(topic/partition/offset)与批次 accountSeq 的映射，
+      # 与资金流水/冻结回执/消费 offset 同事务提交，供快照恢复后按序回溯 Kafka 消息
+      account-offset-seq: me.account.offset-seq-batch
+      # 委托操作全局序列：每条输入消费记录与批次 orderSeq 的映射，
+      # 与撮合输出/结算命令/委托历史/消费 offset 同事务提交
+      order-offset-seq: me.order.offset-seq-batch
     groups:
       account: account-command-consumer
       account-order-freeze: account-order-freeze-consumer
@@ -179,19 +185,15 @@ app:
       flush-interval-ms: 20
 
   order:
-    command:
-      # 下单消费端并发保存订单 / 生成冻结命令的线程池大小
-      worker-threads: 8
-    freeze-result:
-      # 冻结回执消费端并发推进订单 / 成交清算的线程池大小
-      worker-threads: 8
-    cancel:
-      # 撤单消费端查询委托 / 更新委托的线程池大小
-      worker-threads: 8
+    operation:
+      # 委托操作执行线程池（下单 / 冻结回执 / 撤单三条链路共用）：
+      # 批次在全局锁内串行，批内按各链路原有方式并发
+      worker-threads: 16
 
   account:
-    settlement:
-      # 成交清算消费端按 userId slot 分组并发结算的线程池大小
+    operation:
+      # 账户操作执行线程池（充值/冻结/结算三条链路共用）：
+      # 批次在全局锁内串行，批内再按 userId slot 分组并发
       worker-threads: 8
 
   marketdata:

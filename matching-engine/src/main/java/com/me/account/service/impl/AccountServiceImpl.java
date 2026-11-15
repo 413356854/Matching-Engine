@@ -43,9 +43,15 @@ public class AccountServiceImpl implements AccountService {
     /**
      * 按 userId slot 分片的账户写锁，共 {@link AccountSharding#SLOTS} 把。
      *
-     * <p>apply 只锁 {@code slot(userId)}；settle 拆成单用户命令后同样只锁一个 slot，
-     * 防御性地支持一条命令涉及多个 slot（按升序加锁、降序解锁）。同一用户的冻结、
-     * 清算、充值都使用同一个 slot，保证不会并发修改同一账户。
+     * <p>正常链路上，{@code AccountOperationService} 的全局批次锁已保证任一时刻只有一个
+     * 批次在执行，批内又按 {@code slot(userId)} 分组（同一 slot 由单线程处理），因此这些
+     * 槽锁基本不会被争用。保留它们有两个原因：
+     * <ul>
+     *   <li>{@code settle} 防御性支持多用户命令时，同一批次内按第一腿 slot 分组的两个
+     *       工作线程仍可能同时触及另一个 slot；按升序加锁、降序解锁避免丢失更新和死锁；</li>
+     *   <li>{@code AccountService} 是模块内可直接调用的 service 接口，写操作必须自我保证
+     *       线程安全，不能依赖调用方恰好只提交一个批次。</li>
+     * </ul>
      */
     private final ReentrantLock[] accountLocks = newLocks();
 

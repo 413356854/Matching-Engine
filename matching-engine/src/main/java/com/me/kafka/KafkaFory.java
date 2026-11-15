@@ -1,5 +1,7 @@
 package com.me.kafka;
 
+import com.me.account.dto.AccountOffsetSeq;
+import com.me.account.dto.AccountOffsetSeqBatch;
 import com.me.account.dto.FundsCommand;
 import com.me.account.dto.OrderFreezeCommandsBatch;
 import com.me.account.dto.TradeSettlementBatch;
@@ -16,6 +18,8 @@ import com.me.shared.order.OrderCancelBatch;
 import com.me.shared.order.OrderCancelCommand;
 import com.me.shared.order.OrderCommand;
 import com.me.shared.order.OrderCommandBatch;
+import com.me.order.dto.OrderOffsetSeq;
+import com.me.order.dto.OrderOffsetSeqBatch;
 import com.me.shared.order.OrderHistoryBatch;
 import com.me.shared.order.OrderHistoryEvent;
 import com.me.shared.order.OrderPlacedEvent;
@@ -80,6 +84,12 @@ public final class KafkaFory {
 
         fory.register(FundsFlowEvent.class, 150);
         fory.register(FundsFlowBatch.class, 151);
+
+        fory.register(AccountOffsetSeq.class, 160);
+        fory.register(AccountOffsetSeqBatch.class, 161);
+
+        fory.register(OrderOffsetSeq.class, 170);
+        fory.register(OrderOffsetSeqBatch.class, 171);
         return fory;
     }
 }
