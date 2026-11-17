@@ -107,6 +107,26 @@ export function TradeIcon() {
   );
 }
 
+export function SnapshotIcon() {
+  return (
+    <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true">
+      <ellipse cx="10" cy="4.8" rx="6" ry="2.5" fill="none" stroke="currentColor" strokeWidth="1.3" />
+      <path
+        d="M4 4.8v5.2c0 1.4 2.7 2.5 6 2.5s6-1.1 6-2.5V4.8"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.3"
+      />
+      <path
+        d="M4 10v5.2c0 1.4 2.7 2.5 6 2.5s6-1.1 6-2.5V10"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.3"
+      />
+    </svg>
+  );
+}
+
 export function CandleIcon() {
   return (
     <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true">

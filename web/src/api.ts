@@ -471,9 +471,14 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 }
 
 function extractReason(body: unknown): string | null {
-  if (body && typeof body === 'object' && 'reason' in body) {
-    const reason = (body as { reason?: unknown }).reason;
-    return typeof reason === 'string' && reason.length > 0 ? reason : null;
+  if (body && typeof body === 'object') {
+    const source = body as { reason?: unknown; error?: unknown };
+    if (typeof source.reason === 'string' && source.reason.length > 0) {
+      return source.reason;
+    }
+    if (typeof source.error === 'string' && source.error.length > 0) {
+      return source.error;
+    }
   }
   return null;
 }
@@ -842,4 +847,113 @@ export async function clearAllKlines(signal?: AbortSignal): Promise<number> {
     throw new ApiError(body.reason ?? 'CLEAR_FAILED', 200, body);
   }
   return body.deletedCount ?? 0;
+}
+
+/** 一条备份快照记录（MySQL snapshot_backup）。 */
+export interface SnapshotBackup {
+  id: number;
+  formatVersion: number;
+  instanceId: string;
+  filePath: string;
+  fileSizeBytes: number;
+  checksum: string;
+  /** 快照切点时间，ISO-8601 UTC。 */
+  snapshotCreatedAt: string;
+  accountSeq: number;
+  orderSeq: number;
+  accountCount: number;
+  orderCount: number;
+  bookCount: number;
+  offsetCount: number;
+  durationMs: number;
+  /** 记录时间，ISO-8601 UTC。 */
+  createdAt: string;
+}
+
+/** 快照恢复 offset：一条输入 topic 的一个分区。 */
+export interface SnapshotBackupOffset {
+  topic: string;
+  group: string;
+  partition: number;
+  nextOffset: number;
+}
+
+export interface SnapshotBackupDetail {
+  backup: SnapshotBackup;
+  offsets: SnapshotBackupOffset[];
+}
+
+interface AdminSnapshotQueryResponse {
+  success: boolean;
+  reason: string | null;
+  backups: SnapshotBackup[];
+}
+
+interface AdminSnapshotDetailResponse {
+  success: boolean;
+  reason: string | null;
+  backup: SnapshotBackup | null;
+  offsets: SnapshotBackupOffset[];
+}
+
+/** POST /api/v1/admin/snapshots 的成功响应。 */
+export interface CreateSnapshotResponse {
+  success: boolean;
+  backupId: number | null;
+  path: string | null;
+  fileSizeBytes: number | null;
+  createdAt: string | null;
+  accountSeq: number | null;
+  orderSeq: number | null;
+  accountCount: number | null;
+  orderCount: number | null;
+  bookCount: number | null;
+  offsetCount: number | null;
+  durationMillis: number | null;
+  checksum: string | null;
+  error: string | null;
+}
+
+/** 后台：查询最近快照记录，按 id 倒序。 */
+export async function fetchSnapshots(
+  limit = 50,
+  signal?: AbortSignal,
+): Promise<SnapshotBackup[]> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  const body = await request<AdminSnapshotQueryResponse>(
+    `/api/v1/admin/snapshots?${params.toString()}`,
+    { signal },
+  );
+  if (!body.success) {
+    throw new ApiError(body.reason ?? 'SNAPSHOT_LIST_REJECTED', 200, body);
+  }
+  return body.backups ?? [];
+}
+
+/** 后台：查询单次快照详情和逐分区恢复 offset。 */
+export async function fetchSnapshotDetail(
+  id: number,
+  signal?: AbortSignal,
+): Promise<SnapshotBackupDetail> {
+  const body = await request<AdminSnapshotDetailResponse>(
+    `/api/v1/admin/snapshots/${id}`,
+    { signal },
+  );
+  if (!body.success || !body.backup) {
+    throw new ApiError(body.reason ?? 'SNAPSHOT_DETAIL_REJECTED', 200, body);
+  }
+  return { backup: body.backup, offsets: body.offsets ?? [] };
+}
+
+/**
+ * 后台：立即执行一次备份快照。
+ *
+ * <p>同步等待快照写完并登记 MySQL；快照期间入口消费会暂停，最长可能到后端
+ * `drain-timeout-ms`，调用方需要足够的 HTTP 超时。
+ */
+export function createSnapshot(signal?: AbortSignal): Promise<CreateSnapshotResponse> {
+  return request<CreateSnapshotResponse>('/api/v1/admin/snapshots', {
+    method: 'POST',
+    signal,
+  });
 }

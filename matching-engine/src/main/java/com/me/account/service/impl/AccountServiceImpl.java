@@ -305,6 +305,51 @@ public class AccountServiceImpl implements AccountService {
                 .toList();
     }
 
+    @Override
+    public List<AccountView> snapshotAccounts() {
+        List<AccountView> views = new ArrayList<>(balances.size());
+        balances.forEach((key, balance) -> views.add(new AccountView(
+                key.userId(), key.currency(), balance.available(), balance.frozen(),
+                balance.seq())));
+        views.sort(Comparator.comparingLong(AccountView::userId)
+                .thenComparing(AccountView::currency));
+        return List.copyOf(views);
+    }
+
+    @Override
+    public void restoreAccounts(List<AccountView> accounts) {
+        if (accounts == null) {
+            throw new IllegalArgumentException("accounts must not be null");
+        }
+        ConcurrentHashMap<AccountKey, Balance> restored = new ConcurrentHashMap<>();
+        ConcurrentHashMap<Long, Set<String>> restoredCurrencies = new ConcurrentHashMap<>();
+        for (AccountView account : accounts) {
+            if (account == null) {
+                throw new IllegalArgumentException("snapshot account must not be null");
+            }
+            String currency = normalizeCurrency(account.currency());
+            if (account.userId() <= 0 || currency == null || currency.isBlank()) {
+                throw new IllegalArgumentException("invalid snapshot account: " + account);
+            }
+            if (account.available() < 0 || account.frozen() < 0 || account.seq() < 0) {
+                throw new IllegalArgumentException("negative snapshot account balance: " + account);
+            }
+            AccountKey key = new AccountKey(account.userId(), currency);
+            Balance balance = new Balance(account.available(), account.frozen(), account.seq());
+            if (restored.putIfAbsent(key, balance) != null) {
+                throw new IllegalArgumentException("duplicate snapshot account: userId="
+                        + account.userId() + ", currency=" + currency);
+            }
+            restoredCurrencies
+                    .computeIfAbsent(account.userId(), userId -> ConcurrentHashMap.newKeySet())
+                    .add(currency);
+        }
+        balances.clear();
+        balances.putAll(restored);
+        currenciesByUser.clear();
+        currenciesByUser.putAll(restoredCurrencies);
+    }
+
     /**
      * 按原子操作类型修改余额；余额不足时抛出异常，compute 不会写入变更。
      */

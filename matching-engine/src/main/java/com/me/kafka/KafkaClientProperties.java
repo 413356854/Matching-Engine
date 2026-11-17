@@ -39,7 +39,6 @@ public record KafkaClientProperties(
             int fetchMinSizeBytes,
             int maxPollIntervalMs,
             int sessionTimeoutMs,
-            int prefetchPollTimeoutMs,
             Map<String, Integer> concurrency) {
 
         /**

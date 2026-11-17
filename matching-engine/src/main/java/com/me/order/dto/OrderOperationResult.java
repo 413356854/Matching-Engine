@@ -11,10 +11,10 @@ import java.util.Map;
 /**
  * 一个委托操作批次的执行结果。
  *
- * <p>{@code orderSeq} 是 {@link com.me.order.service.OrderOperationService} 在全局
- * {@code orderLock} 内为本批次分配的全局递增序号；{@code offsets} 是本批每条输入消费
- * 记录与该序号的对应关系，由 listener 在同一个 Kafka 事务内发往
- * {@code me.order.offset-seq-batch}。
+ * <p>{@code offsets} 是本批每条 Kafka 输入记录与自己独立序号的对应关系，
+ * {@code OrderOperationServiceImpl} 在 orderLock 内把它发往
+ * {@code me.order.offset-seq-batch}；批次水位可由最后一条 offset 的
+ * {@code orderSeq} 推导，不再单独保存。
  *
  * <p>不同链路的输出分别落在对应字段：
  * <ul>
@@ -25,7 +25,6 @@ import java.util.Map;
  * </ul>
  */
 public record OrderOperationResult(
-        long orderSeq,
         List<OrderOffsetSeq> offsets,
         List<FreezeCommand> freezeCommands,
         Map<String, List<MatchPairEvent>> matchPairsBySymbol,
@@ -44,8 +43,8 @@ public record OrderOperationResult(
     }
 
     /** 没有可执行命令或没有产生输出时的空结果。 */
-    public static OrderOperationResult empty(long orderSeq) {
+    public static OrderOperationResult empty() {
         return new OrderOperationResult(
-                orderSeq, List.of(), List.of(), Map.of(), List.of(), List.of());
+                List.of(), List.of(), Map.of(), List.of(), List.of());
     }
 }

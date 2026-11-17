@@ -1,5 +1,6 @@
 package com.me.matching.entity;
 
+import com.me.matching.vo.BookOrderSnapshot;
 import com.me.shared.order.OrderPlacedEvent;
 import com.me.shared.order.OrderSide;
 import com.me.shared.order.OrderType;
@@ -42,6 +43,60 @@ public final class BookOrder {
         this.price = order.price();
         this.quantity = order.quantity();
         this.placedAt = order.placedAt();
+        this.remainingQuantity = remainingQuantity;
+    }
+
+    /** 从快照重建挂单；只允许启动恢复阶段使用。 */
+    public static BookOrder fromSnapshot(BookOrderSnapshot snapshot) {
+        if (snapshot == null) {
+            throw new IllegalArgumentException("snapshot book order must not be null");
+        }
+        if (snapshot.orderId() <= 0 || snapshot.userId() <= 0) {
+            throw new IllegalArgumentException("invalid snapshot book order: " + snapshot);
+        }
+        if (snapshot.symbol() == null || snapshot.symbol().isBlank()
+                || snapshot.side() == null || snapshot.type() == null) {
+            throw new IllegalArgumentException("incomplete snapshot book order: " + snapshot);
+        }
+        if (snapshot.quantity() <= 0
+                || snapshot.remainingQuantity() <= 0
+                || snapshot.remainingQuantity() > snapshot.quantity()) {
+            throw new IllegalArgumentException(
+                    "snapshot book order remainingQuantity out of range: " + snapshot);
+        }
+        if (snapshot.placedAt() == null || snapshot.placedAt().isBlank()) {
+            throw new IllegalArgumentException("snapshot book order placedAt is missing: "
+                    + snapshot);
+        }
+        return new BookOrder(
+                snapshot.orderId(),
+                snapshot.userId(),
+                snapshot.symbol(),
+                snapshot.side(),
+                snapshot.type(),
+                snapshot.price(),
+                snapshot.quantity(),
+                java.time.Instant.parse(snapshot.placedAt()),
+                snapshot.remainingQuantity());
+    }
+
+    private BookOrder(long orderId,
+                      long userId,
+                      String symbol,
+                      OrderSide side,
+                      OrderType type,
+                      long price,
+                      long quantity,
+                      Instant placedAt,
+                      long remainingQuantity) {
+        this.orderId = orderId;
+        this.userId = userId;
+        this.symbol = symbol;
+        this.side = side;
+        this.type = type;
+        this.price = price;
+        this.quantity = quantity;
+        this.placedAt = placedAt;
         this.remainingQuantity = remainingQuantity;
     }
 
@@ -97,5 +152,11 @@ public final class BookOrder {
 
     public boolean filled() {
         return remainingQuantity == 0;
+    }
+
+    /** 备份快照用的只读副本。 */
+    public BookOrderSnapshot toSnapshot() {
+        return new BookOrderSnapshot(orderId, userId, symbol, side, type, price, quantity,
+                remainingQuantity, placedAt.toString());
     }
 }

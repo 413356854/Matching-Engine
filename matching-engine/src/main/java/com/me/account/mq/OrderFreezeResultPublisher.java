@@ -1,6 +1,6 @@
 package com.me.account.mq;
 
-import com.me.kafka.KafkaSink;
+import com.me.kafka.BatchOutput;
 import com.me.shared.event.OrderFreezeResultBatch;
 import com.me.shared.event.OrderFreezeResultEvent;
 import java.util.List;
@@ -22,13 +22,10 @@ import org.springframework.stereotype.Component;
 @Component
 public class OrderFreezeResultPublisher {
 
-    private final KafkaSink sink;
     private final String topic;
 
     public OrderFreezeResultPublisher(
-            KafkaSink sink,
             @Value("${app.kafka.topics.order-freeze-results}") String topic) {
-        this.sink = sink;
         this.topic = topic;
     }
 
@@ -37,8 +34,9 @@ public class OrderFreezeResultPublisher {
      *
      * @param eventsBySymbol symbol → 该 symbol 的回执列表，列表顺序即处理顺序
      */
-    public void publishBatch(Map<String, List<OrderFreezeResultEvent>> eventsBySymbol) {
+    public void publishBatch(BatchOutput output,
+                             Map<String, List<OrderFreezeResultEvent>> eventsBySymbol) {
         eventsBySymbol.forEach((symbol, events) ->
-                sink.sendBatchMessage(topic, symbol, events, OrderFreezeResultBatch::new));
+                output.sendBatchMessage(topic, symbol, events, OrderFreezeResultBatch::new));
     }
 }

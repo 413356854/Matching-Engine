@@ -3,11 +3,12 @@ import type { Currency, TradingPair } from '../api';
 import { FundsFlowAdmin } from './FundsFlowAdmin';
 import { KlineAdmin } from './KlineAdmin';
 import { OrderHistoryAdmin } from './OrderHistoryAdmin';
+import { SnapshotAdmin } from './SnapshotAdmin';
 import { UserTradeAdmin } from './UserTradeAdmin';
-import { CandleIcon, FlowIcon, OrderIcon, TradeIcon } from './icons';
+import { CandleIcon, FlowIcon, OrderIcon, SnapshotIcon, TradeIcon } from './icons';
 import type { ToastKind } from './ToastStack';
 
-export type AdminSection = 'flows' | 'orders' | 'trades' | 'klines';
+export type AdminSection = 'flows' | 'orders' | 'trades' | 'klines' | 'snapshots';
 
 interface AdminPageProps {
   pairs: TradingPair[];
@@ -22,6 +23,7 @@ const SECTIONS = [
   { id: 'orders' as const, label: '委托历史', hint: 'ord_history', Icon: OrderIcon },
   { id: 'trades' as const, label: '成交记录', hint: 'user_trade', Icon: TradeIcon },
   { id: 'klines' as const, label: 'K 线管理', hint: 'md_kline', Icon: CandleIcon },
+  { id: 'snapshots' as const, label: '备份管理', hint: 'snapshot_backup', Icon: SnapshotIcon },
 ];
 
 export function AdminPage({
@@ -38,7 +40,7 @@ export function AdminPage({
       <aside className="admin-sidebar panel">
         <div className="admin-sidebar-head">
           <h2>后台管理</h2>
-          <span>QuestDB 查询投影</span>
+          <span>查询投影 / 备份快照</span>
         </div>
 
         <nav className="admin-nav" aria-label="后台管理子栏目">
@@ -74,8 +76,10 @@ export function AdminPage({
           <OrderHistoryAdmin />
         ) : section === 'trades' ? (
           <UserTradeAdmin pairs={pairs} currencyScales={currencyScales} />
-        ) : (
+        ) : section === 'klines' ? (
           <KlineAdmin pairs={pairs} currencyScales={currencyScales} notify={notify} />
+        ) : (
+          <SnapshotAdmin notify={notify} />
         )}
       </main>
     </div>

@@ -4,7 +4,8 @@ import com.me.account.dto.FundsCommand;
 import com.me.account.dto.TradeSettlementCommand;
 import com.me.currency.vo.CurrencyView;
 import com.me.currency.vo.TradingPairView;
-import com.me.kafka.KafkaSink;
+import com.me.kafka.BatchOutput;
+import com.me.kafka.FatalState;
 import com.me.matching.dto.CancelResult;
 import com.me.matching.dto.MatchResult;
 import com.me.matching.service.MatchingEngine;
@@ -18,11 +19,18 @@ import com.me.order.dto.OrderFreezeApplyResult;
 import com.me.order.dto.OrderMatchResult;
 import com.me.order.dto.OrderOffsetSeq;
 import com.me.order.dto.OrderOperationResult;
+import com.me.order.mq.MatchPairEventPublisher;
+import com.me.order.mq.OrderFreezeCommandPublisher;
+import com.me.order.mq.OrderHistoryPublisher;
+import com.me.order.mq.OrderOffsetSeqPublisher;
+import com.me.order.mq.TradeSettlementCommandPublisher;
 import com.me.order.service.OrderConfigCache;
 import com.me.order.service.OrderMatchingService;
 import com.me.order.service.OrderOperationService;
 import com.me.order.service.OrderService;
 import com.me.shared.event.MatchPairEvent;
+import com.me.order.service.OrderBatchLock;
+import com.me.order.service.OrderEntryLocks;
 import com.me.shared.event.OrderFreezeResultBatch;
 import com.me.shared.event.OrderFreezeResultEvent;
 import com.me.shared.order.OrderCancelBatch;
@@ -50,8 +58,8 @@ import org.springframework.stereotype.Service;
  * 委托操作执行器实现。
  *
  * <p><b>批次串行 + 批内按原定义并发</b>：下单命令、冻结回执、撤单三条链路的所有批次
- * 先竞争 {@link #orderLock}，拿到锁后自增 {@link #orderSeq} 并把该序号写入本批每条
- * 输入的 offset-seq 映射。锁内保持各链路原有的并发方式：
+ * 先竞争 {@link #orderLock}。锁内保持各链路原有的并发方式处理批次，处理完成后按
+ * ConsumerRecord 输入顺序为每条输入记录自增 {@link #orderSeq} 并写入 offset-seq 映射：
  * <ul>
  *   <li>下单命令：逐条提交线程池，按原命令顺序收集结果；</li>
  *   <li>冻结回执：并发更新委托 → 引擎对象锁内聚合撮合 → 并发清算 → 聚合输出；</li>
@@ -60,10 +68,19 @@ import org.springframework.stereotype.Service;
  * 三条链路共用 {@code orderOperationExecutor}；{@code orderLock} 保证同一时刻只有一个
  * 批次、一个批次只使用一条链路的并发阶段，因此共享池不改变每批并发度，也不会跨池等待。
  *
- * <p><b>为什么整批加锁</b>：offset-seq 的价值在于「orderSeq 的顺序就是委托状态推进的
- * 实际顺序」。如果只锁单条命令，不同 consumer 的批次会交错，seq 无法用于快照恢复后的
- * 确定性重放。代价是三条委托链路的跨链路并发退化为「批内并发」，吞吐上限由单批大小和
- * 各链路线程池决定。
+ * <p><b>入口锁</b>：下单、撤单入口批次在进入 {@link #orderLock} 之前先获取
+ * {@link OrderEntryLocks} 中对应的入口锁；快照持有全部入口锁后，新的外部输入不会再
+ * 推进状态。冻结回执是内部链路，不获取入口锁，因此快照等待内部 topic 排空时仍可继续。
+ *
+ * <p><b>为什么整批加锁</b>：offset-seq 的价值在于「orderSeq 的顺序就是输入记录被委托
+ * 模块处理的顺序」；每条 Kafka 原生 offset 都有独立序号后，快照恢复可以精确定位每条输入。
+ * 如果只锁单条命令，不同 consumer 的批次会交错，seq 无法用于快照恢复后的确定性重放。
+ * 代价是三条委托链路的跨链路并发退化为「批内并发」，吞吐上限由单批大小和各链路线程池决定。
+ *
+ * <p><b>输出发布也在 orderLock 内</b>：冻结命令、撮合对、结算命令、委托历史和
+ * offset-seq 映射在 {@link #orderLock} 内发布（publisher 写入当前 runner 绑定的
+ * {@link BatchOutput}）。这样「状态修改 → 分配 orderSeq → 发布输出」在同一个临界区内
+ * 完成，listener 不再在 service 返回后再发布。Kafka 事务仍由 runner 统一提交。
  *
  * <p><b>演示版重投语义</b>：不缓存撮合输出/重放。Kafka 事务回滚后的重投可能重复执行或
  * 丢失上一次未提交的输出；订单状态与撮合引擎的 orderId 去重保证重复回执不会重复撮合。
@@ -77,30 +94,65 @@ public class OrderOperationServiceImpl implements OrderOperationService {
     private final OrderConfigCache configCache;
     private final OrderMatchingService orderMatchingService;
     private final MatchingEngine matchingEngine;
+    private final OrderFreezeCommandPublisher freezeCommandPublisher;
+    private final MatchPairEventPublisher matchPairPublisher;
+    private final TradeSettlementCommandPublisher settlementPublisher;
+    private final OrderHistoryPublisher orderHistoryPublisher;
+    private final OrderOffsetSeqPublisher offsetSeqPublisher;
+    private final FatalState fatalState;
 
     /** 三条链路共用的执行池；orderLock 保证同一时刻只有一个批次在使用它。 */
     private final ExecutorService workerPool;
 
-    /** 委托操作的全局序号；每个批次在 {@link #orderLock} 内自增一次。 */
+    /** 委托操作的全局序号；每条 Kafka 输入记录在 {@link #orderLock} 内自增一次。 */
     private final AtomicLong orderSeq = new AtomicLong();
 
     /**
      * 批次级全局锁：下单命令、冻结回执、撤单三条链路的批次在这里串行，
-     * 保证 orderSeq 顺序与实际委托状态推进顺序一致。
+     * 保证 orderSeq 顺序与输入记录被委托模块处理的顺序一致。
+     *
+     * <p>runner 在 beginTransaction 前先获取同一把锁，并在 commit/abort 之后释放；
+     * 本类内部再次获取可重入锁。因此本类释放后，runner 仍保持锁到 Kafka 事务结束，
+     * 下一批不会在失败批次的脏状态上继续执行。
      */
-    private final ReentrantLock orderLock = new ReentrantLock();
+    private final ReentrantLock orderLock;
+
+    /**
+     * 外部入口锁：下单 / 撤单入口消费批次必须先取得，再进入 {@link #orderLock}。
+     * 快照持有这两把入口锁后，新的外部输入不会再驱动状态机；内部冻结回执链路
+     * 不获取入口锁，因此仍可继续排空。
+     */
+    private final ReentrantLock placementEntryLock;
+    private final ReentrantLock cancelEntryLock;
 
     public OrderOperationServiceImpl(
             OrderService orderService,
             OrderConfigCache configCache,
             OrderMatchingService orderMatchingService,
             MatchingEngine matchingEngine,
-            @Qualifier("orderOperationExecutor") ExecutorService workerPool) {
+            @Qualifier("orderOperationExecutor") ExecutorService workerPool,
+            OrderBatchLock orderBatchLock,
+            OrderEntryLocks orderEntryLocks,
+            OrderFreezeCommandPublisher freezeCommandPublisher,
+            MatchPairEventPublisher matchPairPublisher,
+            TradeSettlementCommandPublisher settlementPublisher,
+            OrderHistoryPublisher orderHistoryPublisher,
+            OrderOffsetSeqPublisher offsetSeqPublisher,
+            FatalState fatalState) {
         this.orderService = orderService;
         this.configCache = configCache;
         this.orderMatchingService = orderMatchingService;
         this.matchingEngine = matchingEngine;
         this.workerPool = workerPool;
+        this.orderLock = orderBatchLock.reentrantLock();
+        this.placementEntryLock = orderEntryLocks.placementLock();
+        this.cancelEntryLock = orderEntryLocks.cancelLock();
+        this.freezeCommandPublisher = freezeCommandPublisher;
+        this.matchPairPublisher = matchPairPublisher;
+        this.settlementPublisher = settlementPublisher;
+        this.orderHistoryPublisher = orderHistoryPublisher;
+        this.offsetSeqPublisher = offsetSeqPublisher;
+        this.fatalState = fatalState;
     }
 
     // ==================================================================
@@ -109,17 +161,41 @@ public class OrderOperationServiceImpl implements OrderOperationService {
 
     @Override
     public OrderOperationResult executeCommands(
-            List<ConsumerRecord<String, OrderCommandBatch>> records) {
+            List<ConsumerRecord<String, OrderCommandBatch>> records, BatchOutput output) {
         if (records == null || records.isEmpty()) {
-            return OrderOperationResult.empty(orderSeq.get());
+            return OrderOperationResult.empty();
         }
+        // 入口锁必须早于 orderLock：快照按「入口锁 → 模块锁」获取，
+        // 反过来会与持有 orderLock 等待入口锁的入口批次形成死锁。
+        placementEntryLock.lock();
+        try {
+            return executeCommandsLocked(records, output);
+        } finally {
+            placementEntryLock.unlock();
+        }
+    }
+
+    private OrderOperationResult executeCommandsLocked(
+            List<ConsumerRecord<String, OrderCommandBatch>> records, BatchOutput output) {
         orderLock.lock();
         try {
-            long seq = orderSeq.incrementAndGet();
+            if (fatalState.isFatal()) {
+                throw new IllegalStateException("[" + getClass().getSimpleName()
+                        + "] engine is fatal; refusing batch");
+            }
             List<PendingOrder> pending = flattenCommands(records);
             List<FreezeCommand> freezeCommands = saveConcurrently(pending);
-            return new OrderOperationResult(seq, offsets(seq, records), freezeCommands,
+            List<OrderOffsetSeq> offsets = offsets(records);
+            OrderOperationResult result = new OrderOperationResult(offsets, freezeCommands,
                     Map.of(), List.of(), List.of());
+            publish(output, result);
+            // 锁内直接路由到模块提交队列：BatchOutput.enqueue -> ModuleCommitPipeline.enqueue -> queue.put。
+            output.enqueue();
+            return result;
+        } catch (RuntimeException e) {
+            // 在释放锁之前进入全局 fatal，下一批拿到锁会看到 fatal 并退出。
+            markFatal(output, e);
+            throw e;
         } finally {
             orderLock.unlock();
         }
@@ -206,13 +282,16 @@ public class OrderOperationServiceImpl implements OrderOperationService {
 
     @Override
     public OrderOperationResult executeFreezeResults(
-            List<ConsumerRecord<String, OrderFreezeResultBatch>> records) {
+            List<ConsumerRecord<String, OrderFreezeResultBatch>> records, BatchOutput output) {
         if (records == null || records.isEmpty()) {
-            return OrderOperationResult.empty(orderSeq.get());
+            return OrderOperationResult.empty();
         }
         orderLock.lock();
         try {
-            long seq = orderSeq.incrementAndGet();
+            if (fatalState.isFatal()) {
+                throw new IllegalStateException("[" + getClass().getSimpleName()
+                        + "] engine is fatal; refusing batch");
+            }
             List<PendingFreeze> pending = flattenFreezeResults(records);
             List<PlacedOrder> placed = applyFreezeResults(pending);
 
@@ -230,9 +309,18 @@ public class OrderOperationServiceImpl implements OrderOperationService {
             }
 
             Outputs outputs = assembleOutputs(placed, matches);
-            return new OrderOperationResult(seq, offsets(seq, records), List.of(),
+            List<OrderOffsetSeq> offsets = offsets(records);
+            OrderOperationResult result = new OrderOperationResult(offsets, List.of(),
                     outputs.matchPairsBySymbol(), outputs.settlementCommands(),
                     outputs.historyEvents());
+            publish(output, result);
+            // 锁内直接路由到模块提交队列：BatchOutput.enqueue -> ModuleCommitPipeline.enqueue -> queue.put。
+            output.enqueue();
+            return result;
+        } catch (RuntimeException e) {
+            // 在释放锁之前进入全局 fatal，下一批拿到锁会看到 fatal 并退出。
+            markFatal(output, e);
+            throw e;
         } finally {
             orderLock.unlock();
         }
@@ -348,7 +436,7 @@ public class OrderOperationServiceImpl implements OrderOperationService {
     /** 回执消息 key 即 symbol；兼容旧的固定 key。 */
     private static String symbolKey(ConsumerRecord<String, OrderFreezeResultBatch> record) {
         String key = record.key();
-        return key == null || key.isBlank() ? KafkaSink.BATCH_KEY : key;
+        return key == null || key.isBlank() ? BatchOutput.BATCH_KEY : key;
     }
 
     // ==================================================================
@@ -357,13 +445,26 @@ public class OrderOperationServiceImpl implements OrderOperationService {
 
     @Override
     public OrderOperationResult executeCancels(
-            List<ConsumerRecord<String, OrderCancelBatch>> records) {
+            List<ConsumerRecord<String, OrderCancelBatch>> records, BatchOutput output) {
         if (records == null || records.isEmpty()) {
-            return OrderOperationResult.empty(orderSeq.get());
+            return OrderOperationResult.empty();
         }
+        cancelEntryLock.lock();
+        try {
+            return executeCancelsLocked(records, output);
+        } finally {
+            cancelEntryLock.unlock();
+        }
+    }
+
+    private OrderOperationResult executeCancelsLocked(
+            List<ConsumerRecord<String, OrderCancelBatch>> records, BatchOutput output) {
         orderLock.lock();
         try {
-            long seq = orderSeq.incrementAndGet();
+            if (fatalState.isFatal()) {
+                throw new IllegalStateException("[" + getClass().getSimpleName()
+                        + "] engine is fatal; refusing batch");
+            }
             List<PendingCancel> pending = flattenCancels(records);
             List<PreparedCancel> prepared = prepareConcurrently(pending);
             List<OrderCancelContext> contexts = new ArrayList<>(prepared.size());
@@ -386,11 +487,47 @@ public class OrderOperationServiceImpl implements OrderOperationService {
             if (!contexts.isEmpty()) {
                 cancelAndApply(contexts, settlements, historyEvents);
             }
-            return new OrderOperationResult(seq, offsets(seq, records), List.of(), Map.of(),
+            List<OrderOffsetSeq> offsets = offsets(records);
+            OrderOperationResult result = new OrderOperationResult(offsets, List.of(), Map.of(),
                     settlements, historyEvents);
+            publish(output, result);
+            // 锁内直接路由到模块提交队列：BatchOutput.enqueue -> ModuleCommitPipeline.enqueue -> queue.put。
+            output.enqueue();
+            return result;
+        } catch (RuntimeException e) {
+            // 在释放锁之前进入全局 fatal，下一批拿到锁会看到 fatal 并退出。
+            markFatal(output, e);
+            throw e;
         } finally {
             orderLock.unlock();
         }
+    }
+
+    private void markFatal(BatchOutput output, RuntimeException error) {
+        fatalState.markFatal(
+                output == null ? getClass().getSimpleName() : output.source(), error);
+    }
+
+    /**
+     * 在 orderLock 内发布本批输出：冻结命令、撮合对、结算命令、委托历史、offset-seq。
+     *
+     * <p>publisher 直接把记录写入调用方传入的 {@link BatchOutput}，最终由 runner
+     * 封装成 SendPackage、模块 committer 在同一个 Kafka 事务里提交。
+     */
+    private void publish(BatchOutput output, OrderOperationResult result) {
+        if (!result.freezeCommands().isEmpty()) {
+            freezeCommandPublisher.publishBatch(output, result.freezeCommands());
+        }
+        if (!result.matchPairsBySymbol().isEmpty()) {
+            matchPairPublisher.publishBatch(output, result.matchPairsBySymbol());
+        }
+        if (!result.settlementCommands().isEmpty()) {
+            settlementPublisher.publishBatch(output, result.settlementCommands());
+        }
+        if (!result.historyEvents().isEmpty()) {
+            orderHistoryPublisher.publishBatch(output, result.historyEvents());
+        }
+        offsetSeqPublisher.publish(output, result);
     }
 
     private void cancelAndApply(List<OrderCancelContext> contexts,
@@ -498,13 +635,29 @@ public class OrderOperationServiceImpl implements OrderOperationService {
         return orderSeq.get();
     }
 
-    /** 本批每条输入消费记录与批次序号的映射；按输入顺序排列。 */
-    private static List<OrderOffsetSeq> offsets(
-            long seq, List<? extends ConsumerRecord<?, ?>> records) {
+    @Override
+    public void restoreSeq(long seq) {
+        if (seq < 0) {
+            throw new IllegalArgumentException("orderSeq must not be negative: " + seq);
+        }
+        long current = orderSeq.get();
+        if (seq < current) {
+            throw new IllegalStateException("orderSeq cannot move backwards: current="
+                    + current + ", requested=" + seq);
+        }
+        orderSeq.set(seq);
+    }
+
+    /**
+     * 本批每条 Kafka 输入记录与自己的全局 seq 的映射；按 ConsumerRecord 输入顺序，
+     * 每条记录自增一次。任意 Kafka 原生 offset 都能反查到唯一的 orderSeq。
+     */
+    private List<OrderOffsetSeq> offsets(List<? extends ConsumerRecord<?, ?>> records) {
         List<OrderOffsetSeq> offsets = new ArrayList<>(records.size());
         for (ConsumerRecord<?, ?> record : records) {
             offsets.add(new OrderOffsetSeq(
-                    record.topic(), record.partition(), record.offset(), seq));
+                    record.topic(), record.partition(), record.offset(),
+                    orderSeq.incrementAndGet()));
         }
         return offsets;
     }

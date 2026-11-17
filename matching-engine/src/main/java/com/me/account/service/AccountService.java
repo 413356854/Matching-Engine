@@ -32,4 +32,22 @@ public interface AccountService {
      * 查询用户在全部币种下的余额，按币种升序；没有账户时返回空列表。
      */
     List<AccountView> listBalances(long userId);
+
+    /**
+     * 快照用：返回全部账户余额的只读副本，按 userId / currency 升序。
+     *
+     * <p>调用方必须持有账户模块的批次锁（{@code AccountBatchLock}），否则只能得到
+     * {@link java.util.concurrent.ConcurrentHashMap} 的弱一致遍历结果。快照服务在
+     * accountLock 内调用本方法。
+     */
+    List<AccountView> snapshotAccounts();
+
+    /**
+     * 快照恢复用：清空当前账户并以快照内容重建。
+     *
+     * <p>只能在启动恢复阶段、consumer 尚未启动时调用；实现不做并发保护。
+     *
+     * @throws IllegalArgumentException 快照包含重复账户或非法金额
+     */
+    void restoreAccounts(List<AccountView> accounts);
 }

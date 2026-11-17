@@ -4,7 +4,7 @@ import java.util.List;
 
 /**
  * 委托 offset-seq 批量消息：委托模块处理完一个消费批次后，把该批每条输入记录
- * 与批次 {@code orderSeq} 的对应关系封装成一条 Kafka 消息，发往
+ * 与自己的 {@code orderSeq} 的对应关系封装成一条 Kafka 消息，发往
  * {@code me.order.offset-seq-batch}。
  *
  * <p>与撮合输出（撮合对 / 结算命令 / 委托历史）及输入消费 offset 在同一个 Kafka

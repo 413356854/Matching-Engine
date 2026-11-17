@@ -80,8 +80,6 @@ app:
       # 逐条 topic 处理 2000 条会阻塞 poll；给足余量，避免批次处理期间触发 rebalance
       max-poll-interval-ms: 600000
       session-timeout-ms: 45000
-      # 预取下一批的 poll 超时；0 = 非阻塞，只推动 fetch 管线
-      prefetch-poll-timeout-ms: 0
       # 各 stage 的并发 consumer 数，未配置默认 1。
       # order-command 的消息体是 OrderCommandBatch，key=symbol，同一 symbol 只落一个分区、
       # 由同一个 consumer 处理，因此按分区并行消费不破坏 symbol 内的价格-时间优先；
@@ -120,6 +118,14 @@ app:
       # 同一批次的记录先全部入队，由客户端按 partition 聚合；少量 linger 提高批合并率
       linger-ms: 2
       batch-size-bytes: 32768
+    # 有状态模块（委托 / 账户）的 FIFO 事务提交管线：
+    # runner 在模块锁内把输出打包入队，唯一的 committer 线程按入队顺序提交。
+    # 队列满时 runner 阻塞入队（背压），不拒绝、不超时。
+    commit:
+      # 队列容量；必须能容纳同时等待提交的批次，避免 committer 凑包时互相等待。
+      queue-capacity: 128
+      # 一个 Kafka 事务最多合并的包数；只合并且已排队的包，不额外等待。
+      max-packages-per-transaction: 16
     admin:
       auto-create: true
       fail-fast: false
@@ -160,6 +166,42 @@ app:
     topic:
       partitions: 8
       replication-factor: 1
+
+  # 备份快照：POST /api/v1/admin/snapshots 同步触发。
+  # 快照会先拿三个入口锁，等待内部链路排空和两个 committer 的队列提交完成，
+  # 然后在账户 / 委托模块锁内复制内存，校验「委托剩余冻结 == 账户冻结」后原子写文件。
+  snapshot:
+    # 输出目录；相对路径按进程工作目录解析
+    directory: "${SNAPSHOT_DIR:./snapshots}"
+    # 等入口批次处理完 + 内部 topic 排空 + committer flush 的总超时。
+    # 入口 consumer 在此期间阻塞在入口锁上，本值必须明显小于
+    # app.kafka.consumer.max-poll-interval-ms（默认 600000），否则会触发 rebalance。
+    drain-timeout-ms: 120000
+    # 获取下单 / 撤单 / 充值三个入口锁的超时
+    entry-lock-timeout-ms: 30000
+    # 排空后获取账户 / 委托模块锁的超时
+    module-lock-timeout-ms: 30000
+    # 写文件前校验每个 (userId, currency) 的委托剩余冻结与账户冻结相等
+    validate-invariant: true
+    # true 输出带缩进的 JSON，便于人工查看；默认紧凑格式
+    pretty-print: false
+    # 启动恢复：加载快照 → 恢复内存 → 重放快照切点之后已提交的输入 → 对齐消费 offset。
+    # 默认关闭；开启后恢复失败会阻止 consumer 启动。
+    recovery:
+      enabled: "${SNAPSHOT_RECOVERY_ENABLED:false}"
+      # >0 指定 backup id；0 表示取最新一条
+      backup-id: "${SNAPSHOT_RECOVERY_BACKUP_ID:0}"
+      # 非空时直接读文件，优先于 backup-id（MySQL 元数据丢失的灾备场景）
+      file: "${SNAPSHOT_RECOVERY_FILE:}"
+      # 开启恢复但找不到可用快照时是否阻止启动
+      fail-if-missing: true
+      # 严格校验 [快照 offset, broker committed offset) 内可见记录与 offset-seq 映射完全一致
+      strict-validation: true
+      # 一次恢复最多允许的 offset-seq 映射条数，超出要求重新做快照
+      max-mappings: 5000000
+      fetch-timeout-ms: 60000
+      offset-timeout-ms: 60000
+      admin-timeout-ms: 30000
 
   currency:
     ingress:

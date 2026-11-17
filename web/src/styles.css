@@ -2501,6 +2501,77 @@ button:disabled {
   text-align: center;
 }
 
+.admin-table.snapshot-table {
+  min-width: 1120px;
+}
+
+.admin-table.snapshot-table tbody tr {
+  cursor: pointer;
+}
+
+.snapshot-path {
+  display: inline-block;
+  max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
+
+.snapshot-detail-card {
+  width: min(920px, 100%);
+}
+
+.snapshot-detail-body {
+  gap: 12px;
+}
+
+.snapshot-meta {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: var(--panel-soft);
+}
+
+.snapshot-meta > div {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.snapshot-meta span {
+  color: var(--muted-2);
+  font-size: 9.5px;
+  letter-spacing: 0.3px;
+}
+
+.snapshot-meta b {
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+
+.snapshot-meta .span-3 {
+  grid-column: span 3;
+}
+
+.snapshot-detail-scroll {
+  max-height: 46vh;
+  overflow: auto;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+}
+
+.admin-table.snapshot-offset-table {
+  min-width: 560px;
+}
+
 /* ------------------------------------------------------------------ */
 /* Animations                                                          */
 /* ------------------------------------------------------------------ */

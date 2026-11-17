@@ -8,6 +8,8 @@ import com.me.order.dto.OrderCancelBeginResult;
 import com.me.order.dto.OrderCancelContext;
 import com.me.order.dto.OrderCancelPrepareResult;
 import com.me.order.dto.OrderFreezeApplyResult;
+import com.me.order.dto.OrderSnapshot;
+import com.me.order.dto.OrderStateSnapshot;
 import com.me.order.dto.OrderTradeApplyResult;
 import com.me.order.service.OrderService;
 import com.me.order.vo.OrderView;
@@ -24,8 +26,10 @@ import com.me.shared.order.OrderType;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -603,6 +607,39 @@ public class OrderServiceImpl implements OrderService {
                 || status == OrderStatus.PARTIALLY_FILLED;
     }
 
+    @Override
+    public OrderStateSnapshot snapshotState() {
+        List<OrderSnapshot> snapshots = new ArrayList<>(orders.size());
+        for (Order order : orders.values()) {
+            snapshots.add(order.toSnapshot());
+        }
+        snapshots.sort(Comparator.comparingLong(OrderSnapshot::orderId));
+        return new OrderStateSnapshot(List.copyOf(snapshots),
+                tradeSettlementIdGenerator.get());
+    }
+
+    @Override
+    public void restoreState(OrderStateSnapshot state) {
+        if (state == null || state.orders() == null) {
+            throw new IllegalArgumentException("snapshot order state must not be null");
+        }
+        if (state.tradeSettlementIdGenerator() < 1) {
+            throw new IllegalArgumentException("snapshot tradeSettlementIdGenerator must be "
+                    + "positive: " + state.tradeSettlementIdGenerator());
+        }
+        Map<Long, Order> restored = new HashMap<>(state.orders().size() * 2);
+        for (OrderSnapshot snapshot : state.orders()) {
+            Order order = Order.fromSnapshot(snapshot);
+            if (restored.putIfAbsent(order.orderId(), order) != null) {
+                throw new IllegalArgumentException(
+                        "duplicate snapshot orderId: " + order.orderId());
+            }
+        }
+        orders.clear();
+        orders.putAll(restored);
+        tradeSettlementIdGenerator.set(state.tradeSettlementIdGenerator());
+    }
+
     private OrderApplyResult successOf(Order order) {
         FundsCommand freezeCommand = order.status() == OrderStatus.ACCEPTED ? freezeCommand(order) : null;
         return OrderApplyResult.success(order.toView(), freezeCommand);
@@ -763,6 +800,68 @@ public class OrderServiceImpl implements OrderService {
                     orderId, userId, symbol, side, type, price, quantity,
                     frozenCurrency, frozenAmount, Instant.now(),
                     priceScale, quantityScale, quoteScale);
+        }
+
+        private OrderSnapshot toSnapshot() {
+            return new OrderSnapshot(
+                    requestId, orderId, userId, symbol, side, type, price, quantity,
+                    frozenCurrency, frozenAmount, filledQuantity, settledQuoteAmount,
+                    status, seq, createdAt.toString(),
+                    finalAt == null ? null : finalAt.toString(),
+                    priceScale, quantityScale, quoteScale, cancelRequested);
+        }
+
+        /** 从快照重建委托；只允许启动恢复阶段使用。 */
+        private static Order fromSnapshot(OrderSnapshot snapshot) {
+            if (snapshot == null) {
+                throw new IllegalArgumentException("snapshot order must not be null");
+            }
+            if (snapshot.orderId() <= 0 || snapshot.userId() <= 0) {
+                throw new IllegalArgumentException("invalid snapshot order id: " + snapshot);
+            }
+            if (snapshot.symbol() == null || snapshot.symbol().isBlank()
+                    || snapshot.requestId() == null || snapshot.requestId().isBlank()
+                    || snapshot.side() == null || snapshot.type() == null
+                    || snapshot.status() == null) {
+                throw new IllegalArgumentException("incomplete snapshot order: " + snapshot);
+            }
+            if (snapshot.quantity() <= 0
+                    || snapshot.filledQuantity() < 0
+                    || snapshot.filledQuantity() > snapshot.quantity()) {
+                throw new IllegalArgumentException("invalid snapshot order quantity: " + snapshot);
+            }
+            Instant parsedCreatedAt;
+            Instant parsedFinalAt = null;
+            try {
+                parsedCreatedAt = Instant.parse(snapshot.createdAt());
+                if (snapshot.finalAt() != null) {
+                    parsedFinalAt = Instant.parse(snapshot.finalAt());
+                }
+            } catch (RuntimeException e) {
+                throw new IllegalArgumentException(
+                        "invalid snapshot order timestamp: " + snapshot, e);
+            }
+            return new Order(
+                    snapshot.requestId(),
+                    snapshot.orderId(),
+                    snapshot.userId(),
+                    snapshot.symbol(),
+                    snapshot.side(),
+                    snapshot.type(),
+                    snapshot.price(),
+                    snapshot.quantity(),
+                    snapshot.frozenCurrency(),
+                    snapshot.frozenAmount(),
+                    snapshot.filledQuantity(),
+                    snapshot.settledQuoteAmount(),
+                    snapshot.status(),
+                    snapshot.seq(),
+                    parsedCreatedAt,
+                    parsedFinalAt,
+                    snapshot.priceScale(),
+                    snapshot.quantityScale(),
+                    snapshot.quoteScale(),
+                    snapshot.cancelRequested());
         }
     }
 

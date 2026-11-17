@@ -1,8 +1,15 @@
 # 构建产物
-matching-engine/target/
+**/target/
 web/node_modules/
 web/dist/
 loadtest/out/
+
+# 压测中间文件：临时压测脚本、编译类与测试报告（.log 由下方 *.log 覆盖）
+loadtest/*.java
+loadtest/*.class
+loadtest/TEST-REPORT*.md
+# 汇总报告需要保留在仓库中
+!loadtest/TEST-REPORT.md
 
 # IDE
 .idea/
@@ -11,6 +18,9 @@ loadtest/out/
 # 日志与调试产物
 *.log
 .playwright-mcp/
+
+# 备份快照输出（app.snapshot.directory 默认 ./snapshots）
+snapshots/
 
 # 本地配置与密钥
 .env

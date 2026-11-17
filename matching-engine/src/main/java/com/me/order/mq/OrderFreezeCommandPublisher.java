@@ -2,7 +2,7 @@ package com.me.order.mq;
 
 import com.me.account.dto.FundsCommand;
 import com.me.account.dto.OrderFreezeCommandsBatch;
-import com.me.kafka.KafkaSink;
+import com.me.kafka.BatchOutput;
 import com.me.order.dto.FreezeCommand;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -26,19 +26,16 @@ import org.springframework.stereotype.Component;
 @Component
 public class OrderFreezeCommandPublisher {
 
-    private final KafkaSink sink;
     private final String topic;
 
     public OrderFreezeCommandPublisher(
-            KafkaSink sink,
             @Value("${app.kafka.topics.account-order-freeze-commands}") String topic) {
-        this.sink = sink;
         this.topic = topic;
     }
 
-    /** 在当前消费批次事务中发送一条冻结命令（封装成单元素批量消息）。 */
-    public void publish(String symbol, FundsCommand command) {
-        sink.sendBatchMessage(topic, symbol, List.of(command), OrderFreezeCommandsBatch::new);
+    /** 把一条冻结命令封装成单元素批量消息，放入本批次输出。 */
+    public void publish(BatchOutput output, String symbol, FundsCommand command) {
+        output.sendBatchMessage(topic, symbol, List.of(command), OrderFreezeCommandsBatch::new);
     }
 
     /**
@@ -48,7 +45,7 @@ public class OrderFreezeCommandPublisher {
      * symbol 汇总，撮合阶段的价格-时间优先不被破坏。账户模块在消费端再把批内命令
      * 按 userId slot 拆给 8 个线程并发执行。
      */
-    public void publishBatch(List<FreezeCommand> commands) {
+    public void publishBatch(BatchOutput output, List<FreezeCommand> commands) {
         if (commands == null || commands.isEmpty()) {
             return;
         }
@@ -58,6 +55,6 @@ public class OrderFreezeCommandPublisher {
                     .add(command.command());
         }
         bySymbol.forEach((symbol, batch) ->
-                sink.sendBatchMessage(topic, symbol, batch, OrderFreezeCommandsBatch::new));
+                output.sendBatchMessage(topic, symbol, batch, OrderFreezeCommandsBatch::new));
     }
 }

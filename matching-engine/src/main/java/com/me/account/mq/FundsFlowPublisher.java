@@ -1,6 +1,6 @@
 package com.me.account.mq;
 
-import com.me.kafka.KafkaSink;
+import com.me.kafka.BatchOutput;
 import com.me.shared.event.FundsFlowBatch;
 import com.me.shared.event.FundsFlowEvent;
 import java.nio.charset.StandardCharsets;
@@ -30,21 +30,18 @@ import org.springframework.stereotype.Component;
 @Component
 public class FundsFlowPublisher {
 
-    private final KafkaSink sink;
     private final String topic;
     private final int partitions;
 
     public FundsFlowPublisher(
-            KafkaSink sink,
             @Value("${app.kafka.topics.funds-flow}") String topic,
             @Value("${app.kafka.topic.partitions:8}") int partitions) {
-        this.sink = sink;
         this.topic = topic;
         this.partitions = Math.max(1, partitions);
     }
 
-    /** 按 userId 目标分区聚合，每个分区一条批量消息入队，由当前 Kafka 事务统一提交。 */
-    public void publishBatch(List<FundsFlowEvent> events) {
+    /** 按 userId 目标分区聚合，每个分区一条批量消息放入本批次输出。 */
+    public void publishBatch(BatchOutput output, List<FundsFlowEvent> events) {
         if (events == null || events.isEmpty()) {
             return;
         }
@@ -58,7 +55,7 @@ public class FundsFlowPublisher {
                     .events().add(event);
         }
         byPartition.values().forEach(batch ->
-                sink.sendBatchMessage(topic, batch.key(), batch.events(), FundsFlowBatch::new));
+                output.sendBatchMessage(topic, batch.key(), batch.events(), FundsFlowBatch::new));
     }
 
     private record PartitionBatch(String key, List<FundsFlowEvent> events) {

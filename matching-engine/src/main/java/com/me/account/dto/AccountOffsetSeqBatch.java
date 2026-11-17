@@ -4,7 +4,7 @@ import java.util.List;
 
 /**
  * 账户 offset-seq 批量消息：账户模块处理完一个消费批次后，把该批每条输入记录
- * 与批次 {@code accountSeq} 的对应关系封装成一条 Kafka 消息，发往
+ * 与自己的 {@code accountSeq} 的对应关系封装成一条 Kafka 消息，发往
  * {@code me.account.offset-seq-batch}。
  *
  * <p>与资金流水、冻结回执、消费 offset 在同一个 Kafka 事务内提交，因此

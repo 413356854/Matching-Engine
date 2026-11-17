@@ -5,9 +5,15 @@ import com.me.matching.dto.MatchResult;
 import com.me.matching.entity.BookOrder;
 import com.me.matching.service.impl.CollectionOrderBook;
 import com.me.matching.vo.DepthSnapshot;
+import com.me.matching.vo.OrderBookSnapshot;
 import com.me.shared.order.OrderCancelEvent;
 import com.me.shared.order.OrderPlacedEvent;
 import com.me.shared.order.OrderType;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -93,5 +99,49 @@ public final class MatchingEngine {
 
     public int symbolCount() {
         return books.size();
+    }
+
+    /**
+     * 备份快照：按 symbol 升序复制全部订单簿。
+     *
+     * <p>与 {@link #place} / {@link #cancel} 使用同一把引擎对象锁，复制期间不会有
+     * 撮合或撤单修改订单簿。调用方通常还持有委托模块的批次锁，形成完整的静止点。
+     */
+    public synchronized List<OrderBookSnapshot> snapshot() {
+        List<OrderBookSnapshot> snapshots = new ArrayList<>(books.size());
+        for (OrderBook book : books.values()) {
+            snapshots.add(book.snapshot());
+        }
+        snapshots.sort(Comparator.comparing(OrderBookSnapshot::symbol));
+        return List.copyOf(snapshots);
+    }
+
+    /**
+     * 快照恢复：用快照内容整体替换全部订单簿。
+     *
+     * <p>只能在启动恢复阶段、委托 consumer 尚未启动时调用。先在局部结构中构建全部
+     * 订单簿，全部成功后再替换，避免异常时留下半恢复状态。
+     */
+    public synchronized void restore(List<OrderBookSnapshot> snapshots) {
+        if (snapshots == null) {
+            throw new IllegalArgumentException("snapshot books must not be null");
+        }
+        Map<String, OrderBook> restored = new HashMap<>(snapshots.size() * 2);
+        for (OrderBookSnapshot snapshot : snapshots) {
+            if (snapshot == null) {
+                throw new IllegalArgumentException("snapshot book must not be null");
+            }
+            if (snapshot.symbol() == null || snapshot.symbol().isBlank()) {
+                throw new IllegalArgumentException("snapshot book symbol is missing");
+            }
+            CollectionOrderBook book = new CollectionOrderBook(snapshot.symbol());
+            book.restore(snapshot);
+            if (restored.putIfAbsent(snapshot.symbol(), book) != null) {
+                throw new IllegalArgumentException(
+                        "duplicate snapshot book symbol: " + snapshot.symbol());
+            }
+        }
+        books.clear();
+        books.putAll(restored);
     }
 }

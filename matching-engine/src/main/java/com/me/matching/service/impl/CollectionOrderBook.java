@@ -4,8 +4,11 @@ import com.me.matching.dto.MatchResult;
 import com.me.matching.entity.BookOrder;
 import com.me.matching.entity.Trade;
 import com.me.matching.service.OrderBook;
+import com.me.matching.vo.BookOrderSnapshot;
 import com.me.matching.vo.DepthLevel;
 import com.me.matching.vo.DepthSnapshot;
+import com.me.matching.vo.OrderBookSnapshot;
+import com.me.matching.vo.PriceLevelSnapshot;
 import com.me.shared.money.Amounts;
 import com.me.shared.order.OrderPlacedEvent;
 import com.me.shared.order.OrderSide;
@@ -341,6 +344,169 @@ public final class CollectionOrderBook implements OrderBook {
             }
         }
         return null;
+    }
+
+    @Override
+    public synchronized OrderBookSnapshot snapshot() {
+        return new OrderBookSnapshot(
+                symbol,
+                snapshotLevels(limitBids),
+                snapshotLevels(limitAsks),
+                snapshotMarket(marketBids),
+                snapshotMarket(marketAsks),
+                sortedSeenOrderIds(),
+                nextTradeId);
+    }
+
+    /**
+     * 从快照重建订单簿；只允许启动恢复阶段使用。
+     *
+     * <p>先在局部结构中构建并校验，全部成功后再替换当前状态，避免异常时留下半更新订单簿。
+     */
+    public synchronized void restore(OrderBookSnapshot snapshot) {
+        if (snapshot == null) {
+            throw new IllegalArgumentException("snapshot book must not be null");
+        }
+        if (!symbol.equals(snapshot.symbol())) {
+            throw new IllegalArgumentException("snapshot book symbol " + snapshot.symbol()
+                    + " does not match " + symbol);
+        }
+        if (snapshot.bids() == null || snapshot.asks() == null
+                || snapshot.marketBids() == null || snapshot.marketAsks() == null
+                || snapshot.seenOrderIds() == null) {
+            throw new IllegalArgumentException("snapshot book is incomplete: " + symbol);
+        }
+        if (snapshot.nextTradeId() < 1) {
+            throw new IllegalArgumentException("snapshot book nextTradeId must be positive: "
+                    + symbol + ", nextTradeId=" + snapshot.nextTradeId());
+        }
+
+        NavigableMap<Long, LinkedHashMap<Long, BookOrder>> restoredBids =
+                new TreeMap<>(Comparator.reverseOrder());
+        NavigableMap<Long, LinkedHashMap<Long, BookOrder>> restoredAsks = new TreeMap<>();
+        Map<Long, BookOrder> restoredMarketBids = new LinkedHashMap<>();
+        Map<Long, BookOrder> restoredMarketAsks = new LinkedHashMap<>();
+        Set<Long> restoredSeen = new HashSet<>();
+        Set<Long> allOrderIds = new HashSet<>();
+
+        restoreLevels(snapshot.bids(), OrderSide.BUY, restoredBids, allOrderIds);
+        restoreLevels(snapshot.asks(), OrderSide.SELL, restoredAsks, allOrderIds);
+        restoreMarket(snapshot.marketBids(), OrderSide.BUY, restoredMarketBids, allOrderIds);
+        restoreMarket(snapshot.marketAsks(), OrderSide.SELL, restoredMarketAsks, allOrderIds);
+
+        for (Long orderId : snapshot.seenOrderIds()) {
+            if (orderId == null || orderId <= 0) {
+                throw new IllegalArgumentException("invalid seen orderId: " + orderId);
+            }
+            if (!restoredSeen.add(orderId)) {
+                throw new IllegalArgumentException("duplicate seen orderId: " + orderId);
+            }
+        }
+        for (Long orderId : allOrderIds) {
+            if (!restoredSeen.contains(orderId)) {
+                throw new IllegalArgumentException("resting order missing from seenOrderIds: "
+                        + orderId);
+            }
+        }
+
+        limitBids.clear();
+        limitBids.putAll(restoredBids);
+        limitAsks.clear();
+        limitAsks.putAll(restoredAsks);
+        marketBids.clear();
+        marketBids.putAll(restoredMarketBids);
+        marketAsks.clear();
+        marketAsks.putAll(restoredMarketAsks);
+        seenOrderIds.clear();
+        seenOrderIds.addAll(restoredSeen);
+        nextTradeId = snapshot.nextTradeId();
+    }
+
+    private void restoreLevels(List<PriceLevelSnapshot> levels,
+                               OrderSide expectedSide,
+                               NavigableMap<Long, LinkedHashMap<Long, BookOrder>> target,
+                               Set<Long> allOrderIds) {
+        for (PriceLevelSnapshot level : levels) {
+            if (level == null || level.orders() == null || level.orders().isEmpty()) {
+                throw new IllegalArgumentException("snapshot book has empty price level");
+            }
+            if (level.price() <= 0) {
+                throw new IllegalArgumentException("snapshot price level must be positive: "
+                        + level.price());
+            }
+            LinkedHashMap<Long, BookOrder> orders = new LinkedHashMap<>(level.orders().size() * 2);
+            for (BookOrderSnapshot order : level.orders()) {
+                if (order == null || order.type() != OrderType.LIMIT
+                        || order.side() != expectedSide
+                        || order.price() != level.price()) {
+                    throw new IllegalArgumentException("snapshot limit order does not match "
+                            + "price level: " + order);
+                }
+                BookOrder restored = BookOrder.fromSnapshot(order);
+                if (!symbol.equals(restored.symbol())) {
+                    throw new IllegalArgumentException("snapshot book order symbol mismatch: "
+                            + restored.symbol() + " != " + symbol);
+                }
+                if (!allOrderIds.add(restored.orderId())) {
+                    throw new IllegalArgumentException("duplicate snapshot book orderId: "
+                            + restored.orderId());
+                }
+                orders.put(restored.orderId(), restored);
+            }
+            if (target.put(level.price(), orders) != null) {
+                throw new IllegalArgumentException("duplicate snapshot price level: "
+                        + level.price());
+            }
+        }
+    }
+
+    private void restoreMarket(List<BookOrderSnapshot> orders,
+                               OrderSide expectedSide,
+                               Map<Long, BookOrder> target,
+                               Set<Long> allOrderIds) {
+        for (BookOrderSnapshot order : orders) {
+            if (order == null || order.type() != OrderType.MARKET
+                    || order.side() != expectedSide || order.price() != 0) {
+                throw new IllegalArgumentException("snapshot market order is invalid: " + order);
+            }
+            BookOrder restored = BookOrder.fromSnapshot(order);
+            if (!symbol.equals(restored.symbol())) {
+                throw new IllegalArgumentException("snapshot book order symbol mismatch: "
+                        + restored.symbol() + " != " + symbol);
+            }
+            if (!allOrderIds.add(restored.orderId())) {
+                throw new IllegalArgumentException("duplicate snapshot book orderId: "
+                        + restored.orderId());
+            }
+            target.put(restored.orderId(), restored);
+        }
+    }
+
+    private static List<PriceLevelSnapshot> snapshotLevels(
+            NavigableMap<Long, LinkedHashMap<Long, BookOrder>> book) {
+        List<PriceLevelSnapshot> levels = new ArrayList<>(book.size());
+        for (Map.Entry<Long, LinkedHashMap<Long, BookOrder>> entry : book.entrySet()) {
+            List<BookOrderSnapshot> orders = new ArrayList<>(entry.getValue().size());
+            for (BookOrder order : entry.getValue().values()) {
+                orders.add(order.toSnapshot());
+            }
+            levels.add(new PriceLevelSnapshot(entry.getKey(), List.copyOf(orders)));
+        }
+        return List.copyOf(levels);
+    }
+
+    private static List<BookOrderSnapshot> snapshotMarket(Map<Long, BookOrder> book) {
+        List<BookOrderSnapshot> orders = new ArrayList<>(book.size());
+        for (BookOrder order : book.values()) {
+            orders.add(order.toSnapshot());
+        }
+        return List.copyOf(orders);
+    }
+
+    private List<Long> sortedSeenOrderIds() {
+        List<Long> ids = new ArrayList<>(seenOrderIds);
+        ids.sort(Long::compareTo);
+        return List.copyOf(ids);
     }
 
     @Override

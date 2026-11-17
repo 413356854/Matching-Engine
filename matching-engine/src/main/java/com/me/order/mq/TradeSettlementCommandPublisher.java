@@ -3,7 +3,7 @@ package com.me.order.mq;
 import com.me.account.dto.TradeSettlementBatch;
 import com.me.account.dto.TradeSettlementCommand;
 import com.me.account.sharding.AccountSharding;
-import com.me.kafka.KafkaSink;
+import com.me.kafka.BatchOutput;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -24,18 +24,15 @@ import org.springframework.stereotype.Component;
 @Component
 public class TradeSettlementCommandPublisher {
 
-    private final KafkaSink sink;
     private final String topic;
 
     public TradeSettlementCommandPublisher(
-            KafkaSink sink,
             @Value("${app.kafka.topics.account-settlements}") String topic) {
-        this.sink = sink;
         this.topic = topic;
     }
 
-    /** 按 userId slot 分组发送结算批量消息，由当前 Kafka 事务统一提交。 */
-    public void publishBatch(List<TradeSettlementCommand> commands) {
+    /** 按 userId slot 分组，把结算批量消息直接封装进本批次的输出。 */
+    public void publishBatch(BatchOutput output, List<TradeSettlementCommand> commands) {
         if (commands == null || commands.isEmpty()) {
             return;
         }
@@ -45,7 +42,7 @@ public class TradeSettlementCommandPublisher {
             bySlot.computeIfAbsent(slot, ignored -> new ArrayList<>()).add(command);
         }
         bySlot.forEach((slot, batch) ->
-                sink.sendBatchMessage(topic, slot, Integer.toString(slot), batch,
+                output.sendBatchMessage(topic, slot, Integer.toString(slot), batch,
                         TradeSettlementBatch::new));
     }
 }

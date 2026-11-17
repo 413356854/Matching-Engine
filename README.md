@@ -115,7 +115,7 @@ MatchingEngine（订单簿，价格-时间优先，M0 集合版）
 **五个业务模块跑在同一个进程里**：Kafka 是同机部署的持久化与消息组件，不是服务边界；模块间同步调用走 `service` 接口，异步解耦走事件。撮合引擎不再是 Kafka 消费者/生产者，而是委托模块进程内的纯 JDK 组件。
 
 **接单与撮合**：`币币模块 REST（仅投递命令）→ me.order.commands-batch → 委托模块唯一接单入口 OrderCommandListener → 账户模块预占 → me.account.order-freeze-commands-batch → 账户回执 me.order.freeze-results-batch → 委托模块进程内调用 MatchingEngine → 委托清算 → me.account.settlements-batch / me.match-pair-batch`。
-充值等非冻结资金命令仍走 `me.account.commands`（key=userId），与冻结链路分开；三条账户输入链路的批次由 `AccountOperationService` 的全局锁串行执行并分配 `accountSeq`，批内再按 `AccountService` 的分片锁并发。委托侧的下单、冻结回执、撤单三条链路同理，由 `OrderOperationService` 的全局锁串行并分配 `orderSeq`，批内保留各链路原有的线程池并发。
+充值等非冻结资金命令仍走 `me.account.commands`（key=userId），与冻结链路分开；三条账户输入链路的批次由 `AccountOperationService` 的全局锁串行执行，并按 Kafka 输入记录分配 `accountSeq`，批内再按 `AccountService` 的分片锁并发。委托侧的下单、冻结回执、撤单三条链路同理，由 `OrderOperationService` 的全局锁串行，并按 Kafka 输入记录分配 `orderSeq`，批内保留各链路原有的线程池并发。两个模块各自把批次输出封装成 `SendPackage` 放入有界 FIFO 队列，由唯一的 `order-committer` / `account-committer` 按入队顺序提交 Kafka 事务；模块锁只覆盖业务处理、seq 分配和打包，Kafka 提交与下一批业务可以重叠。
 下单命令、冻结命令、冻结回执、撮合对、结算都按 symbol 分组，每个 symbol 一条批量消息（key=symbol）；资金流水按 userId 分组发送（key=userId），每个目标分区一条批量消息。消息体分别是 `OrderCommandBatch` / `OrderFreezeCommandsBatch` / `OrderFreezeResultBatch` / `MatchPairBatch` / `TradeSettlementBatch` / `FundsFlowBatch` / `AccountOffsetSeqBatch`；只有充值等非冻结资金命令 `me.account.commands` 仍是逐条消息。
 `me.orders` 与 `me.trades` 两个 topic 已从撮合链路移除；订单/订单簿状态仍是内存态（演示口径），生产化需另做持久化与快照。
 
@@ -137,7 +137,7 @@ MatchingEngine（订单簿，价格-时间优先，M0 集合版）
 2. 撮合在冻结回执线程内同步完成；行情、结算、K 线通过 Kafka 异步解耦
 3. 订单簿**先集合版、后数组化**：M0 用 `TreeMap` 价格梯 + `LinkedHashMap` FIFO + `HashMap` 索引，先把正确性与确定性跑通；数组化（分页价格梯 + 两级位图 + 64B 订单槽 + 侵入式 FIFO，全 O(1)、零分配）列为 M3，换实现不动 `OrderBook` 接口
 4. 批量：下单入口 Disruptor 按 symbol 维护 `Map<String, List<Order>>`，任一 symbol 达到 2000 条或 50ms 窗口到达时，把 map 中所有 symbol 的订单分别封装为 `OrderCommandBatch`；批量 topic 消费 `max.poll.records=10`（逐条的 `me.account.commands` 仍为 2000）+ `fetch.max.wait.ms=50ms` + `fetch.min.bytes≈1MB`，每个 poll 批次一个 Kafka 事务；整批回滚后在**新事务**中重投，账户拒绝按记录身份缓存、资金流水按 eventId 去重、QuestDB 按 poll 批次批量写入
-5. 确定性：冻结回执按 symbol 分区并行消费（同一 symbol 内仍单线程）、进程内按 symbol 串行撮合、整数运算；演示版**不缓存撮合输出**，同一订单的重复回执由匹配引擎按 `orderId` 去重，不再产生行情/结算；充值（key=userId）、冻结（key=symbol）、结算（key=slot）三条链路的批次由 `AccountOperationService` 全局锁串行并分配 `accountSeq`，跨链路的执行先后由该序号确定，批内不同 slot 仍并发、余额正确性由账户分片锁保证；委托侧下单 / 冻结回执 / 撤单三条链路由 `OrderOperationService` 全局锁串行并分配 `orderSeq`；快照/内存恢复列为后续计划
+5. 确定性：冻结回执按 symbol 分区并行消费（同一 symbol 内仍单线程）、进程内按 symbol 串行撮合、整数运算；演示版**不缓存撮合输出**，同一订单的重复回执由匹配引擎按 `orderId` 去重，不再产生行情/结算；充值（key=userId）、冻结（key=symbol）、结算（key=slot）三条链路的批次由 `AccountOperationService` 全局锁串行，并按 Kafka 输入记录分配 `accountSeq`，跨链路的输入记录执行先后由该序号确定，批内不同 slot 仍并发、余额正确性由账户分片锁保证；委托侧下单 / 冻结回执 / 撤单三条链路由 `OrderOperationService` 全局锁串行，并按 Kafka 输入记录分配 `orderSeq`；快照/内存恢复列为后续计划
 6. 资金预占前置，撮合器只接收已冻结订单
 7. 背压快速失败（Kafka buffer / consumer lag 水位），绝不无限排队
 
@@ -258,10 +258,10 @@ pwsh -File .\stop-kafka.ps1
 | `me.order.freeze-results-batch` | 8 | 下单冻结回执批量消息（`key=symbol`，每个 symbol 一条，body=`OrderFreezeResultBatch`；触发进程内撮合） |
 | `me.match-pair-batch` | 8 | 撮合对批量消息（`key=symbol`，每个 symbol 一条，body=`MatchPairBatch`；行情模块消费生成 K 线 / 成交明细，admin 以独立消费组 `admin-user-trade` 消费并归档用户成交记录 `user_trade`，建表脚本 `doc/questdb/user_trade.sql`） |
 | `me.account.settlements-batch` | 8 | 单用户成交结算批量消息（`key/partition=slot(userId)`，每个 slot 一条，body=`TradeSettlementBatch`；每笔成交拆成买方 `-b`、卖方 `-s` 两条命令，每个元素只含一个用户的资金腿） |
-| `me.account.offset-seq-batch` | 8 | 账户操作全局序列（固定 `key=batch`，body=`AccountOffsetSeqBatch`；每个元素是输入消费记录 `(topic, partition, offset)` 与批次 `accountSeq` 的映射；与资金流水 / 冻结回执 / 消费 offset 同事务提交，供备份快照恢复后按序回溯 Kafka 消息） |
+| `me.account.offset-seq-batch` | 8 | 账户操作全局序列（固定 `key=batch`，body=`AccountOffsetSeqBatch`；每个元素是输入消费记录 `(topic, partition, offset)` 与自己的 `accountSeq` 的映射；与资金流水 / 冻结回执 / 消费 offset 同事务提交，供备份快照恢复后按序回溯 Kafka 消息） |
 | `me.funds-batch` | 8 | 资金流水批量消息（按 userId 哈希分区，每个分区每批一条，body=`FundsFlowBatch`；8 个 admin consumer 并行归档 QuestDB） |
 | `me.order.history-batch` | 8 | 委托历史批量消息（`key=symbol`，每个 symbol 一条，body=`OrderHistoryBatch`；只包含撤单 `CANCELED` 与撮合完成 `FILLED` 两种终态；admin 消费并归档 QuestDB `ord_history`，建表脚本 `doc/questdb/ord_history.sql`） |
-| `me.order.offset-seq-batch` | 8 | 委托操作全局序列（固定 `key=batch`，body=`OrderOffsetSeqBatch`；每个元素是输入消费记录 `(topic, partition, offset)` 与批次 `orderSeq` 的映射；与撮合输出 / 结算命令 / 委托历史 / 消费 offset 同事务提交，供备份快照恢复后按序回溯 Kafka 消息） |
+| `me.order.offset-seq-batch` | 8 | 委托操作全局序列（固定 `key=batch`，body=`OrderOffsetSeqBatch`；每个元素是输入消费记录 `(topic, partition, offset)` 与自己的 `orderSeq` 的映射；与撮合输出 / 结算命令 / 委托历史 / 消费 offset 同事务提交，供备份快照恢复后按序回溯 Kafka 消息） |
 | `me.depth` | 8 | 深度 / BBO 事件（规划；当前代码未使用） |
 
 > 下单、撤单、冻结回执、撮合对、委托历史按 symbol 分组（`key=symbol`），同一 symbol 的批次落在同一分区并保持顺序；结算按 `slot(userId)` 分组（`key/partition=slot`），同一 slot 的清算命令保持顺序；资金流水按 userId 哈希分区，每个分区每批聚合一条批量消息；账户 / 委托 offset-seq 映射使用固定 `key=batch`，所有批次写入同一分区。单条批量消息最多封装 2000 个元素，超过时拆成多条。旧的 `me.account.order-freeze-commands` / `me.order.freeze-results` / `me.marketdata` / `me.marketdata-batch` / `me.account.settlements` / `me.funds` topic 已由上述 `-batch` topic 取代（行情批量 topic 现为 `me.match-pair-batch`），broker 中可能保留历史消息。
@@ -316,18 +316,21 @@ pwsh -File .\stop-kafka.ps1
 | `app.kafka.consumer.max-poll-interval-ms` | `600000` | 批量处理阻塞 poll 的余量 |
 | `app.kafka.producer.transaction-timeout-ms` | `180000` | 一批最多 10 条批量消息（每条 ≤2000 元素），给足事务时间 |
 
-> 一个 poll 批次 = 一次 Kafka 事务：`initTransactions`（启动一次）→ `beginTransaction`
-> → 处理（收集整批流水/回执/行情/结算，一次 `sendBatch` 入队，不逐条 `.get()`）
-> → `sendOffsetsToTransaction(offsets, consumer.groupMetadata())` → `commitTransaction`。
-> 发送失败由 `commitTransaction` 统一暴露。poll 只返回“当前可用的记录”，不会跨 poll 精确凑满上限
-> （逐条 topic 2000 条，批量 topic 10 条）。
+> 有状态模块（委托 / 账户）的 poll 批次不再由 runner 直接提交：runner 在模块锁内完成业务、
+> 分配 seq，并把本批输出消息 / 输入 offset / groupMetadata 封装成 `SendPackage`，放入模块的
+> 有界 FIFO 队列（`app.kafka.commit.queue-capacity`，默认 32；满时 `put()` 阻塞，不拒绝）。
+> 释放模块锁后等待 committer；每个模块一个 committer 线程，按入队顺序执行
+> `beginTransaction → send`（一次最多合并 `max-packages-per-transaction` 个包，默认 2）
+> `→ sendOffsetsToTransaction → commitTransaction`，提交顺序 == seq 顺序。
+> 审计 / 投影 stage（marketdata / user-trade / funds-flow / order-history）仍由 runner 直接提交。
+> poll 只返回“当前可用的记录”，不会跨 poll 精确凑满上限（逐条 topic 2000 条，批量 topic 10 条）。
 
 **错误处理与幂等**：
 
-- `KafkaConsumerRunner`：可重试异常（业务处理失败、`TransactionAbortableException`、
-  `CommitFailedException`）→ `abortTransaction`，精确 seek 回本批第一条 offset，1s 退避后整批重投；
-  `ApplicationRecoverableException` / 其他 `KafkaException` → 关闭并重建 client；
-  `InvalidConfigurationException` / 反序列化失败 → 记录 ERROR 并停止该 runner（fail-stop）。
+- `KafkaConsumerRunner`：**不做整批重试**。业务处理或 Kafka 事务失败时先置全局 fatal
+  （停止全部 consumer、HTTP 统一返回 503），abort 当前事务后线程退出，进程等待外部监控重启；
+  失败批次可能已经修改内存状态，重启丢弃脏状态。有状态 stage 的 committer 失败时还会异常
+  完成队列中所有未提交包，避免 runner 永久等待。
 - `AccountOperationService`（三条账户输入链路共用）：充值 / 扣账按 `(topic, partition, offset)`、成交结算按 `(topic, partition, offset, index)` 缓存拒绝结果。批量在拒绝后仍继续处理后续记录，后者可能改变余额；整批重投时复现原拒绝，避免“先拒绝、后入账”被重算成成功。冻结链路不缓存拒绝，重投会重新执行并回执。
 - `FundsFlowConsumer`：按 `eventId` 去重（`funds_flow` 无 QuestDB DEDUP），整批 `insertBatch` 成功后才记录本批 eventId，整批重投不产生重复行；极端情况下 batch 已写入前缀行后才失败，重投可能重复该前缀。
 - `OrderOperationService`（下单 / 冻结回执 / 撤单三条链路共用）：业务执行迁到 service 后保持原有幂等语义；演示版不缓存撮合输出，重复回执由撮合引擎按 `orderId` 返回 duplicate（`DUPLICATE_IGNORED`），不会重复产生行情/结算；若上一次事务未提交，重投可能丢输出（后续由备份消息/内存恢复解决）。
@@ -346,27 +349,28 @@ pwsh -File .\stop-kafka.ps1
   不按具体日志类型分支。可用 / 冻结余额不足分别返回
   `INSUFFICIENT_AVAILABLE_BALANCE` / `INSUFFICIENT_FROZEN_BALANCE`，且不产生流水。
 - **账户操作执行器**：`AccountOperationService` 统一承接充值/扣账、下单冻结、成交结算三条链路
-  的批次业务。批次先竞争全局 `accountLock`，拿到锁后 `accountSeq.incrementAndGet()` 取得
-  本批次的全局序号；批内命令再按 `slot(userId)` 分组提交 `accountOperationExecutor` 并发执行，
-  同一 slot 内按输入顺序串行。批次内每条输入消费记录 `(topic, partition, offset)` 与该序号
-  配对，封装成 `AccountOffsetSeqBatch` 发往 `me.account.offset-seq-batch`，与资金流水 / 冻结
-  回执 / 消费 offset 在同一个 Kafka 事务内提交；备份快照恢复后按 `accountSeq` 顺序回溯重放
-  输入消息，并用快照水位过滤已执行的记录。重投的失败批次会重新分配序号，因此 `accountSeq`
-  单调递增但不保证连续。
+  的批次业务。批次先竞争全局 `accountLock`，拿到锁后按 ConsumerRecord 输入顺序，为每条 Kafka
+  输入记录执行 `accountSeq.incrementAndGet()` 分配独立序号；批内命令再按 `slot(userId)` 分组
+  提交 `accountOperationExecutor` 并发执行，同一 slot 内按输入顺序串行。每条输入消费记录
+  `(topic, partition, offset)` 与自己的 `accountSeq` 配对，封装成 `AccountOffsetSeqBatch` 发往
+  `me.account.offset-seq-batch`。本批输出（资金流水 / 冻结回执 / offset-seq）先收集成
+  `SendPackage`，释放模块锁后由 `account-committer` 统一提交，与消费 offset 在同一个 Kafka
+  事务内；因此账户锁只覆盖「状态修改 + seq 分配 + 打包」，不再覆盖网络提交。备份快照恢复后
+  按 `accountSeq` 顺序回溯重放输入消息，并用快照水位过滤已执行的记录。失败批次可能已经分配
+  但未提交序号，因此映射中的 `accountSeq` 单调递增但不保证连续；进程重启后从快照水位恢复。
 - **资金流水**：成功操作生成 `FundsFlowEvent`，封装进 `FundsFlowBatch` 发送到
   `me.funds-batch`（按 userId 哈希分区），事件携带日志类型、可用/冻结余额前后值。
 - **下单冻结回执**：`ORDER_FREEZE` 命令处理完（无论成功还是余额不足）都会向委托模块的
   `me.order.freeze-results-batch` 回执 `OrderFreezeResultEvent`（封装进 `OrderFreezeResultBatch`）；
   回执中的 `orderId` 来自命令的 `refId`，与消费 offset、`me.funds-batch` 流水在同一个
   Kafka 事务内提交。
-- **Kafka 事务（消费 offset + 产出流水原子提交）**：每条消费链路一个事务型 `KafkaProducer`
-  （`transactional.id = 前缀 + runner + instance-id`）；`initTransactions()` 后每个 poll 批次
-  `beginTransaction → 发送流水/回执 → sendOffsetsToTransaction → commitTransaction`，
-  `me.account.commands` 的消费 offset 与发往 `me.funds-batch` 的流水在同一个事务中提交或回滚，
-  消费端使用 `isolation.level=read_committed`、关闭自动提交。演示版账户服务不做 `requestId`
-  防重，Kafka 重投会再次执行；后续由持久化备份与内存状态恢复解决。
-  事务回滚后的命令重投会再次执行，可能重复修改余额（演示版取舍）；runner 对可重试失败整批重投（1s 间隔），
-  不会跳过记录导致「offset 已提交、流水丢失」。
+- **Kafka 事务（消费 offset + 产出流水原子提交）**：有状态 stage 由模块 committer 统一提交，
+  `transactional.id = 前缀 + order/account-committer + instance-id`；committer 按 FIFO 队列
+  一次处理最多 2 个 `SendPackage`，`beginTransaction → 发送流水/回执 → sendOffsetsToTransaction
+  → commitTransaction`。审计 / 投影 stage 仍由每条消费链路自己的事务型 producer 提交
+  （`transactional.id = 前缀 + runner + instance-id`）。消费端使用 `isolation.level=read_committed`、
+  关闭自动提交。演示版账户服务不做 `requestId` 防重，Kafka 重启后的未提交消息会被重新消费；
+  后续由持久化备份与内存状态恢复解决。任何失败进入全局 fatal，不在本进程重试。
 - **消费起点**：`KafkaRebalanceListener` 在分区分配时查询本消费组已提交的 offset 并显式 `seek`
   到该位置；没有提交记录则从最早位置开始。
 - **admin 模块**：`com.me.admin` 消费 `me.funds-batch`，默认通过 QuestDB 官方 Java 客户端的
@@ -431,6 +435,58 @@ curl -G http://localhost:9000/exec `
 - **一键删除 K 线**：`DELETE /api/v1/admin/klines`
   - 实现为 `TRUNCATE TABLE md_kline` + `TRUNCATE TABLE md_kline_anchor`，并清空内存聚合状态；
     返回删除前的 K 线条数；成交明细 `md_trade` 不受影响。
+- **备份快照**：`POST /api/v1/admin/snapshots`
+  - 同步执行一次内存快照：先拿下单 / 撤单 / 充值三个入口锁，等待两个事务 committer 队列
+    提交完成、三个内部级联 topic 排空，再在账户 / 委托模块锁内复制内存，校验
+    「每 (userId, currency) 的未成交委托剩余冻结 == 账户冻结」后写入本地 JSON 文件。
+  - 返回 `backupId`、`path`、`fileSizeBytes`、`accountSeq` / `orderSeq` 水位、账户 /
+    委托 / 订单簿 / offset 数量与 SHA-256 校验和；并发调用返回 409，引擎 fatal /
+    排空超时 / 一致性校验失败返回 503。
+  - 每次成功快照同时写入 MySQL `snapshot_backup`（文件路径、大小、校验和、seq 水位、
+    统计信息）和 `snapshot_backup_offset`（六条状态机输入 topic 的逐分区 next offset）；
+    建表脚本见 `doc/mysql/snapshot_backup.sql`。主表 + offset 表在同一事务写入。
+  - 输出目录由 `app.snapshot.directory`（环境变量 `SNAPSHOT_DIR`）配置，默认 `./snapshots`。
+    文件记录六条状态机输入 topic 的 next offset、seq 水位、结算 ID 生成器与订单簿
+    `seenOrderIds` / `nextTradeId`，以及格式版本 2 新增的两个 offset-seq topic 在切点的
+    逐分区端位点（`replayCheckpoints`），供启动恢复使用。
+- **快照列表**：`GET /api/v1/admin/snapshots?limit=50`
+  - 按 id 倒序返回 MySQL 中的快照记录；`limit` 缺省 50、上限 200。
+- **快照详情**：`GET /api/v1/admin/snapshots/{id}`
+  - 返回快照记录和逐分区恢复 offset；不存在返回 404。
+- **启动恢复状态**：`GET /api/v1/admin/snapshots/recovery`
+  - 返回当前恢复阶段（DISABLED / PENDING / RUNNING / READY / FAILED）、选中的 backup id、
+    重放的批次 / 记录数、调整过的消费组数量和失败原因。恢复期间其他接口统一返回 503。
+- 后台管理页「备份管理」已对接上述接口：可查看快照列表、展开详情、
+  点击「立即备份」触发快照。
+
+### 启动快照恢复与 committed offset 重放
+
+恢复只在进程启动阶段执行，默认关闭：
+
+```bash
+SNAPSHOT_RECOVERY_ENABLED=true \
+SNAPSHOT_RECOVERY_BACKUP_ID=0 \   # 0 = 最新快照；>0 = 指定 backup id
+java -jar matching-engine.jar
+```
+
+执行顺序（Spring `SmartLifecycle` phase 10，早于 committer 50 / consumer 100）：
+
+1. 从 MySQL 选中快照记录或直接读取 `SNAPSHOT_RECOVERY_FILE`，校验格式版本、SHA-256、
+   topic 分区 / 消费组拓扑；
+2. 恢复账户、委托、订单簿、两个 seq 水位和结算 ID 生成器；
+3. 从两个 offset-seq topic 的 `replayCheckpoints.nextOffset` 读到 read_committed LSO，
+   得到「输入记录 → seq」映射，按 seq 排序并保留原始批次边界；
+4. 从快照 offset 到 broker committed offset 之间重放已提交输入：**只改状态、不发输出**
+   （discard `BatchOutput`），避免重复资金流水 / 结算；每批校验 service 重新分配的 seq
+   与 offset-seq 完全一致；
+5. 严格模式下扫描重放区间，要求可见输入记录与 offset-seq 映射一一对应；
+6. broker committed offset 缺失或落后于快照时，用 `alterConsumerGroupOffsets` 写回快照
+   位点；正常情况保持 broker 位点，启动后 consumer 从该位点继续消费。
+
+崩溃前未提交的批次没有 offset-seq 映射、输入 offset 也未提交，恢复后由正常消费链路重新
+处理并按 at-least-once 语义发布输出。恢复期间 HTTP 统一返回 503
+（`RECOVERY_IN_PROGRESS`）；恢复失败会阻止 consumer 启动。主要配置见 `application.yml`
+中的 `app.snapshot.recovery.*`。
 
 ```powershell
 curl "http://localhost:8080/api/v1/admin/funds-flows?userId=1001&limit=50"
@@ -439,6 +495,10 @@ curl "http://localhost:8080/api/v1/admin/order-history?userId=1001&status=FILLED
 curl "http://localhost:8080/api/v1/admin/user-trades?userId=1001&role=TAKER&limit=50"
 curl "http://localhost:8080/api/v1/admin/klines?symbol=BTC-USDT&interval=1m&limit=50"
 curl -X DELETE "http://localhost:8080/api/v1/admin/klines"
+curl -X POST "http://localhost:8080/api/v1/admin/snapshots"
+curl "http://localhost:8080/api/v1/admin/snapshots?limit=10"
+curl "http://localhost:8080/api/v1/admin/snapshots/1"
+curl "http://localhost:8080/api/v1/admin/snapshots/recovery"
 ```
 
 ### 交易端用户历史流水、委托历史与成交
@@ -484,12 +544,13 @@ curl "http://localhost:8080/api/v1/currency/user-trades?userId=1001&limit=50"
 
 委托模块完成「接单 → 资金冻结 → 进程内撮合 → 成交清算」的闭环（余额、委托与订单簿仍是内存态，进程重启后丢失）：
 
-> **批次串行 + orderSeq**：下单、冻结回执、撤单三条链路的业务执行统一由
-> `OrderOperationService` 承接。每个 poll 批次在全局 `orderLock` 内先
-> `orderSeq.incrementAndGet()` 再执行，批内保留下文原有的线程池并发；批次内每条输入记录
-> `(topic, partition, offset)` 与 `orderSeq` 配对，封装成 `OrderOffsetSeqBatch` 发往
-> `me.order.offset-seq-batch`，与撮合输出 / 结算命令 / 委托历史 / 消费 offset 同事务提交。
-> 备份快照恢复后按该顺序回溯 Kafka 消息。
+> **批次串行 + 每条输入独立 orderSeq + FIFO 提交**：下单、冻结回执、撤单三条链路的业务执行
+> 统一由 `OrderOperationService` 承接。每个 poll 批次在全局 `orderLock` 内执行，批内保留下文
+> 原有的线程池并发；处理完成后按 ConsumerRecord 输入顺序为每条输入记录
+> `orderSeq.incrementAndGet()`，每条 `(topic, partition, offset)` 与自己的 `orderSeq` 配对，
+> 封装成 `OrderOffsetSeqBatch`。本批撮合输出 / 结算命令 / 委托历史 / offset-seq 收集成
+> `SendPackage`，释放 `orderLock` 后由唯一的 `order-committer` 按 FIFO 顺序提交，与消费
+> offset 同事务。批次水位可由最后一条 offset 的序号推导，备份快照恢复后按该顺序回溯 Kafka 消息。
 
 1. **接单入口**：币币模块 `POST /api/v1/currency/orders` 只做同步校验，把命令写入
    `OrderIngressRing`，由聚合线程按 symbol 攒入 `Map<String, List<OrderCommand>>`，
@@ -651,16 +712,25 @@ curl -X POST http://localhost:8080/api/v1/currency/orders/cancel \
   未提交的撮合输出，这是演示版的取舍。
 - 代价：订单不再写入 Kafka 事实源；订单/订单簿/幂等状态都是内存态，进程重启丢失。
 
-### 后续计划：备份消息 + 内存状态恢复
+### 备份消息 + 内存状态恢复
 
-当前演示版不引入额外的防重/重放代码，后续补齐：
+已实现：本地 JSON 快照（`POST /api/v1/admin/snapshots`）+ 启动恢复
+（`app.snapshot.recovery.enabled=true`）。恢复流程：
 
-1. **备份消息**：把订单、订单簿/撮合结果、幂等键写入备份 topic 或 compacted state topic，
-   与现有 Kafka 事务一起提交；
-2. **内存状态恢复**：启动时从备份 topic / 快照恢复 `orders`、订单簿、账户余额、
-   `appliedRequests`、`appliedTrades`、`appliedSettlements` 等，再按已提交 offset 继续消费；
-3. **持久化幂等**：用恢复后的状态替代当前内存缓存，实现模块级 exactly-once/重投重放；
-4. 在完成前，Kafka 重投按订单状态/撮合引擎 `orderId` 去重，不额外做防重缓存。
+1. 快照提供账户 / 委托 / 订单簿 / seq 水位 / 结算 ID 生成器的静止点；
+2. 两个 offset-seq topic 提供快照切点之后每条输入记录的全局 seq 和原始批次边界；
+3. 启动时先恢复内存，再按 seq 重放快照切点之后已提交的输入（只改状态、不发输出），
+   最后按 broker committed offset 继续正常消费；
+4. 未提交批次没有映射，由正常消费链路重投；下游投影（资金流水 / 委托历史 / 成交、
+   K 线）从各自 committed offset 继续消费，不会因恢复重复写入。
+
+后续可继续补齐：
+
+1. **持久化幂等**：用恢复后的状态替代当前内存拒绝缓存，实现模块级 exactly-once/重投重放；
+2. **运行中恢复**：目前只支持启动恢复，热恢复需要停止 consumer / committer 并清空状态，
+   风险较高，暂不提供；
+3. **快照配置一致性**：交易对 / 币种精度配置在快照之后变更会影响重放结果，必要时把配置
+   一并写入快照。
 
 ### 订单簿结构
 
@@ -710,8 +780,8 @@ curl -X POST http://localhost:8080/api/v1/currency/orders/cancel \
    - 买方：冻结计价币扣账（`TRADE_SETTLE_OUT`）、可用基础币到账（`TRADE_SETTLE_IN`）；
    - 卖方：冻结基础币扣账、可用计价币到账；
    - 买单全部成交且成交价优于限价时，买方命令附一条 `ORDER_UNFREEZE` 把多冻结的计价币释放回可用。
-4. **账户按命令原子结算**：`AccountOperationService` 在账户全局锁内承接清算批次并分配
-   `accountSeq`，再把批内清算单按 `slot(第一腿 userId)` 分成最多 8 组，提交
+4. **账户按命令原子结算**：`AccountOperationService` 在账户全局锁内承接清算批次，按输入记录
+   分配 `accountSeq`，再把批内清算单按 `slot(第一腿 userId)` 分成最多 8 组，提交
    `accountOperationExecutor` 线程池并发结算；同一 slot 的命令在组内按输入顺序串行。
    每条命令在涉及的账户分片锁内、先在副本上顺序执行
    全部资金腿，全部腿成功后才写回余额；任一腿余额不足则该条命令不生效并抛错重试。
@@ -979,10 +1049,12 @@ curl http://localhost:8080/api/v1/pairs
 ```
 
 演示数据见 [`doc/mysql/pair_seed.sql`](doc/mysql/pair_seed.sql)，建表脚本为
-[`pair_currency.sql`](doc/mysql/pair_currency.sql) / [`pair_symbol.sql`](doc/mysql/pair_symbol.sql)：
+[`pair_currency.sql`](doc/mysql/pair_currency.sql) / [`pair_symbol.sql`](doc/mysql/pair_symbol.sql)；
+备份快照记录表见 [`snapshot_backup.sql`](doc/mysql/snapshot_backup.sql)：
 
 ```powershell
 mysql --default-character-set=utf8mb4 -uadmin -padmin db_exchange < doc/mysql/pair_seed.sql
+mysql --default-character-set=utf8mb4 -uadmin -padmin db_exchange < doc/mysql/snapshot_backup.sql
 ```
 
 ### 下单

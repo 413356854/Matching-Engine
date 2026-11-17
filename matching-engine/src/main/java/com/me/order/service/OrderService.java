@@ -6,6 +6,7 @@ import com.me.order.dto.OrderCancelBeginResult;
 import com.me.order.dto.OrderCancelContext;
 import com.me.order.dto.OrderCancelPrepareResult;
 import com.me.order.dto.OrderFreezeApplyResult;
+import com.me.order.dto.OrderStateSnapshot;
 import com.me.order.dto.OrderTradeApplyResult;
 import com.me.order.vo.OrderView;
 import com.me.shared.event.OrderFreezeResultEvent;
@@ -113,4 +114,22 @@ public interface OrderService {
      * @param limit  1..200，超出范围按边界夹取
      */
     List<OrderView> openOrders(long userId, String symbol, int limit);
+
+    /**
+     * 快照用：返回全部委托及结算 requestId 生成器的只读副本，按 orderId 升序。
+     *
+     * <p>调用方必须持有委托模块的批次锁（{@code OrderBatchLock}），否则只能得到
+     * {@link java.util.concurrent.ConcurrentHashMap} 的弱一致遍历结果。快照服务在
+     * orderLock 内调用本方法。
+     */
+    OrderStateSnapshot snapshotState();
+
+    /**
+     * 快照恢复用：清空当前委托并恢复结算 requestId 生成器。
+     *
+     * <p>只能在启动恢复阶段、consumer 尚未启动时调用；实现不做并发保护。
+     *
+     * @throws IllegalArgumentException 快照包含重复委托或非法字段
+     */
+    void restoreState(OrderStateSnapshot state);
 }

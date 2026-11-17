@@ -25,6 +25,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
@@ -53,12 +54,11 @@ import org.springframework.context.annotation.Configuration;
  * {@code order-command} / {@code account-order-freeze} 等一致。
  *
  * <p>账户的三条输入链路（account-command / account-order-freeze / account-settlement）
- * 都走 poll 线程直连 listener：批次业务在 {@code AccountOperationService} 的全局锁内
- * 串行执行，资金流水、冻结回执与 offset-seq 映射回到 poll 线程，在同一个 Kafka 事务里发送。
- *
- * <p>委托的三条输入链路（order-command / order-freeze-result / order-cancel）同理：
- * 批次业务在 {@code OrderOperationService} 的全局锁内串行并分配 orderSeq，批内保留各
- * 链路原有的线程池并发；输出与 order offset-seq 映射在 poll 线程的同一事务内发送。
+ * 在模块锁内完成业务并分配 seq，输出消息收集成 {@link SendPackage} 后交给
+ * {@code account-committer}，由唯一 committer 线程按 FIFO 顺序统一发送并提交 offset。
+ * 委托的三条输入链路（order-command / order-freeze-result / order-cancel）同理，使用
+ * {@code order-committer}；批内保留各链路线程池并发。队列满时 runner 阻塞在入队，
+ * 形成背压。
  */
 @Configuration
 @ConditionalOnProperty(name = "app.kafka.enabled", havingValue = "true", matchIfMissing = true)
@@ -67,11 +67,9 @@ public class KafkaConsumerConfiguration {
     private final Set<String> disabledStages;
     private final int fundsFlowMaxPollRecords;
     private final int fundsFlowFetchMaxWaitMs;
-
-    /** 测试用默认值：funds-flow 拉大 poll 批次。 */
-    public KafkaConsumerConfiguration(String disabledConsumers) {
-        this(disabledConsumers, 100, 200);
-    }
+    private final FatalState fatalState;
+    private final ModuleCommitPipeline orderCommitPipeline;
+    private final ModuleCommitPipeline accountCommitPipeline;
 
     @Autowired
     public KafkaConsumerConfiguration(
@@ -79,20 +77,25 @@ public class KafkaConsumerConfiguration {
             @Value("${app.kafka.consumer.funds-flow.max-poll-records:100}")
             int fundsFlowMaxPollRecords,
             @Value("${app.kafka.consumer.funds-flow.fetch-max-wait-ms:200}")
-            int fundsFlowFetchMaxWaitMs) {
+            int fundsFlowFetchMaxWaitMs,
+            FatalState fatalState,
+            @Qualifier("orderCommitPipeline") ModuleCommitPipeline orderCommitPipeline,
+            @Qualifier("accountCommitPipeline") ModuleCommitPipeline accountCommitPipeline) {
         this.disabledStages = Arrays.stream(disabledConsumers.split(","))
                 .map(String::trim)
                 .filter(stage -> !stage.isEmpty())
                 .collect(Collectors.toUnmodifiableSet());
         this.fundsFlowMaxPollRecords = Math.max(1, fundsFlowMaxPollRecords);
         this.fundsFlowFetchMaxWaitMs = Math.max(0, fundsFlowFetchMaxWaitMs);
+        this.fatalState = fatalState;
+        this.orderCommitPipeline = orderCommitPipeline;
+        this.accountCommitPipeline = accountCommitPipeline;
     }
 
     @Bean
     public KafkaConsumerRunners kafkaConsumerRunners(
             KafkaClientProperties properties,
             KafkaClientFactory clientFactory,
-            KafkaSink sink,
             AccountCommandListener accountCommandListener,
             AccountFreezeCommandListener accountFreezeCommandListener,
             AccountSettlementListener accountSettlementListener,
@@ -105,59 +108,60 @@ public class KafkaConsumerConfiguration {
             UserTradeConsumer userTradeConsumer) {
         List<KafkaConsumerRunner<?>> all = new ArrayList<>();
 
-        all.addAll(createRunners(properties, clientFactory, sink,
+        all.addAll(createRunners(properties, clientFactory,
                 "account-command", "account-commands", "account",
                 FundsCommand.class, false, accountCommandListener::onCommand));
 
         // ORDER_FREEZE 独立链路：每个 symbol 一条批量消息，key=symbol，按分区消费；
         // 同一 symbol 仍由单 consumer 串行。这里固定走直连 listener，不接入 account
         // ingress ring；批次业务统一由 AccountOperationService 的全局锁串行执行。
-        all.addAll(createRunners(properties, clientFactory, sink,
+        all.addAll(createRunners(properties, clientFactory,
                 "account-order-freeze", "account-order-freeze-commands", "account-order-freeze",
                 OrderFreezeCommandsBatch.class, true,
                 accountFreezeCommandListener::onFreezeCommandBatch));
 
-        all.addAll(createRunners(properties, clientFactory, sink,
+        all.addAll(createRunners(properties, clientFactory,
                 "account-settlement", "account-settlements", "account-settlement",
                 TradeSettlementBatch.class, true, accountSettlementListener::onSettlement));
 
         // 下单入口已改为批量消息：每条 record 是一个 OrderCommandBatch（≤2000 条命令），
         // 使用 batch-max-poll-records，避免一个事务处理过多元素。批次业务由
         // OrderOperationService 全局锁串行，批内仍逐条提交共享的 orderOperationExecutor。
-        all.addAll(createRunners(properties, clientFactory, sink,
+        all.addAll(createRunners(properties, clientFactory,
                 "order-command", "order-commands", "order",
                 OrderCommandBatch.class, true, orderCommandListener::onCommand));
 
         // 冻结回执批次业务同样由 OrderOperationService 全局锁串行；批内先并发更新委托，
         // 再在引擎对象锁内聚合撮合、并发清算。
-        all.addAll(createRunners(properties, clientFactory, sink,
+        all.addAll(createRunners(properties, clientFactory,
                 "order-freeze-result", "order-freeze-results", "order-freeze-result",
                 OrderFreezeResultBatch.class, true, orderFreezeResultListener::onFreezeResult));
 
         // 撤单链路与下单链路一致：批量消息按 symbol 分区，同一 symbol 的撤单由单 consumer
         // 按序处理；批内撤单交给线程池并发查询 / 更新委托，批次业务同样在全局锁内串行。
-        all.addAll(createRunners(properties, clientFactory, sink,
+        all.addAll(createRunners(properties, clientFactory,
                 "order-cancel", "order-cancels", "order-cancel",
                 OrderCancelBatch.class, true, orderCancelListener::onCancel));
 
         // 撮合对 topic 有两个独立消费组：行情模块聚合 K 线，admin 归档用户成交记录。
-        all.addAll(createRunners(properties, clientFactory, sink,
+        all.addAll(createRunners(properties, clientFactory,
                 "marketdata", "match-pair", "marketdata",
-                MatchPairBatch.class, true, marketDataListener::onMatchPair));
+                MatchPairBatch.class, true,
+                (records, output) -> marketDataListener.onMatchPair(records)));
 
-        all.addAll(createRunners(properties, clientFactory, sink,
+        all.addAll(createRunners(properties, clientFactory,
                 "user-trade", "match-pair", "user-trade",
-                MatchPairBatch.class, true, userTradeConsumer::onMatchPair));
+                MatchPairBatch.class, true, (records, output) -> userTradeConsumer.onMatchPair(records)));
 
-        all.addAll(createRunners(properties, clientFactory, sink,
+        all.addAll(createRunners(properties, clientFactory,
                 "funds-flow", "funds-flow", "admin",
-                FundsFlowBatch.class, true, fundsFlowConsumer::onFundsFlow));
+                FundsFlowBatch.class, true, (records, output) -> fundsFlowConsumer.onFundsFlow(records)));
 
         // 委托历史按 symbol 分区：8 个 consumer 并行归档 QuestDB，同一 symbol 由单 consumer
         // 串行处理。历史事件由委托模块在撤单 / 成交清算的同一 Kafka 事务内产出。
-        all.addAll(createRunners(properties, clientFactory, sink,
+        all.addAll(createRunners(properties, clientFactory,
                 "order-history", "order-history", "order-history",
-                OrderHistoryBatch.class, true, orderHistoryConsumer::onOrderHistory));
+                OrderHistoryBatch.class, true, (records, output) -> orderHistoryConsumer.onOrderHistory(records)));
 
         return new KafkaConsumerRunners(all);
     }
@@ -165,7 +169,6 @@ public class KafkaConsumerConfiguration {
     private <T> List<KafkaConsumerRunner<T>> createRunners(
             KafkaClientProperties properties,
             KafkaClientFactory clientFactory,
-            KafkaSink sink,
             String stage,
             String topicKey,
             String groupKey,
@@ -193,9 +196,25 @@ public class KafkaConsumerConfiguration {
             runners.add(new KafkaConsumerRunner<>(name,
                     properties.topics().get(topicKey),
                     properties.groups().get(groupKey),
-                    type, processor, sink, properties, clientFactory,
-                    maxPollRecords, fetchMaxWaitMs));
+                    type, processor, properties, clientFactory, fatalState,
+                    commitPipelineFor(stage), maxPollRecords, fetchMaxWaitMs));
         }
         return runners;
+    }
+
+    /**
+     * 有状态 stage 使用的模块提交管线；审计 / 投影 stage 不修改委托或账户状态，返回 null。
+     *
+     * <p>同一模块的下单、冻结回执、撤单 / 充值、冻结、结算共用一条 FIFO 队列和一个
+     * committer，保证跨链路提交顺序与 seq 顺序一致。
+     */
+    private ModuleCommitPipeline commitPipelineFor(String stage) {
+        return switch (stage) {
+            case "order-command", "order-freeze-result", "order-cancel" ->
+                    orderCommitPipeline;
+            case "account-command", "account-order-freeze", "account-settlement" ->
+                    accountCommitPipeline;
+            default -> null;
+        };
     }
 }

@@ -3,6 +3,7 @@ package com.me.matching.service;
 import com.me.matching.dto.MatchResult;
 import com.me.matching.entity.BookOrder;
 import com.me.matching.vo.DepthSnapshot;
+import com.me.matching.vo.OrderBookSnapshot;
 import com.me.shared.order.OrderPlacedEvent;
 import com.me.shared.order.OrderSide;
 import com.me.shared.order.OrderType;
@@ -50,4 +51,12 @@ public interface OrderBook {
 
     /** 按 orderId 查找挂单，找不到返回 {@code null}（测试 / 运维查看用）。 */
     BookOrder find(long orderId);
+
+    /**
+     * 备份快照用的完整只读副本。
+     *
+     * <p>必须与撮合 / 撤单写入互斥；实现应持有与 {@link #place} / {@link #cancel}
+     * 相同的同步设施，保证复制期间订单簿不会变化。
+     */
+    OrderBookSnapshot snapshot();
 }

@@ -8,10 +8,16 @@ import com.me.account.dto.OrderFreezeCommandsBatch;
 import com.me.account.dto.TradeSettleResult;
 import com.me.account.dto.TradeSettlementBatch;
 import com.me.account.dto.TradeSettlementCommand;
+import com.me.account.mq.AccountOffsetSeqPublisher;
+import com.me.account.mq.FundsFlowPublisher;
+import com.me.account.mq.OrderFreezeResultPublisher;
+import com.me.account.service.AccountBatchLock;
+import com.me.account.service.AccountEntryLock;
 import com.me.account.service.AccountOperationService;
 import com.me.account.service.AccountService;
 import com.me.account.sharding.AccountSharding;
-import com.me.kafka.KafkaSink;
+import com.me.kafka.BatchOutput;
+import com.me.kafka.FatalState;
 import com.me.shared.event.FundsFlowEvent;
 import com.me.shared.event.FundsLogType;
 import com.me.shared.event.OrderFreezeResultEvent;
@@ -38,16 +44,25 @@ import org.springframework.stereotype.Service;
  * 账户操作执行器实现。
  *
  * <p><b>批次串行 + 批内按 slot 并发</b>：三条账户输入链路由不同 consumer 线程驱动，
- * 所有批次先竞争 {@code accountLock}，拿到锁后自增 {@link #accountSeq} 并把该序号
- * 写入本批每条输入的 offset-seq 映射。锁内再按 {@code slot(userId)} 把批内命令
- * 分成最多 {@link AccountSharding#SLOTS} 组提交共享线程池；同一 slot 的命令在组内
- * 按输入顺序串行，不同 slot 可以并行。因此不同批次之间严格串行，批内仍保留
- * 账户分片级的并发。
+ * 所有批次先竞争 {@code accountLock}。锁内按 {@code slot(userId)} 把批内命令分成最多
+ * {@link AccountSharding#SLOTS} 组提交共享线程池并发处理；同一 slot 的命令在组内按输入
+ * 顺序串行，不同 slot 可以并行。处理完成后，按 ConsumerRecord 输入顺序为每条输入记录
+ * 自增 {@link #accountSeq} 并写入 offset-seq 映射；最后一条 offset 的序号即该批水位。
+ * 因此不同批次之间严格串行，批内仍保留账户分片级的并发。
  *
- * <p><b>为什么整批加锁</b>：offset-seq 的价值在于「accountSeq 的顺序就是账户写入的
- * 实际顺序」。如果只锁单条命令，不同 consumer 的批次会交错执行，seq 无法用于快照恢复
- * 后的确定性重放。代价是账户写入的跨链路并发退化为「批内 slot 并发」，吞吐上限由
- * 单批大小和 slot 数决定。
+ * <p><b>入口锁</b>：{@code me.account.commands} 入口批次在进入 {@code accountLock} 之前
+ * 先获取 {@link AccountEntryLock}；冻结 / 结算内部链路不获取入口锁，因此快照等待内部
+ * topic 排空时仍可继续。
+ *
+ * <p><b>为什么整批加锁</b>：offset-seq 的价值在于「accountSeq 的顺序就是输入记录被账户
+ * 模块处理的顺序」；每条 Kafka 原生 offset 都有独立序号后，快照恢复可以精确定位每条输入。
+ * 如果只锁单条命令，不同 consumer 的批次会交错执行，seq 无法用于快照恢复后的确定性重放。
+ * 代价是账户写入的跨链路并发退化为「批内 slot 并发」，吞吐上限由单批大小和 slot 数决定。
+ *
+ * <p><b>输出发布也在 accountLock 内</b>：资金流水、冻结回执和 offset-seq 映射在
+ * {@link #accountLock} 内把记录写入当前批次的 {@link BatchOutput}。
+ * 这样「状态修改 → 分配 accountSeq → 发布输出」在同一个临界区内完成，listener 不再
+ * 在 service 返回后再发布。Kafka 事务仍由 runner 统一提交。
  *
  * <p><b>拒绝缓存</b>：整批回滚后内存余额不回滚，重投时其他批次可能已经改变余额。
  * 这里按记录身份缓存拒绝结果（LRU），重投时复现同一拒绝；成功结果不缓存，重投会
@@ -64,35 +79,76 @@ public class AccountOperationServiceImpl implements AccountOperationService {
 
     private final AccountService accountService;
     private final ExecutorService slotExecutor;
+    private final FundsFlowPublisher flowPublisher;
+    private final OrderFreezeResultPublisher freezeResultPublisher;
+    private final AccountOffsetSeqPublisher offsetSeqPublisher;
+    private final FatalState fatalState;
 
-    /** 账户操作的全局序号；每个批次在 {@link #accountLock} 内自增一次。 */
+    /** 账户操作的全局序号；每条 Kafka 输入记录在 {@link #accountLock} 内自增一次。 */
     private final AtomicLong accountSeq = new AtomicLong();
 
     /**
      * 批次级全局锁：充值 / 扣账、冻结、结算三条链路的批次在这里串行，
-     * 保证 accountSeq 顺序与实际账户写入顺序一致。
+     * 保证 accountSeq 顺序与输入记录被账户模块处理的顺序一致。
+     *
+     * <p>runner 在 beginTransaction 前先获取同一把锁，并在 commit/abort 之后释放；
+     * 本类内部再次获取可重入锁。因此本类释放后，runner 仍保持锁到 Kafka 事务结束，
+     * 下一批不会在失败批次的脏状态上继续执行。
      */
-    private final ReentrantLock accountLock = new ReentrantLock();
+    private final ReentrantLock accountLock;
+
+    /**
+     * 外部入口锁：{@code me.account.commands} 消费批次必须先取得，再进入
+     * {@link #accountLock}。冻结 / 结算等内部链路不获取入口锁，快照持有入口锁等待
+     * 排空时不会堵死内部级联。
+     */
+    private final ReentrantLock commandEntryLock;
 
     private final Map<RecordKey, AccountApplyResult> rejectedCommands = rejectedCache();
     private final Map<SettlementRecordKey, String> rejectedSettlements = rejectedCache();
 
     public AccountOperationServiceImpl(
             AccountService accountService,
-            @Qualifier("accountOperationExecutor") ExecutorService slotExecutor) {
+            @Qualifier("accountOperationExecutor") ExecutorService slotExecutor,
+            AccountBatchLock accountBatchLock,
+            AccountEntryLock accountEntryLock,
+            FundsFlowPublisher flowPublisher,
+            OrderFreezeResultPublisher freezeResultPublisher,
+            AccountOffsetSeqPublisher offsetSeqPublisher,
+            FatalState fatalState) {
         this.accountService = accountService;
         this.slotExecutor = slotExecutor;
+        this.accountLock = accountBatchLock.reentrantLock();
+        this.commandEntryLock = accountEntryLock.reentrantLock();
+        this.flowPublisher = flowPublisher;
+        this.freezeResultPublisher = freezeResultPublisher;
+        this.offsetSeqPublisher = offsetSeqPublisher;
+        this.fatalState = fatalState;
     }
 
     @Override
     public AccountOperationResult executeCommands(
-            List<ConsumerRecord<String, FundsCommand>> records) {
+            List<ConsumerRecord<String, FundsCommand>> records, BatchOutput output) {
         if (records == null || records.isEmpty()) {
-            return AccountOperationResult.empty(accountSeq.get());
+            return AccountOperationResult.empty();
         }
+        // 入口锁必须早于 accountLock：快照按「入口锁 → 模块锁」获取。
+        commandEntryLock.lock();
+        try {
+            return executeCommandsLocked(records, output);
+        } finally {
+            commandEntryLock.unlock();
+        }
+    }
+
+    private AccountOperationResult executeCommandsLocked(
+            List<ConsumerRecord<String, FundsCommand>> records, BatchOutput output) {
         accountLock.lock();
         try {
-            long seq = accountSeq.incrementAndGet();
+            if (fatalState.isFatal()) {
+                throw new IllegalStateException("[" + getClass().getSimpleName()
+                        + "] engine is fatal; refusing batch");
+            }
             FundsFlowEvent[] outcomes = new FundsFlowEvent[records.size()];
             executeBySlot(records.size(),
                     position -> slotOfCommand(records.get(position).value()),
@@ -104,7 +160,16 @@ public class AccountOperationServiceImpl implements AccountOperationService {
                     flows.add(flow);
                 }
             }
-            return new AccountOperationResult(seq, offsets(seq, records), flows, Map.of());
+            List<AccountOffsetSeq> offsets = offsets(records);
+            AccountOperationResult result = new AccountOperationResult(offsets, flows, Map.of());
+            publish(output, result);
+            // 锁内直接路由到模块提交队列：BatchOutput.enqueue -> ModuleCommitPipeline.enqueue -> queue.put。
+            output.enqueue();
+            return result;
+        } catch (RuntimeException e) {
+            // 在释放锁之前进入全局 fatal，下一批拿到锁会看到 fatal 并退出。
+            markFatal(output, e);
+            throw e;
         } finally {
             accountLock.unlock();
         }
@@ -112,14 +177,17 @@ public class AccountOperationServiceImpl implements AccountOperationService {
 
     @Override
     public AccountOperationResult executeFreezeCommands(
-            List<ConsumerRecord<String, OrderFreezeCommandsBatch>> records) {
+            List<ConsumerRecord<String, OrderFreezeCommandsBatch>> records, BatchOutput output) {
         if (records == null || records.isEmpty()) {
-            return AccountOperationResult.empty(accountSeq.get());
+            return AccountOperationResult.empty();
         }
         List<FreezeItem> items = flattenFreezeCommands(records);
         accountLock.lock();
         try {
-            long seq = accountSeq.incrementAndGet();
+            if (fatalState.isFatal()) {
+                throw new IllegalStateException("[" + getClass().getSimpleName()
+                        + "] engine is fatal; refusing batch");
+            }
             FreezeOutcome[] outcomes = new FreezeOutcome[items.size()];
             executeBySlot(items.size(),
                     position -> slotOfCommand(items.get(position).command()),
@@ -137,7 +205,17 @@ public class AccountOperationServiceImpl implements AccountOperationService {
                             .add(outcome.freezeResult());
                 }
             }
-            return new AccountOperationResult(seq, offsets(seq, records), flows, freezeResults);
+            List<AccountOffsetSeq> offsets = offsets(records);
+            AccountOperationResult result =
+                    new AccountOperationResult(offsets, flows, freezeResults);
+            publish(output, result);
+            // 锁内直接路由到模块提交队列：BatchOutput.enqueue -> ModuleCommitPipeline.enqueue -> queue.put。
+            output.enqueue();
+            return result;
+        } catch (RuntimeException e) {
+            // 在释放锁之前进入全局 fatal，下一批拿到锁会看到 fatal 并退出。
+            markFatal(output, e);
+            throw e;
         } finally {
             accountLock.unlock();
         }
@@ -145,14 +223,17 @@ public class AccountOperationServiceImpl implements AccountOperationService {
 
     @Override
     public AccountOperationResult executeSettlements(
-            List<ConsumerRecord<String, TradeSettlementBatch>> records) {
+            List<ConsumerRecord<String, TradeSettlementBatch>> records, BatchOutput output) {
         if (records == null || records.isEmpty()) {
-            return AccountOperationResult.empty(accountSeq.get());
+            return AccountOperationResult.empty();
         }
         List<SettleItem> items = flattenSettlements(records);
         accountLock.lock();
         try {
-            long seq = accountSeq.incrementAndGet();
+            if (fatalState.isFatal()) {
+                throw new IllegalStateException("[" + getClass().getSimpleName()
+                        + "] engine is fatal; refusing batch");
+            }
             @SuppressWarnings("unchecked")
             List<FundsFlowEvent>[] outcomes = new List[items.size()];
             executeBySlot(items.size(),
@@ -167,15 +248,58 @@ public class AccountOperationServiceImpl implements AccountOperationService {
                 }
                 flows.addAll(outcomes[index]);
             }
-            return new AccountOperationResult(seq, offsets(seq, records), flows, Map.of());
+            List<AccountOffsetSeq> offsets = offsets(records);
+            AccountOperationResult result = new AccountOperationResult(offsets, flows, Map.of());
+            publish(output, result);
+            // 锁内直接路由到模块提交队列：BatchOutput.enqueue -> ModuleCommitPipeline.enqueue -> queue.put。
+            output.enqueue();
+            return result;
+        } catch (RuntimeException e) {
+            // 在释放锁之前进入全局 fatal，下一批拿到锁会看到 fatal 并退出。
+            markFatal(output, e);
+            throw e;
         } finally {
             accountLock.unlock();
         }
     }
 
+    private void markFatal(BatchOutput output, RuntimeException error) {
+        fatalState.markFatal(
+                output == null ? getClass().getSimpleName() : output.source(), error);
+    }
+
+    /**
+     * 在 accountLock 内发布本批输出：资金流水、冻结回执、offset-seq 映射。
+     *
+     * <p>publisher 直接把记录写入调用方传入的 {@link BatchOutput}，最终由 runner
+     * 封装成 SendPackage、模块 committer 在同一个 Kafka 事务里提交。
+     */
+    private void publish(BatchOutput output, AccountOperationResult result) {
+        if (!result.flows().isEmpty()) {
+            flowPublisher.publishBatch(output, result.flows());
+        }
+        if (!result.freezeResults().isEmpty()) {
+            freezeResultPublisher.publishBatch(output, result.freezeResults());
+        }
+        offsetSeqPublisher.publish(output, result);
+    }
+
     @Override
     public long currentSeq() {
         return accountSeq.get();
+    }
+
+    @Override
+    public void restoreSeq(long seq) {
+        if (seq < 0) {
+            throw new IllegalArgumentException("accountSeq must not be negative: " + seq);
+        }
+        long current = accountSeq.get();
+        if (seq < current) {
+            throw new IllegalStateException("accountSeq cannot move backwards: current="
+                    + current + ", requested=" + seq);
+        }
+        accountSeq.set(seq);
     }
 
     /**
@@ -301,7 +425,7 @@ public class AccountOperationServiceImpl implements AccountOperationService {
             return symbol;
         }
         String key = item.record().key();
-        return key == null || key.isBlank() ? KafkaSink.BATCH_KEY : key;
+        return key == null || key.isBlank() ? BatchOutput.BATCH_KEY : key;
     }
 
     // ------------------------------------------------------------------
@@ -353,13 +477,19 @@ public class AccountOperationServiceImpl implements AccountOperationService {
     // 公共辅助
     // ------------------------------------------------------------------
 
-    /** 本批每条输入消费记录与批次序号的映射；按输入顺序排列。 */
-    private static List<AccountOffsetSeq> offsets(
-            long seq, List<? extends ConsumerRecord<?, ?>> records) {
+    /**
+     * 本批每条 Kafka 输入记录与自己的全局 seq 的映射；按 ConsumerRecord 输入顺序，
+     * 每条记录自增一次。
+     *
+     * <p>之前是“一个批次一个 seq，批内所有记录共用”；改为每条记录独立 seq 后，
+     * 任意 Kafka 原生 offset 都能反查到唯一的 accountSeq。
+     */
+    private List<AccountOffsetSeq> offsets(List<? extends ConsumerRecord<?, ?>> records) {
         List<AccountOffsetSeq> offsets = new ArrayList<>(records.size());
         for (ConsumerRecord<?, ?> record : records) {
             offsets.add(new AccountOffsetSeq(
-                    record.topic(), record.partition(), record.offset(), seq));
+                    record.topic(), record.partition(), record.offset(),
+                    accountSeq.incrementAndGet()));
         }
         return offsets;
     }

@@ -3,26 +3,17 @@ package com.me.kafka;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
-import org.apache.kafka.clients.consumer.CommitFailedException;
 import org.apache.kafka.clients.consumer.ConsumerGroupMetadata;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.producer.KafkaProducer;
-import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.TopicPartition;
-import org.apache.kafka.common.errors.ApplicationRecoverableException;
 import org.apache.kafka.common.errors.InterruptException;
-import org.apache.kafka.common.errors.InvalidConfigurationException;
-import org.apache.kafka.common.errors.RecordDeserializationException;
-import org.apache.kafka.common.errors.SerializationException;
-import org.apache.kafka.common.errors.TransactionAbortableException;
 import org.apache.kafka.common.errors.WakeupException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -30,14 +21,23 @@ import org.slf4j.LoggerFactory;
 /**
  * 一条消费链路的裸 kafka-clients 运行循环。
  *
- * <p>语义与原来的 Spring Kafka 批量监听器一致：一个 poll 批次一个事务，输出消息与消费 offset
- * 通过 {@link KafkaProducer#sendOffsetsToTransaction} 原子提交；任何可重试失败都 abort、把
- * 消费位置 reset 回本批第一条、退避后整批重投。
+ * <p>一个 poll 批次一个事务，输出消息与消费 offset 通过
+ * {@link KafkaProducer#sendOffsetsToTransaction} 原子提交。任何失败都只 abort 当前事务
+ * 并原样抛出，不做整批重试，也不在本进程重建 client：失败批次可能已经修改内存状态，
+ * 重试会在脏状态上重复执行；后续由外部监控重启整个进程来丢弃内存状态。
+ * 监控接入前，失败只记录 error 日志，进程不会自动重启。
  *
- * <p>事务提交方式参考 Kafka 官方
- * {@code TransactionalClientDemo}：{@code initTransactions} 一次 → {@code beginTransaction}
- * → {@code send}（异步）→ {@code sendOffsetsToTransaction(offsets, consumer.groupMetadata())}
- * → {@code commitTransaction}。
+ * <p><b>有状态 stage</b>：在模块锁内完成业务、分配 seq，输出写入 runner 显式创建的
+ * {@link BatchOutput}，再连同输入 offset 封装成 {@link SendPackage} 放入模块 FIFO 队列；
+ * 队列满时阻塞入队，不拒绝。
+ * 释放模块锁后等待 committer 的提交结果，再 poll 下一批。committer 单线程按入队顺序
+ * 提交，保证提交顺序 == seq 顺序；同时下一批业务可以和上一批的 Kafka 提交重叠执行。
+ *
+ * <p><b>审计 / 投影 stage</b>：仍由本 runner 直接开启事务，发送消息并提交 offset
+ * （{@code beginTransaction → send → sendOffsetsToTransaction → commitTransaction}）。
+ *
+ * <p>任何失败都只 abort 当前事务并进入全局 fatal，不做整批重试、不在本进程重建 client：
+ * 失败批次可能已经修改内存状态，重试会在脏状态上重复执行；后续由外部监控重启整个进程。
  */
 public final class KafkaConsumerRunner<T> implements Runnable {
 
@@ -48,9 +48,15 @@ public final class KafkaConsumerRunner<T> implements Runnable {
     private final String group;
     private final Class<T> type;
     private final KafkaBatchProcessor<T> processor;
-    private final KafkaSink sink;
     private final KafkaClientProperties properties;
     private final KafkaClientFactory clientFactory;
+    private final FatalState fatalState;
+    /**
+     * 有状态 stage 的模块提交管线；审计 stage 为 null。
+     *
+     * <p>管线持有 FIFO 提交队列；service 在模块锁内完成业务并入队，runner 不等待提交结果。
+     */
+    private final ModuleCommitPipeline commitPipeline;
     private final int maxPollRecords;
     private final int fetchMaxWaitMs;
     private final AtomicBoolean running = new AtomicBoolean(true);
@@ -63,11 +69,13 @@ public final class KafkaConsumerRunner<T> implements Runnable {
                                String group,
                                Class<T> type,
                                KafkaBatchProcessor<T> processor,
-                               KafkaSink sink,
                                KafkaClientProperties properties,
-                               KafkaClientFactory clientFactory) {
-        this(name, topic, group, type, processor, sink, properties, clientFactory,
-                properties.consumer().maxPollRecords(), properties.consumer().fetchMaxWaitMs());
+                               KafkaClientFactory clientFactory,
+                               FatalState fatalState,
+                               ModuleCommitPipeline commitPipeline) {
+        this(name, topic, group, type, processor, properties, clientFactory, fatalState,
+                commitPipeline, properties.consumer().maxPollRecords(),
+                properties.consumer().fetchMaxWaitMs());
     }
 
     public KafkaConsumerRunner(String name,
@@ -75,12 +83,13 @@ public final class KafkaConsumerRunner<T> implements Runnable {
                                String group,
                                Class<T> type,
                                KafkaBatchProcessor<T> processor,
-                               KafkaSink sink,
                                KafkaClientProperties properties,
                                KafkaClientFactory clientFactory,
+                               FatalState fatalState,
+                               ModuleCommitPipeline commitPipeline,
                                int maxPollRecords) {
-        this(name, topic, group, type, processor, sink, properties, clientFactory,
-                maxPollRecords, properties.consumer().fetchMaxWaitMs());
+        this(name, topic, group, type, processor, properties, clientFactory, fatalState,
+                commitPipeline, maxPollRecords, properties.consumer().fetchMaxWaitMs());
     }
 
     public KafkaConsumerRunner(String name,
@@ -88,9 +97,10 @@ public final class KafkaConsumerRunner<T> implements Runnable {
                                String group,
                                Class<T> type,
                                KafkaBatchProcessor<T> processor,
-                               KafkaSink sink,
                                KafkaClientProperties properties,
                                KafkaClientFactory clientFactory,
+                               FatalState fatalState,
+                               ModuleCommitPipeline commitPipeline,
                                int maxPollRecords,
                                int fetchMaxWaitMs) {
         this.name = name;
@@ -98,9 +108,10 @@ public final class KafkaConsumerRunner<T> implements Runnable {
         this.group = group;
         this.type = type;
         this.processor = processor;
-        this.sink = sink;
         this.properties = properties;
         this.clientFactory = clientFactory;
+        this.fatalState = fatalState;
+        this.commitPipeline = commitPipeline;
         this.maxPollRecords = maxPollRecords;
         this.fetchMaxWaitMs = fetchMaxWaitMs;
     }
@@ -111,13 +122,14 @@ public final class KafkaConsumerRunner<T> implements Runnable {
                         String group,
                         Class<T> type,
                         KafkaBatchProcessor<T> processor,
-                        KafkaSink sink,
                         KafkaClientProperties properties,
                         KafkaClientFactory clientFactory,
+                        FatalState fatalState,
+                        ModuleCommitPipeline commitPipeline,
                         KafkaConsumer<String, T> consumer,
                         KafkaProducer<String, Object> producer) {
-        this(name, topic, group, type, processor, sink, properties, clientFactory,
-                properties.consumer().maxPollRecords());
+        this(name, topic, group, type, processor, properties, clientFactory, fatalState,
+                commitPipeline, properties.consumer().maxPollRecords());
         this.consumer = consumer;
         this.producer = producer;
     }
@@ -129,39 +141,24 @@ public final class KafkaConsumerRunner<T> implements Runnable {
                 if (!initialize()) {
                     return;
                 }
-                try {
-                    consume();
-                } catch (WakeupException e) {
-                    if (running.get()) {
-                        log.warn("[{}] unexpected consumer wakeup", name, e);
-                    }
-                } catch (InterruptException e) {
-                    Thread.currentThread().interrupt();
-                    return;
-                } catch (InvalidConfigurationException e) {
-                    log.error("[{}] fatal Kafka configuration error, runner stops", name, e);
-                    return;
-                } catch (RecordDeserializationException e) {
-                    log.error("[{}] record deserialization failed at {}-{}@{}; runner stops",
-                            name, e.topicPartition().topic(), e.topicPartition().partition(),
-                            e.offset(), e.getCause());
-                    return;
-                } catch (SerializationException e) {
-                    log.error("[{}] Kafka serialization failed; runner stops", name, e);
-                    return;
-                } catch (ApplicationRecoverableException e) {
-                    log.error("[{}] producer must be recreated, recreating clients", name, e);
-                } catch (KafkaException e) {
-                    log.error("[{}] recoverable Kafka error, recreating clients", name, e);
-                } catch (RuntimeException e) {
-                    log.error("[{}] unexpected runner failure, recreating clients", name, e);
-                } finally {
-                    closeClients();
-                }
-                if (running.get()) {
-                    sleepQuietly(properties.retryBackoffMs());
-                }
+                consume();
             }
+        } catch (WakeupException e) {
+            if (running.get()) {
+                fatalState.markFatal(name, e);
+                throw e;
+            }
+        } catch (InterruptException e) {
+            Thread.currentThread().interrupt();
+        } catch (RuntimeException e) {
+            /*
+             * 不在本进程重试或重建 client：失败批次可能已经修改了内存状态，
+             * 重试会在脏状态上重复执行。这里进入全局 fatal：停止全部 consumer，
+             * HTTP 入口返回 503，进程等待外部监控重启，用重启丢弃内存状态。
+             * 监控接入前，fatal 只体现在日志和 503 上，进程不会自动退出。
+             */
+            fatalState.markFatal(name, e);
+            throw e;
         } finally {
             closeClients();
         }
@@ -195,42 +192,39 @@ public final class KafkaConsumerRunner<T> implements Runnable {
     }
 
     private boolean initialize() {
-        while (running.get() && !Thread.currentThread().isInterrupted()) {
-            try {
-                KafkaConsumer<String, T> newConsumer = clientFactory.createConsumer(
-                        name, group, type, maxPollRecords, fetchMaxWaitMs);
-                consumer = newConsumer;
+        try {
+            KafkaConsumer<String, T> newConsumer = clientFactory.createConsumer(
+                    name, group, type, maxPollRecords, fetchMaxWaitMs);
+            consumer = newConsumer;
+            if (commitPipeline == null) {
+                // 有状态 stage 的输出由模块 committer 的事务型 producer 统一提交。
                 producer = clientFactory.createProducer("runner-" + name, 0);
-                newConsumer.subscribe(List.of(topic), new KafkaRebalanceListener(newConsumer));
-                return true;
-            } catch (InvalidConfigurationException e) {
-                log.error("[{}] fatal Kafka configuration error during init", name, e);
-                closeClients();
-                return false;
-            } catch (InterruptException e) {
-                Thread.currentThread().interrupt();
-                closeClients();
-                return false;
-            } catch (RuntimeException e) {
-                log.warn("[{}] kafka client init failed, retrying in {}ms: {}",
-                        name, properties.retryBackoffMs(), e.toString());
-                closeClients();
-                sleepQuietly(properties.retryBackoffMs());
             }
+            newConsumer.subscribe(List.of(topic), new KafkaRebalanceListener(newConsumer));
+            return true;
+        } catch (WakeupException e) {
+            if (running.get()) {
+                fatalState.markFatal(name, e);
+                throw e;
+            }
+            return false;
+        } catch (InterruptException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        } catch (RuntimeException e) {
+            // 同 processBatch：不在本进程重试，进入全局 fatal，等待外部监控重启进程。
+            fatalState.markFatal(name, e);
+            throw e;
         }
-        return false;
     }
 
     private void consume() {
-        PolledBatch<T> current = null;
         while (running.get() && !Thread.currentThread().isInterrupted()) {
+            PolledBatch<T> current = pollBatch(properties.pollTimeoutMs());
             if (current == null) {
-                current = pollBatch(properties.pollTimeoutMs());
-                if (current == null) {
-                    continue;
-                }
+                continue;
             }
-            current = processBatch(current.records());
+            processBatch(current.records());
         }
     }
 
@@ -243,88 +237,90 @@ public final class KafkaConsumerRunner<T> implements Runnable {
     }
 
     /**
-     * 在等 handler 处理当前批之前预取下一批，默认非阻塞（0ms），只推动 fetch 管线。
+     * 处理一个 poll 批次；只执行一次，不做整批重试。
      *
-     * <p>poll 抛非 Kafka 异常时消费者位置不可信，包装成 {@link KafkaException} 走到
-     * {@link #run()} 的 client 重建路径，绝不在原地重试整批。
+     * <p>有状态 stage 走 {@link #processStatefulBatch}：service impl 在自己的
+     * accountLock / orderLock 内处理、发布并 {@code output.enqueue()} 入队，runner
+     * 入队后立即 poll 下一批；审计 / 投影 stage 走 {@link #processInTransaction}，
+     * 沿用单 runner 事务。
      */
-    private PolledBatch<T> pollPrefetch() {
-        ConsumerRecords<String, T> records;
-        try {
-            records = consumer.poll(
-                    Duration.ofMillis(properties.consumer().prefetchPollTimeoutMs()));
-        } catch (KafkaException e) {
-            throw e;
-        } catch (RuntimeException e) {
-            throw new KafkaException(
-                    "prefetch poll failed; consumer position is unknown", e);
+    void processBatch(ConsumerRecords<String, T> records) {
+        if (fatalState.isFatal()) {
+            throw new IllegalStateException("[" + name + "] engine is fatal; refusing new batch");
         }
-        return records.isEmpty() ? null : new PolledBatch<>(records);
+        if (commitPipeline != null) {
+            processStatefulBatch(records);
+            return;
+        }
+        processInTransaction(records);
     }
 
     /**
-     * 处理一个 poll 批次；可重试错误在方法内部 abort + reset + 退避重试，直到成功或停止。
-     * 致命/需要重建 client 的错误向上抛给 {@link #run()}。
+     * 有状态 stage：service impl 在自己的 accountLock / orderLock 内完成业务、分配 seq、
+     * 发布输出并调用 {@code output.enqueue()}；runner 不持有模块锁，也不等待提交结果，
+     * 入队后立即回去 poll 下一批。
      *
-     * @return 处理期间预取到的下一批（可能为 null）；成功提交当前批后由 consume 直接使用
+     * <p>队列顺序由 service 的批次锁保证；在途窗口只由队列长度控制；队列满时 service
+     * 在锁内阻塞在 {@code queue.put}，形成背压。commit 失败进入 fatal，由外部重启处理。
      */
-    PolledBatch<T> processBatch(ConsumerRecords<String, T> records) {
-        while (running.get() && !Thread.currentThread().isInterrupted()) {
-            boolean transactionOpen = false;
-            boolean abortFailed = false;
-            PolledBatch<T> prefetched = null;
-            try {
-                // 在预取 poll 之前捕获本批的 group metadata：若预取期间发生 rebalance，
-                // 用旧 generation 提交会失败并整批重投，而不是以新 generation 提交旧分区 offset。
-                ConsumerGroupMetadata batchGroupMetadata = consumer.groupMetadata();
-                producer.beginTransaction();
-                transactionOpen = true;
-                sink.bind(producer);
-                try {
-                    if (processor instanceof PrefetchingBatchProcessor<?>) {
-                        @SuppressWarnings("unchecked")
-                        PrefetchingBatchProcessor<T> prefetching =
-                                (PrefetchingBatchProcessor<T>) processor;
-                        prefetching.submit(toList(records));
-                        if (running.get() && !Thread.currentThread().isInterrupted()) {
-                            prefetched = pollPrefetch();
-                        }
-                        prefetching.await();
-                    } else {
-                        processor.process(toList(records));
-                    }
-                } finally {
-                    sink.unbind();
-                }
-                producer.sendOffsetsToTransaction(offsets(records), batchGroupMetadata);
-                producer.commitTransaction();
-                transactionOpen = false;
-                return prefetched;
-            } catch (InvalidConfigurationException | SerializationException e) {
-                throw e;
-            } catch (ApplicationRecoverableException e) {
-                throw e;
-            } catch (TransactionAbortableException | CommitFailedException e) {
-                log.warn("[{}] retryable transaction failure, retrying batch", name, e);
-            } catch (KafkaException e) {
-                throw e;
-            } catch (RuntimeException e) {
-                log.warn("[{}] batch processing failed, retrying whole batch: {}",
-                        name, e.toString());
-            } finally {
-                if (transactionOpen) {
-                    abortFailed = !abortQuietly();
-                }
-            }
-            if (abortFailed) {
-                throw new IllegalStateException(
-                        "[" + name + "] abortTransaction failed; producer will be recreated");
-            }
-            resetToBatchStart(records);
-            resetDiscardedPrefetch(prefetched, records);
-            sleepQuietly(properties.retryBackoffMs());
+    private void processStatefulBatch(ConsumerRecords<String, T> records) {
+        if (!running.get() || Thread.currentThread().isInterrupted()) {
+            return;
         }
-        return null;
+        if (fatalState.isFatal()) {
+            throw new IllegalStateException(
+                    "[" + name + "] engine is fatal; refusing batch");
+        }
+        ConsumerGroupMetadata batchGroupMetadata = consumer.groupMetadata();
+
+        // 输出缓冲由 runner 显式创建，沿 listener → service → publisher 传递；
+        // service 在锁内发布完输出后调用 output.enqueue()，直接路由到 queue.put。
+        BatchOutput output = BatchOutput.capture(
+                name, offsets(records), batchGroupMetadata, commitPipeline);
+        try {
+            processor.process(toList(records), output);
+        } catch (RuntimeException e) {
+            if (!running.get()) {
+                // 正常停机期间 committer 已停止；offset 未提交，重启后重新消费。
+                return;
+            }
+            // service 已在持锁状态下标记 fatal；这里兜底（幂等）。
+            fatalState.markFatal(name, e);
+            throw e;
+        }
+    }
+
+    /**
+     * 审计 / 投影 stage：单 runner 直接开启本地事务，处理完提交输入 offset。
+     * 输出缓冲使用直连模式，记录会立即写入当前事务 producer。
+     */
+    private void processInTransaction(ConsumerRecords<String, T> records) {
+        boolean transactionOpen = false;
+        try {
+            ConsumerGroupMetadata batchGroupMetadata = consumer.groupMetadata();
+            producer.beginTransaction();
+            transactionOpen = true;
+
+            BatchOutput output = BatchOutput.direct(producer);
+            processor.process(toList(records), output);
+
+            producer.sendOffsetsToTransaction(offsets(records), batchGroupMetadata);
+
+            if (fatalState.isFatal()) {
+                throw new IllegalStateException(
+                        "[" + name + "] engine is fatal; aborting batch before commit");
+            }
+            producer.commitTransaction();
+            transactionOpen = false;
+        } catch (RuntimeException e) {
+            // 失败批次可能已改内存：先进入全局 fatal（停止全部 consumer），再 abort/抛出。
+            fatalState.markFatal(name, e);
+            throw e;
+        } finally {
+            if (transactionOpen) {
+                abortQuietly();
+            }
+        }
     }
 
     private List<ConsumerRecord<String, T>> toList(ConsumerRecords<String, T> records) {
@@ -347,109 +343,12 @@ public final class KafkaConsumerRunner<T> implements Runnable {
         return offsets;
     }
 
-    /**
-     * 优先精确 seek 回本批次每个 partition 的第一条 offset；被 rebalance 撤销的分区跳过，
-     * seek 失败时退回已提交 offset / beginning。
-     */
-    private void resetToBatchStart(ConsumerRecords<String, T> records) {
-        Set<TopicPartition> assignment;
-        try {
-            assignment = consumer.assignment();
-        } catch (RuntimeException e) {
-            log.warn("[{}] cannot read consumer assignment while resetting", name, e);
-            return;
-        }
-        for (TopicPartition partition : records.partitions()) {
-            if (!assignment.contains(partition)) {
-                log.warn("[{}] partition no longer assigned, skip reset: {}-{}",
-                        name, partition.topic(), partition.partition());
-                continue;
-            }
-            List<ConsumerRecord<String, T>> partitionRecords = records.records(partition);
-            if (partitionRecords.isEmpty()) {
-                continue;
-            }
-            long firstOffset = partitionRecords.get(0).offset();
-            try {
-                consumer.seek(partition, firstOffset);
-            } catch (RuntimeException e) {
-                log.warn("[{}] seek to batch start failed, falling back to committed offset: "
-                        + "{}-{}@{}", name, partition.topic(), partition.partition(), firstOffset, e);
-                seekCommittedOrBeginning(partition);
-            }
-        }
-    }
-
-    private void seekCommittedOrBeginning(TopicPartition partition) {
-        try {
-            OffsetAndMetadata committed =
-                    consumer.committed(Set.of(partition)).get(partition);
-            if (committed != null) {
-                consumer.seek(partition, committed.offset());
-            } else {
-                consumer.seekToBeginning(List.of(partition));
-            }
-        } catch (RuntimeException e) {
-            log.warn("[{}] reset to committed offset failed: {}-{}",
-                    name, partition.topic(), partition.partition(), e);
-        }
-    }
-
-    /**
-     * 当前批失败重投时，预取批的 fetch position 已经前移但从未处理；
-     * 预取批中不属于当前批的 partition 必须 seek 回已提交位置，否则会丢记录。
-     * 与当前批重叠的 partition 由 {@link #resetToBatchStart(ConsumerRecords)} 回到更早的起点。
-     *
-     * <p>回退失败说明 consumer 位置不可信：直接抛出，走 {@link #run()} 的 client 重建路径。
-     * 新 consumer 会从已提交 offset 重新开始，预取但未处理的记录自然重放。
-     */
-    private void resetDiscardedPrefetch(PolledBatch<T> prefetched,
-                                        ConsumerRecords<String, T> current) {
-        if (prefetched == null) {
-            return;
-        }
-        Set<TopicPartition> currentPartitions = current.partitions();
-        Set<TopicPartition> assignment;
-        try {
-            assignment = consumer.assignment();
-        } catch (RuntimeException e) {
-            throw new KafkaException(
-                    "cannot read consumer assignment while resetting prefetched batch", e);
-        }
-        Set<TopicPartition> toReset = new LinkedHashSet<>();
-        for (TopicPartition partition : prefetched.records().partitions()) {
-            if (currentPartitions.contains(partition)) {
-                continue;
-            }
-            if (!assignment.contains(partition)) {
-                log.warn("[{}] prefetched partition no longer assigned, skip reset: {}-{}",
-                        name, partition.topic(), partition.partition());
-                continue;
-            }
-            toReset.add(partition);
-        }
-        if (toReset.isEmpty()) {
-            return;
-        }
-        Map<TopicPartition, OffsetAndMetadata> committed = consumer.committed(toReset);
-        for (TopicPartition partition : toReset) {
-            OffsetAndMetadata offset = committed.get(partition);
-            if (offset != null) {
-                consumer.seek(partition, offset.offset());
-            } else {
-                consumer.seekToBeginning(List.of(partition));
-            }
-        }
-    }
-
-    /** @return true 表示 abort 成功，producer 仍可复用 */
-    private boolean abortQuietly() {
+    /** 尽力 abort 当前事务；失败只记录日志，原始异常继续向上抛。 */
+    private void abortQuietly() {
         try {
             producer.abortTransaction();
-            return true;
         } catch (RuntimeException e) {
-            log.error("[{}] abortTransaction failed; producer will be recreated", name, e);
-            return false;
+            log.error("[{}] abortTransaction failed; process restart required", name, e);
         }
     }
 
@@ -471,14 +370,6 @@ public final class KafkaConsumerRunner<T> implements Runnable {
             } catch (RuntimeException e) {
                 log.warn("[{}] consumer close failed", name, e);
             }
-        }
-    }
-
-    private static void sleepQuietly(long millis) {
-        try {
-            Thread.sleep(millis);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
         }
     }
 

@@ -29,8 +29,9 @@ public class KafkaConsumerManager implements SmartLifecycle {
     private final AtomicBoolean running = new AtomicBoolean();
     private ExecutorService executor;
 
-    public KafkaConsumerManager(KafkaConsumerRunners runners) {
+    public KafkaConsumerManager(KafkaConsumerRunners runners, FatalState fatalState) {
         this.runners = runners.runners();
+        fatalState.setShutdownAction(this::stopAllRunners);
     }
 
     @Override
@@ -54,14 +55,24 @@ public class KafkaConsumerManager implements SmartLifecycle {
         }
     }
 
+    /**
+     * 只给全部 runner 发停止信号，不等待线程结束。
+     *
+     * <p>fatal 时可能由某个 runner 线程调用本方法，不能在当前线程等待自己退出；
+     * 各 runner 会在 {@code run()} 的 finally 中关闭自己的 client。
+     */
+    private void stopAllRunners() {
+        for (KafkaConsumerRunner<?> runner : runners) {
+            runner.stop();
+        }
+    }
+
     @Override
     public void stop() {
         if (!running.compareAndSet(true, false)) {
             return;
         }
-        for (KafkaConsumerRunner<?> runner : runners) {
-            runner.stop();
-        }
+        stopAllRunners();
         if (executor != null) {
             executor.shutdown();
             try {
