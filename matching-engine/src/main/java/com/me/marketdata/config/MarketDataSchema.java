@@ -8,7 +8,8 @@ package com.me.marketdata.config;
  *   <li>{@code md_trade}：每笔成交一行，指定时间戳 {@code executed_at}，
  *       按 {@code (executed_at, symbol, taker_order_id, maker_order_id)} 去重，
  *       消费重投不会产生重复成交。</li>
- *   <li>{@code md_kline}：每笔成交写一条完整 K 线快照，按
+ *   <li>{@code md_kline}：消费端在内存聚合，后台线程每个刷新间隔（默认 1s）把有变化的
+ *       bucket 的完整快照批量写入，同一 bucket 只保留最新一份。按
  *       {@code (bucket_start, symbol, bar_interval)} 去重（后写覆盖），等价于按 bucket upsert。
  *       {@code source_partition/source_offset} 是消费端幂等水位。</li>
  *   <li>{@code md_kline_anchor}：每个 {@code (symbol, bar_interval)} 一行锚点，记录已经计算到

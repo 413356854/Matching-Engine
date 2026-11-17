@@ -41,7 +41,7 @@ export function BalancesPanel({
           <WalletIcon />
           <div>
             <h2>资产</h2>
-            <span className="panel-sub">用户 {userId} · 5s 刷新</span>
+            <span className="panel-sub">用户 {userId} · 手动刷新</span>
           </div>
         </div>
         <button

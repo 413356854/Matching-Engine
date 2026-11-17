@@ -3,12 +3,13 @@ import { useEffect, useRef } from 'react';
 export type PollCallback = (signal: AbortSignal) => Promise<void> | void;
 
 /**
- * 立即执行一次，然后按固定间隔轮询；组件卸载或依赖变化时中止进行中的请求并清掉定时器。
+ * 立即执行一次；传入间隔时按固定间隔轮询，传 null 时只在依赖变化时执行一次（手动刷新场景）。
+ * 组件卸载或依赖变化时中止进行中的请求并清掉定时器。
  * 回调里错误的处理交给调用方。
  */
 export function usePolling(
   callback: PollCallback,
-  intervalMs: number,
+  intervalMs: number | null,
   deps: ReadonlyArray<unknown>,
 ): void {
   const callbackRef = useRef(callback);
@@ -37,13 +38,15 @@ export function usePolling(
     };
 
     void tick();
-    const timer = window.setInterval(tick, intervalMs);
+    const timer = intervalMs === null ? null : window.setInterval(tick, intervalMs);
 
     return () => {
       disposed = true;
-      window.clearInterval(timer);
+      if (timer !== null) {
+        window.clearInterval(timer);
+      }
       controller.abort();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, deps);
+  }, [...deps, intervalMs]);
 }

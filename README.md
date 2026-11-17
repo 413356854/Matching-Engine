@@ -19,10 +19,10 @@
 | 语言 / 运行时 | Java（JDK） | **21 (LTS)** | 编译与运行统一 `--release 21`；Spring Boot 4.1.2 要求 JDK **≥ 17**、兼容至 **27** |
 | 应用框架 | Spring Boot | **4.1.2** | 当前 GA 稳定版（2026-10-23 发布），依赖 Spring Framework **7.0.10+**；负责单体启动、DI、配置 |
 | 构建工具 | Maven | **3.6.3+** | Spring Boot 4.1.2 官方最低要求；本机验证 3.9.11 |
-| 接入层 | Spring MVC / Netty | — | REST 下单、交易对/余额/行情查询、管理端充值已实现（`/api/v1`）；Netty TCP/WS 网关（规划） |
+| 接入层 | Spring MVC / Spring WebSocket / Netty | — | REST 下单、交易对/余额/行情查询、管理端充值已实现（`/api/v1`）；盘口 WebSocket 实时推送已实现（`/ws/orderbook`）；Netty TCP 网关（规划） |
 | 消息 / 持久化 | Apache Kafka | broker **4.4.0** / client **4.2.2** | 直接使用 `org.apache.kafka:kafka-clients`（不引入 Spring Kafka）；冻结回执、单用户结算与行情事件，详见「持久化组件（当前实现与规划）」；本地单节点已装，见「本地 Kafka 环境（4.4.0）」 |
 | 查询投影 | QuestDB（当前）/ ClickHouse / PostgreSQL | — | 异步写入，不进撮合热路径 |
-| 前端 | React + Vite + lightweight-charts | — | `web/` 演示前端（已实现）：币币交易（交易对、余额、下单、1m K 线、最新成交）+ 后台管理（流水管理、委托历史、成交记录、K 线管理） |
+| 前端 | React + Vite + lightweight-charts | — | `web/` 演示前端（已实现）：币币交易（交易对、余额、下单、多周期 K 线、最新成交）+ 后台管理（流水管理、委托历史、成交记录、K 线管理） |
 
 > **基线口径：JDK 21 + Spring Boot 4.1.2 + Maven 3.6.3+**。
 > 撮合内核（`com.me.matching.entity` / `service`）仍是零第三方依赖、纯 JDK，不引入 Spring/Kafka；它现在是**委托与撮合模块的进程内子包**，可独立编译、单测与压测。
@@ -46,6 +46,8 @@
 | ⑤ | **结算中心** | `com.me.settlement` | （规划）双边记账、手续费、资金划转、清算幂等、日终对账；当前仅保留包结构，结算逻辑在 account / order 内 | 规划 | account、order |
 | ⑥ | **行情模块** | `com.me.marketdata` | 消费撮合对、K 线聚合、成交 / 深度查询；落 QuestDB | `MarketDataListener`、`MarketDataService`、`MarketDataRepository`、`KlineAggregator` | 撮合对事件（order → marketdata） |
 
+另有 `com.me.websocket`：演示用 WebSocket 盘口推送接入层（**不是业务模块**），只读查询撮合引擎订单簿并向浏览器推送，协议见「WebSocket 盘口实时推送」。
+
 ### 依赖方向（单向，无环）
 
 - `account` → 只依赖 `shared`
@@ -54,6 +56,7 @@
 - `matching` → 只依赖 `shared` 的命令/事件 DTO；**纯 JDK、零 Spring、零 Kafka**，不依赖 account / order / settlement
 - `settlement` → `account`、`order`
 - `marketdata` → 订阅 `order` 进程内撮合后输出的撮合对事件（只认 `shared` 事件类型）
+- `websocket`（演示接入层，非业务模块）→ 只读调用撮合引擎 `MatchingEngine.depth()`，向前端推送盘口；不修改订单簿、不走 Kafka、不落库
 - `admin` → `account.service`（管理端充值）、`currency.service`（币种校验），消费撮合对事件归档用户成交；只调 service 接口，不直接访问对方 mapper / entity
 
 ### 模块边界规则
@@ -431,7 +434,7 @@ curl -G http://localhost:9000/exec `
   - 建表脚本见 `doc/questdb/user_trade.sql`。
 - **K 线列表**：`GET /api/v1/admin/klines?symbol=BTC-USDT&interval=1m&limit=100`
   - `symbol` / `interval` 可选，结果按 `bucket_start` 倒序；`interval` 支持
-    `1m / 5m / 15m / 30m / 1h / 4h / 1d`，`limit` 缺省 100、上限 1000。
+    `1m / 5m / 15m / 30m / 1h / 4h / 12h / 1d / 1M`，`limit` 缺省 100、上限 1000。
 - **一键删除 K 线**：`DELETE /api/v1/admin/klines`
   - 实现为 `TRUNCATE TABLE md_kline` + `TRUNCATE TABLE md_kline_anchor`，并清空内存聚合状态；
     返回删除前的 K 线条数；成交明细 `md_trade` 不受影响。
@@ -830,7 +833,8 @@ curl -X POST http://localhost:8080/api/v1/currency/orders/cancel \
 
 委托模块在进程内撮合完成后，把每笔成交封装为 `MatchPairEvent` 写入
 `me.match-pair-batch`（key=symbol）。行情模块与 admin 各以独立消费组消费同一 topic：
-行情模块生成 K 线并把近期成交（每个 poll 批次最后 20 条）保存到 QuestDB；admin 把每个
+行情模块生成 K 线并把近期成交（每个 poll 批次最后 50 条）保存到 QuestDB，同时维护每个
+交易对的最新 50 笔内存缓存供接口 / WebSocket 查询；admin 把每个
 撮合对拆成 taker / maker 两条用户成交记录归档到 QuestDB `user_trade`。
 行情写库与 K 线聚合在独立消费组中异步进行，不占用撮合/清算线程；撮合对消息与
 `me.account.settlements-batch` 结算批量消息、冻结回执消费 offset 在同一个 Kafka 事务内发送，
@@ -843,13 +847,16 @@ curl -X POST http://localhost:8080/api/v1/currency/orders/cancel \
    `OrderFreezeResultListener` 与结算命令一起发布。
 2. **消费撮合对**：`com.me.marketdata.mq.MarketDataListener` 消费 `me.match-pair-batch`
    （group `marketdata-trade-consumer`），把记录与 `partition/offset` 交给 `MarketDataService`。
-3. **成交明细**：每个 poll 批次只取**最后 20 条**成交写入 QuestDB `md_trade`（近期成交查询口径，
-   不为历史全量保留）。指定时间戳 `executed_at`，DEDUP 键
+3. **成交明细**：每个 poll 批次只取**最后 50 条**成交写入 QuestDB `md_trade`（近期成交查询口径，
+   不为历史全量保留）；落库前先写入每个交易对容量 50 的内存缓存，最新成交接口与
+   WebSocket 推送只读缓存。指定时间戳 `executed_at`，DEDUP 键
    `(executed_at, symbol, taker_order_id, maker_order_id)` 保证消费重投不产生重复行。
-4. **K 线**：按 `(symbol, interval)` 在内存聚合。同一 bucket 首次出现时立即写入，
-   之后每 `app.marketdata.kline-write-every-batches`（默认 5）个消费批次再更新一次；
-   跨 bucket 时强制写上一根的最终快照并补齐空 bucket。这样同一分钟只有“首次 + 每 N 批 + 收尾”
-   几次写入，而不是每批都写。`source_partition/source_offset` 取写入快照时批内最后一条成交的水位。
+4. **K 线**：按 `(symbol, interval)` 在进程内聚合。消费线程只更新当前 K 线和待落库快照，
+   不做 K 线写库 I/O；独立的后台线程每 `app.marketdata.kline-flush-interval-ms`（默认
+   1000ms）把有变化的 bucket 整批写入 QuestDB，同一 bucket 只写最新一份快照。跨 bucket 时
+   补齐没有成交的空 bucket。代价是数据库里的当前 K 线最多滞后一个刷新间隔，进程崩溃时
+   最多丢失一个间隔内已提交 offset 的 K 线增量（成交明细 `md_trade` 不受影响）。
+   `source_partition/source_offset` 取快照时批内最后一条成交的水位。
    `open/high/low/close/volume/amount/trade_count` 按 bucket 累加；DEDUP 键
    `(bucket_start, symbol, bar_interval)` 等价于按 bucket upsert。续线创建新 bucket 时，
    `open` 取上一根 K 线的 `close`（`high/low` 同时覆盖 open 与首笔成交价），只有新线第一根
@@ -862,9 +869,10 @@ curl -X POST http://localhost:8080/api/v1/currency/orders/cancel \
    并补写锚点；只有库里一根 K 线都没有时才以当前成交新建。锚点晚于成交 bucket 的迟到成交
    不参与 K 线计算。重投或进程重启后从锚点 / QuestDB 的最新快照续算，不会用不完整快照覆盖
    已有数据。
-5. **周期配置**：`app.marketdata.kline-intervals`，默认 `1m`；可写
-   `1m,5m,15m,30m,1h,4h,1d`，每个周期每个 bucket 按 `kline-write-every-batches` 节流写入
-   （默认每 5 批更新一次，跨分钟写最终快照）。
+5. **周期配置**：`app.marketdata.kline-intervals`，默认
+   `1m,5m,15m,30m,1h,4h,12h,1d,1M`。label 大小写敏感：`1m` 是 1 分钟，`1M` 是自然月。
+   固定长度周期按 UTC epoch 对齐；`1M` 对齐到 UTC 每月 1 日 00:00，相邻 bucket 长度按
+   日历月为 28~31 天，不能按固定毫秒数计算。
 
 ### 用户成交记录（admin 归档）
 
@@ -890,8 +898,8 @@ admin 模块以消费组 `admin-user-trade` 消费同一个 `me.match-pair-batch
 `GET /api/v1/marketdata/klines?symbol=BTC-USDT&interval=1m&limit=100`
 
 - `symbol` 必填，统一转大写；
-- `interval` 缺省 `1m`，支持 `1m / 5m / 15m / 30m / 1h / 4h / 1d`（只有
-  `app.marketdata.kline-intervals` 配置过的周期才有数据）；
+- `interval` 缺省 `1m`，支持 `1m / 5m / 15m / 30m / 1h / 4h / 12h / 1d / 1M`（只有
+  `app.marketdata.kline-intervals` 配置过的周期才有数据；`1m` 为分钟、`1M` 为自然月）；
 - `limit` 缺省 100、上限 1000；
 - 返回最近 N 条 K 线，按 `bucketStart` 升序，可直接用于画图；同一交易对首次成交之后，
   两次成交之间没有成交的周期会由平线 K 线补齐（首次成交之前的区间不回溯生成）。
@@ -931,8 +939,9 @@ curl "http://localhost:8080/api/v1/marketdata/klines?symbol=BTC-USDT&interval=1m
 `GET /api/v1/marketdata/trades?symbol=BTC-USDT&limit=50`
 
 - `symbol` 必填，统一转大写；
-- `limit` 缺省 50、上限 500；
-- 返回 QuestDB `md_trade` 中最近的成交明细，按 `executedAt` 倒序（最新在前），
+- `limit` 缺省 50、上限 50（超过按 50 截断）；
+- 返回每个交易对内存缓存中的最近成交，按 `executedAt` 倒序（最新在前），
+  不实时查询 QuestDB；缓存容量 50，启动时从 `md_trade` 预热，消费落库前先更新缓存；
   `takerSide` 是吃单方向，历史数据缺失时为 `null`。
 
 ```bash
@@ -996,6 +1005,46 @@ curl "http://localhost:8080/api/v1/marketdata/orderbook?symbol=BTC-USDT&depth=5"
 实现说明：订单簿由委托模块进程内撮合线程写入；REST 查询与写入共用同一个监视器锁，
 保证快照一致性（M0 简化，后续可换无锁快照）。
 
+### WebSocket 盘口实时推送
+
+模块 `com.me.websocket`（演示用接入层，非业务模块），端点 `ws://localhost:8080/ws/orderbook`。
+前端建立一条原生 WebSocket 连接并订阅交易对，服务端默认每 **500ms** 从撮合引擎读取一次
+订单簿快照推送给该连接；切换交易对时客户端重新发送 `subscribe`，服务端用新订阅替换旧订阅
+（一个连接同一时刻只推送一个交易对）。
+
+客户端 → 服务端：
+
+```json
+{"action":"subscribe","symbol":"BTC-USDT","depth":10}
+{"action":"unsubscribe"}
+```
+
+服务端 → 客户端：
+
+```json
+{"type":"subscribed","symbol":"BTC-USDT","depth":10,"timestamp":"2026-11-17T11:20:00Z"}
+{"type":"orderbook","symbol":"BTC-USDT","depth":10,"bids":[{"price":5000000,"quantity":1000000,"orderCount":1}],"asks":[{"price":5010000,"quantity":1000000,"orderCount":1}],"bestBid":5000000,"bestAsk":5010000,"marketBidCount":0,"marketAskCount":0,"trades":[{"tradeId":1,"symbol":"BTC-USDT","price":5000000,"quantity":1000000,"amount":5000000000000,"takerSide":"BUY","executedAt":"2026-11-17T11:19:59Z"}],"klines":[{"symbol":"BTC-USDT","interval":"1m","bucketStart":"2026-11-17T11:19:00Z","openPrice":5000000,"highPrice":5010000,"lowPrice":4990000,"closePrice":5010000,"volume":3000000,"amount":15015000000000,"tradeCount":3}],"timestamp":"2026-11-17T11:20:00.500Z"}
+{"type":"unsubscribed","timestamp":"2026-11-17T11:20:01Z"}
+{"type":"error","symbol":"BTC-USDT","reason":"SYMBOL_INVALID","timestamp":"2026-11-17T11:20:02Z"}
+```
+
+- 订阅成功后立即回执并推送首帧，之后按 `app.websocket.push-interval-ms`（默认 500ms）推送；
+- 每帧 `orderbook` 同时附带该交易对最新 50 笔成交（`trades`，最新在前）和各配置周期当前
+  正在聚合的最新 K 线（`klines`，每周期一根），成交 / K 线都不单独订阅；K 线读进程内
+  聚合器，可能领先已落库数据一个刷新间隔，前端按 `bucketStart` 决定覆盖最后一根还是追加新柱子；
+- 同一推送周期内相同 `(symbol, depth)` 只查询引擎一次、只序列化一次，再广播给所有订阅者；
+  没有订阅时不访问引擎；
+- `depth` 缺省 `app.websocket.default-depth`（20），超过 `app.websocket.max-depth`（100）按上限截断；
+- `symbol` 统一转大写，校验规则与 REST 订单簿接口一致；
+- 会话发送统一包装为 `ConcurrentWebSocketSessionDecorator`，发送超时 / 缓冲超限的慢连接会被断开；
+- 本模块只读，订单簿仍由委托模块进程内写入，推送不经过 Kafka，也不写 QuestDB。
+
+前端 `web/src/hooks/useOrderBookSocket.ts` 负责建连、订阅、切换交易对后重新订阅与
+1s→8s 指数退避重连，并从同一帧里同时更新订单簿、最新成交与最新 K 线（均无需额外订阅）；
+`OrderBookPanel` 的徽标从「3s 轮询」改为「WS 500ms」。K 线面板先用 REST 拉取历史 180 根
+（每 5 秒兜底刷新），之后每帧 WS 推送与最后一根比较：时间戳相同覆盖最后一根，时间戳更大
+追加新柱子；REST 结果与实时快照合并时保留成交笔数更多的一份，避免轮询把实时柱子回退。
+
 ### 本地验证
 
 ```powershell
@@ -1004,7 +1053,7 @@ kafka-console-consumer --bootstrap-server localhost:9092 --topic me.match-pair-b
 
 # QuestDB：最新成交
 curl -G http://localhost:9000/exec `
-  --data-urlencode "query=SELECT * FROM md_trade WHERE symbol = 'BTC-USDT' ORDER BY executed_at DESC, trade_id DESC LIMIT 20"
+  --data-urlencode "query=SELECT * FROM md_trade WHERE symbol = 'BTC-USDT' ORDER BY executed_at DESC, trade_id DESC LIMIT 50"
 # QuestDB：1m K 线
 curl -G http://localhost:9000/exec `
   --data-urlencode "query=SELECT * FROM md_kline WHERE symbol = 'BTC-USDT' AND bar_interval = '1m' ORDER BY bucket_start DESC LIMIT 20"
@@ -1013,7 +1062,7 @@ curl -G http://localhost:9000/exec `
   --data-urlencode "query=SELECT * FROM md_kline_anchor ORDER BY symbol, bar_interval"
 ```
 
-预期：`md_trade` 每个 poll 批次写入最后 20 条成交；`md_kline` 每个 bucket 一行，OHLC / volume / amount /
+预期：`md_trade` 每个 poll 批次写入最后 50 条成交；`md_kline` 每个 bucket 一行，OHLC / volume / amount /
 trade_count 与成交一致，无成交的间隔由平线 K 线补齐；`md_kline_anchor` 每个
 `(symbol, interval)` 一行，指向最新已计算的 bucket；重复消费 / 重启后值不回退。
 
@@ -1216,6 +1265,67 @@ curl -X POST http://localhost:8080/api/v1/admin/recharges \
   Kafka 投递失败返回 503 + `RECHARGE_PUBLISH_FAILED`；
 - **演示接口，没有鉴权**，部署到公网前必须加权限控制。
 
+## 已实现：机器人模拟模块（币安行情驱动下单）
+
+`com.me.bot` 是演示用接入层（不是新的业务模块）：启动时为固定机器人用户补齐演示资金，
+通过币安 WebSocket 订阅 BTC / ETH 最新价，开启自动交易后按固定间隔持续下单，用于给
+订单簿、成交、K 线与资金流水制造持续流量。
+
+- **启动充值**：`ApplicationReadyEvent` 时读取 `app.bot.initial-deposits`（展示单位），
+  按「目标余额 -（可用 + 冻结）」差额向 `me.account.commands` 投递 `DEPOSIT` 命令；
+  已达到目标则不重复充值，重启不会无限放大余额。默认用户 `9001`，
+  默认目标 `1,000,000 USDT / 100 BTC / 1,000 ETH`。
+- **行情**：使用 JDK 自带 `java.net.http.WebSocket` 连接币安组合流
+  `wss://stream.binance.com:9443/stream?streams=btcusdt@miniTicker/ethusdt@miniTicker`，
+  只把最新价保存在内存；断线按 `reconnect-delay-ms` 自动重连。
+- **下单**：开启后每个 `order-interval-ms`（默认 500ms）为每个交易对提交一笔限价单：
+  价格 = 币安最新价（按交易对 `priceScale` 换算），数量 = `order-notional / 最新价`
+  （按 `quantityScale` 向下取整，并再对齐到
+  `10^(priceScale + quantityScale - quoteScale)` 的整数倍，保证任何成交价下
+  `价 × 量` 都能整除成计价币最小单位），买卖方向逐交易对交替。下单复用币币模块的
+  `OrderCommandAssembler` + `OrderCommandPublisher`，与 REST 下单走同一条 Kafka 链路。
+- **网络测试**：`POST /api/v1/bot/enable` 先调用币安 REST 测试接口
+  （`GET https://api.binance.com/api/v3/ping`），不可达返回 `503 BINANCE_UNREACHABLE`，
+  前端提示「开启需要配置科学联网币安」。HTTP 测试与 WebSocket 共用代理：
+  `app.bot.binance.proxy` 非空时使用指定的 HTTP 代理，留空时使用 JVM 系统代理
+  （Windows 读取系统 / IE 代理设置，可用环境变量 `BINANCE_PROXY` 覆盖）。
+- **状态**：自动交易开关只保存在内存，进程重启后默认关闭，需要重新点击开启。
+
+### 接口
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `GET` | `/api/v1/bot/status` | 模块开关、自动交易状态、币安连接 / 行情快照、下单统计、最近错误 |
+| `POST` | `/api/v1/bot/enable` | 先测币安接口，通过后开启自动交易；失败返回 `reason` |
+| `POST` | `/api/v1/bot/disable` | 停止下单并断开币安行情连接 |
+
+### 配置
+
+```yaml
+app:
+  bot:
+    enabled: true            # false = 不充值、不允许开启
+    user-id: 9001            # 机器人默认用户
+    symbols: [BTC-USDT, ETH-USDT]
+    order-interval-ms: 500   # 每个交易对每 500ms 下一单
+    order-notional: 100      # 单笔名义金额（USDT）
+    initial-deposits:        # 启动时补齐到的目标余额（展示单位）
+      USDT: 1000000
+      BTC: 100
+      ETH: 1000
+    binance:
+      stream-url: "wss://stream.binance.com:9443/stream?streams="
+      ping-url: "https://api.binance.com/api/v3/ping"
+      proxy: "${BINANCE_PROXY:}"   # 如 http://127.0.0.1:7890；留空用系统代理
+      connect-timeout-ms: 8000
+      ping-timeout-ms: 5000
+      reconnect-delay-ms: 3000
+      quote-stale-ms: 60000
+```
+
+> 本地常见代理端口为 `7890`（Clash）等；若开启返回 `BINANCE_UNREACHABLE`，先确认
+> 代理 / VPN 可访问 `api.binance.com`，再通过 `BINANCE_PROXY` 或配置文件指定代理。
+
 ## 演示前端 `web/`
 
 `web/` 是一个 React 19 + TypeScript + Vite 的单页应用，顶栏并排「币币交易 / 后台管理」
@@ -1224,9 +1334,10 @@ curl -X POST http://localhost:8080/api/v1/admin/recharges \
 | 区域 | 对接接口 | 刷新 |
 |---|---|---|
 | 交易对列表 / 最新价 | `GET /api/v1/pairs` + 每个交易对 `GET /api/v1/marketdata/klines?limit=1` | 30s / 15s |
-| 1m K 线 | `GET /api/v1/marketdata/klines?symbol=...&interval=1m&limit=180` | 5s |
-| 订单簿 | `GET /api/v1/marketdata/orderbook?symbol=...&depth=10` | 3s |
-| 最新成交 | `GET /api/v1/marketdata/trades?symbol=...&limit=50` | 3s |
+| K 线历史 | `GET /api/v1/marketdata/klines?symbol=...&interval=...&limit=180` | 5s |
+| K 线最新柱 | `WS /ws/orderbook`（随盘口帧下发，`klines` 字段） | 500ms |
+| 订单簿 | `WS /ws/orderbook`（订阅 `symbol`，推送 `depth=10`） | 500ms |
+| 最新成交 | `WS /ws/orderbook`（随盘口帧下发，`trades` 字段） | 500ms |
 | 当前委托 | `GET /api/v1/orders?userId=...&limit=100` | 3s |
 | 历史委托 | `GET /api/v1/orders/history?userId=...&limit=50` | 5s |
 | 资产余额 | `GET /api/v1/accounts/{userId}/balances` | 5s |
@@ -1240,14 +1351,19 @@ curl -X POST http://localhost:8080/api/v1/admin/recharges \
 | 后台委托历史 | `GET /api/v1/admin/order-history` | 手动 |
 | 后台成交记录 | `GET /api/v1/admin/user-trades` | 手动 |
 | 后台 K 线管理 | `GET/DELETE /api/v1/admin/klines` | 手动 |
+| 机器人自动交易 | `GET /api/v1/bot/status` + `POST /api/v1/bot/enable` / `disable` | 3s（状态）/ 手动 |
 
 前端功能：
 
+- **机器人自动交易开关**：顶栏「开启自动交易 / 关闭自动交易」按钮，3 秒轮询状态；
+  开启时先由后端调用币安测试接口，失败提示「开启需要配置科学联网币安」；
+  按钮圆点绿色 = 运行且币安行情已连接，琥珀色 = 等待行情，灰色 = 已停止；
+  鼠标悬停显示机器人用户、下单间隔、币安最新价与下单统计。
 - **币币交易**：点击 BTC/USDT 标题旁的弹框搜索 / 切换交易对；下单表单左侧为
-  「订单簿 / 最新成交」共享栏目，通过顶部左右标签切换（订单簿展示价格档位与
-  累计深度条，中间行展示最新成交价、买卖盘上下各半空间；最新成交展示价格 / 数量 / 时间，
-  均 3 秒轮询）；1m 蜡烛图 + 成交量柱
-  （缩放 / 拖拽、十字光标 OHLC 图例）；图表下方「当前委托 / 历史委托 / 历史成交 / 历史流水」
+  「订单簿 / 最新成交」共享栏目，通过顶部左右标签切换（订单簿通过 WebSocket 每 500ms
+  推送，展示价格档位与累计深度条，中间行展示最新成交价、买卖盘上下各半空间，切换交易对
+  时自动重新订阅；最新成交展示价格 / 数量 / 时间，随盘口同一帧 WebSocket 推送）；K 线蜡烛图 + 成交量柱
+  （周期切换、缩放 / 拖拽、十字光标 OHLC 图例，最新柱随盘口帧 500ms 更新）；图表下方「当前委托 / 历史委托 / 历史成交 / 历史流水」
   面板通过顶部标签切换：当前委托显示方向、价格、数量、已成交、状态与「撤单」操作（3 秒轮询；
   `PAID` / `PARTIALLY_FILLED` 可撤，`ACCEPTED` 等待冻结完成后可撤），历史委托展示当前用户
   已撤单 / 已撮合完成的委托（QuestDB `ord_history`，按终态时间倒序，5 秒轮询），历史成交展示
@@ -1280,8 +1396,9 @@ npm install
 npm run dev
 ```
 
-打开 <http://localhost:5173>。Vite 把 `/api` 代理到 `http://localhost:8080`，可用环境变量
-`VITE_PROXY_TARGET` 覆盖后端地址；生产构建：
+打开 <http://localhost:5173>。Vite 把 `/api` 与 `/ws`（WebSocket）代理到
+`http://localhost:8080`，可用环境变量 `VITE_PROXY_TARGET` 覆盖后端地址；
+盘口推送端点也可用 `VITE_ORDERBOOK_WS_URL` 直接指定完整 `ws://` / `wss://` 地址；生产构建：
 
 ```bash
 npm run build      # 产物在 web/dist

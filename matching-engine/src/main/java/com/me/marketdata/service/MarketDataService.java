@@ -12,12 +12,16 @@ import java.util.List;
  */
 public interface MarketDataService {
 
+    /** 每个交易对保留 / 展示的最新成交条数，也是单个消费批次归档成交的上限。 */
+    int RECENT_TRADES_LIMIT = 50;
+
     /**
-     * 批量处理一个 Kafka poll 批次：只归档本批最后 20 条成交明细，再用批内全部成交聚合 K 线。
+     * 批量处理一个 Kafka poll 批次：先把本批最后 {@value #RECENT_TRADES_LIMIT} 条成交推进
+     * 内存缓存，再归档到 QuestDB，最后用批内全部成交更新进程内的当前 K 线。
      *
-     * <p>同一 {@code (symbol, interval, bucket)} 的 K 线首次出现时立即写入，之后每
-     * {@code app.marketdata.kline-write-every-batches} 个批次更新一次；跨 bucket 时写入
-     * 上一根的最终快照。这样同一分钟只有“首次 + 每 N 批 + 收尾”几次写入。
+     * <p>K 线不在消费线程落库：每个 bucket 的最新快照先放进内存，由后台线程按
+     * {@code app.marketdata.kline-flush-interval-ms}（默认 1000ms）整批刷新到 QuestDB。
+     * 进程崩溃时最多丢失一个刷新间隔内已提交 offset 的 K 线增量。
      *
      * <p>分区 + offset 是 K 线的幂等水位：同一条 Kafka 记录重投时跳过已聚合的周期。
      *
@@ -26,8 +30,8 @@ public interface MarketDataService {
     void ingestBatch(List<MarketDataRecord> records);
 
     /**
-     * 管理端清空 K 线 / 锚点后调用：丢弃内存里的写入节流与 dirty 状态，
-     * 避免重建后的第一个 bucket 被当成“已写过”而跳过。
+     * 管理端清空 K 线 / 锚点后调用：丢弃内存里待刷新的快照与锚点状态，
+     * 避免清空后又被旧的刷新批次写回。
      */
     void clearWriteState();
 
@@ -52,10 +56,24 @@ public interface MarketDataService {
     List<Kline> klines(String symbol, KlineInterval interval, int limit);
 
     /**
-     * 查询最近 N 笔成交，按成交时间倒序返回（最新在前）。
+     * 查询各周期当前正在聚合的最新 K 线（只读进程内内存，不查 QuestDB）。
+     *
+     * <p>返回顺序与配置的 {@code app.marketdata.kline-intervals} 一致；尚未产生成交的周期
+     * 不返回。内存快照最多领先已落库数据一个刷新间隔，适合给 WebSocket 做实时推送：
+     * 前端按时间戳决定覆盖最后一根还是追加新柱子。
      *
      * @param symbol 交易对，如 {@code BTC-USDT}
-     * @param limit  条数，1..500，超出范围按边界夹取
+     */
+    List<Kline> latestKlines(String symbol);
+
+    /**
+     * 查询最近 N 笔成交，按成交时间倒序返回（最新在前）。
+     *
+     * <p>只读每个交易对的内存缓存，不查询 QuestDB；{@code limit} 超过
+     * {@value #RECENT_TRADES_LIMIT} 时按该上限截断。
+     *
+     * @param symbol 交易对，如 {@code BTC-USDT}
+     * @param limit  条数，1..{@value #RECENT_TRADES_LIMIT}
      */
     List<TradeRecord> recentTrades(String symbol, int limit);
 }

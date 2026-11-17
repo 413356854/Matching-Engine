@@ -34,6 +34,12 @@
             <artifactId>spring-boot-starter-webmvc</artifactId>
         </dependency>
 
+        <!-- WebSocket 盘口推送：raw WebSocket（不引入 STOMP / SockJS） -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-websocket</artifactId>
+        </dependency>
+
         <!-- MyBatis-Plus：Spring Boot 4 专用 starter（Boot 3 用 mybatis-plus-spring-boot3-starter） -->
         <dependency>
             <groupId>com.baomidou</groupId>

@@ -1,12 +1,15 @@
 import { useState } from 'react';
 import type { OrderBookDepth, Trade, TradingPair } from '../api';
+import type { OrderBookSocketStatus } from '../hooks/useOrderBookSocket';
 import { LatestTradesPanel } from './LatestTradesPanel';
 import { OrderBookPanel } from './OrderBookPanel';
+import { StreamBadge } from './StreamBadge';
 
 interface BookTradesPanelProps {
   pair?: TradingPair;
   orderBook: OrderBookDepth | null;
   orderBookError: string | null;
+  orderBookStream: OrderBookSocketStatus;
   trades: Trade[];
   tradesError: string | null;
 }
@@ -17,6 +20,7 @@ export function BookTradesPanel({
   pair,
   orderBook,
   orderBookError,
+  orderBookStream,
   trades,
   tradesError,
 }: BookTradesPanelProps) {
@@ -49,10 +53,7 @@ export function BookTradesPanel({
         </div>
 
         <div className="book-trades-meta">
-          <span className="refresh-badge">
-            <span className="live-dot" />
-            3s
-          </span>
+          <StreamBadge status={orderBookStream} />
         </div>
       </div>
 
@@ -62,6 +63,7 @@ export function BookTradesPanel({
           orderBook={orderBook}
           lastTrade={trades[0]}
           error={orderBookError}
+          orderBookStream={orderBookStream}
           embedded
         />
       ) : (

@@ -74,7 +74,7 @@ export function LatestTradesPanel({
         </div>
         <span className="refresh-badge">
           <span className="live-dot" />
-          3s
+          WS 500ms
         </span>
       </div>
       {content}

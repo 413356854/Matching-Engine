@@ -34,6 +34,23 @@ mybatis-plus:
       id-type: auto
 
 app:
+  # WebSocket 盘口推送模块（com.me.websocket）：前端订阅交易对，服务端默认每 500ms
+  # 查询一次撮合引擎内存订单簿并推送；同一帧附带该交易对最新 50 笔成交与各周期当前 K 线
+  # （都是内存缓存），成交 / K 线不需要单独订阅。切换交易对时重新订阅，新订阅替换旧订阅。
+  websocket:
+    # 推送间隔（毫秒）
+    push-interval-ms: 500
+    # 客户端未指定 depth 时，买卖两边各返回的价位数量
+    default-depth: 20
+    # 单边价位上限，客户端请求更大时按该值截断
+    max-depth: 100
+    # 握手 Origin 白名单，逗号分隔；* = 不限制（演示环境默认）。
+    # 生产部署建议收敛为前端域名，例如 https://exchange.example.com
+    allowed-origin-patterns: "*"
+    # 单次发送超时与单连接发送缓冲；客户端读取过慢时断开该连接，避免拖住推送线程
+    send-time-limit-ms: 5000
+    send-buffer-size-bytes: 524288
+
   kafka:
     # 关闭后不启动任何裸 consumer/topic initializer
     enabled: true
@@ -239,11 +256,53 @@ app:
       worker-threads: 8
 
   marketdata:
-    # 需要多个周期时改成 1m,5m,15m,30m,1h,4h,1d
-    kline-intervals: 1m
-    # 同一分钟 K 线首次写入后，每 N 个消费批次再更新一次；跨分钟强制写最终快照。
-    # 1 = 每批都写；默认 5，用于减少 QuestDB 写入和 QWP ack 次数。
-    kline-write-every-batches: 5
+    # 每个交易对保留最新 50 笔成交在内存：落库前先写缓存，最新成交接口与盘口 WebSocket
+    # 都只读缓存；启动时从 md_trade 预热。
+    # K 线周期，label 大小写敏感：1m 是分钟、1M 是自然月（UTC 每月 1 日对齐）。
+    kline-intervals: 1m,5m,15m,30m,1h,4h,12h,1d,1M
+    # K 线不随每批写入：消费线程只更新进程内当前 K 线，后台线程按该间隔把有变化的 bucket
+    # 整批刷新到 QuestDB。调大可进一步降低写入频率，代价是查询延迟变大，且宕机最多丢失
+    # 同样时长的 K 线增量（成交明细 md_trade 不受影响）。
+    kline-flush-interval-ms: 1000
+
+  # 机器人模拟模块（com.me.bot）：启动时为默认用户补齐演示资金，订阅币安 miniTicker
+  # 最新价，开启自动交易后每个 order-interval-ms 为每个交易对提交一笔限价单
+  # （价格=币安最新价，数量=order-notional/最新价，买卖交替）。
+  # 开启前先调用币安 REST 测试接口；不可达时接口返回 BINANCE_UNREACHABLE，前端提示
+  # 需要配置可访问币安的网络。自动交易状态只保存在内存，重启后默认关闭。
+  bot:
+    # false = 不启动充值、不允许开启自动交易
+    enabled: true
+    # 机器人使用的默认用户，启动时按 initial-deposits 补齐余额
+    user-id: 9001
+    # 订阅并下单的交易对；空列表默认 BTC-USDT、ETH-USDT
+    symbols:
+      - BTC-USDT
+      - ETH-USDT
+    # 下单间隔；每个交易对每个间隔下一单，买卖方向交替
+    order-interval-ms: 500
+    # 单笔名义金额（计价币展示单位，这里为 USDT）；数量按币安最新价换算
+    order-notional: 100
+    # 启动时补齐到的目标余额（展示单位）；已有余额（可用+冻结）达到目标时不重复充值。
+    # 买入需要计价币（USDT），卖出需要基础币（BTC / ETH）。
+    initial-deposits:
+      USDT: 1000000
+      BTC: 100
+      ETH: 1000
+    binance:
+      # 组合流前缀；实际订阅 <prefix>btcusdt@miniTicker/ethusdt@miniTicker
+      stream-url: "wss://stream.binance.com:9443/stream?streams="
+      # 开启自动交易前调用的测试接口
+      ping-url: "https://api.binance.com/api/v3/ping"
+      # 可选 HTTP 代理，例如 http://127.0.0.1:7890；留空使用 JVM 系统代理
+      # （Windows 读取系统 / IE 代理设置）。也可用环境变量 BINANCE_PROXY 覆盖。
+      proxy: "${BINANCE_PROXY:}"
+      connect-timeout-ms: 8000
+      ping-timeout-ms: 5000
+      # WebSocket 断开后的重连间隔
+      reconnect-delay-ms: 3000
+      # 行情超过该时长未更新时跳过下单，避免用过期价格挂单
+      quote-stale-ms: 60000
 
   questdb:
     # JDBC（PostgreSQL wire）只用于查询/DDL，以及 write-mode=jdbc 时的写入回退

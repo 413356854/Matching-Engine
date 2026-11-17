@@ -49,7 +49,8 @@ public class AdminKlineController {
             @RequestParam(name = "interval", required = false) String interval,
             @RequestParam(name = "limit", defaultValue = "100") int limit) {
         String normalizedSymbol = normalizeUpper(symbol);
-        String normalizedInterval = normalizeLower(interval);
+        // 周期 label 区分大小写（1m = 1 分钟，1M = 1 个月），只做 trim。
+        String normalizedInterval = normalizeOptional(interval);
 
         if (normalizedSymbol != null
                 && (normalizedSymbol.length() > MAX_SYMBOL_LENGTH
@@ -107,11 +108,11 @@ public class AdminKlineController {
         return normalized.isEmpty() ? null : normalized;
     }
 
-    private static String normalizeLower(String value) {
+    private static String normalizeOptional(String value) {
         if (value == null) {
             return null;
         }
-        String normalized = value.strip().toLowerCase(Locale.ROOT);
+        String normalized = value.strip();
         return normalized.isEmpty() ? null : normalized;
     }
 

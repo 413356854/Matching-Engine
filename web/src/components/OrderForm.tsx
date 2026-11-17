@@ -74,28 +74,18 @@ export function OrderForm({
   const [submitting, setSubmitting] = useState(false);
   const [result, setResult] = useState<OrderResult | null>(null);
   const requestIdRef = useRef<string | null>(null);
-  const priceTouchedRef = useRef(false);
 
   const symbol = pair?.symbol;
 
   useEffect(() => {
-    priceTouchedRef.current = false;
     requestIdRef.current = null;
     setQuantityInput('');
     setResult(null);
-    setPriceInput(
-      pair && lastPrice !== undefined ? formatInputValue(lastPrice, pair.priceScale) : '',
-    );
-    // 只在新交易对时重置表单；lastPrice 变化由下面的 effect 处理。
+    // 价格不跟随行情预填：限价单默认留空，由用户手动输入。
+    setPriceInput('');
+    // 只在新交易对时重置表单。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [symbol]);
-
-  useEffect(() => {
-    if (!pair || priceTouchedRef.current || lastPrice === undefined) {
-      return;
-    }
-    setPriceInput(formatInputValue(lastPrice, pair.priceScale));
-  }, [lastPrice, pair]);
 
   const baseBalance = pair
     ? (balances.find((balance) => balance.currency === pair.baseCurrency)?.available ?? 0)
@@ -177,13 +167,12 @@ export function OrderForm({
   }, [pair, quantityRaw, side, type, priceRaw, baseScale, quoteScale, marketAmount]);
 
   // 前端余额校验：限价买 / 市价买按冻结金额比可用计价币，卖单按数量比可用基础币。
-  // 余额快照每 5 秒轮询，可能短暂滞后；提交时若判定不足会主动刷新一次再让用户确认。
+  // 余额快照不自动轮询，成交/充值后可能短暂滞后；提交时若判定不足会主动刷新一次再让用户确认。
   const availableRawBig = BigInt(Math.trunc(availableRaw));
   const balanceInsufficient = freeze !== null && freeze.raw > availableRawBig;
   const balanceShortfall = balanceInsufficient ? freeze.raw - availableRawBig : null;
 
   const changePrice = (value: string) => {
-    priceTouchedRef.current = true;
     requestIdRef.current = null;
     setPriceInput(sanitizeDecimal(value));
   };

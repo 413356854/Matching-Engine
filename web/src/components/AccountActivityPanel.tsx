@@ -11,6 +11,7 @@ import {
 } from '../api';
 import { describeError } from '../errors';
 import { formatDateTime, formatPrice, formatQuantity, formatUnits } from '../format';
+import { RefreshIcon } from './icons';
 import type { ToastKind } from './ToastStack';
 
 interface AccountActivityPanelProps {
@@ -26,6 +27,8 @@ interface AccountActivityPanelProps {
   currencyScales: Record<string, number>;
   userId: number;
   onOrderCanceled: () => void;
+  /** 手动刷新当前委托、历史委托、历史成交与历史流水。 */
+  onRefreshActivity: () => Promise<void>;
   notify: (kind: ToastKind, text: string) => void;
 }
 
@@ -91,10 +94,12 @@ export function AccountActivityPanel({
   currencyScales,
   userId,
   onOrderCanceled,
+  onRefreshActivity,
   notify,
 }: AccountActivityPanelProps) {
   const [tab, setTab] = useState<ActivityTab>('orders');
   const [cancelingOrderId, setCancelingOrderId] = useState<number | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
 
   const pairMap = useMemo(
     () => new Map(pairs.map((item) => [item.symbol, item])),
@@ -127,6 +132,20 @@ export function AccountActivityPanel({
       notify('error', describeError(error));
     } finally {
       setCancelingOrderId(null);
+    }
+  };
+
+  const handleRefresh = async () => {
+    if (refreshing) {
+      return;
+    }
+    setRefreshing(true);
+    try {
+      await onRefreshActivity();
+    } catch {
+      // 各列表的加载错误会显示在对应面板的空状态里。
+    } finally {
+      setRefreshing(false);
     }
   };
 
@@ -195,10 +214,16 @@ export function AccountActivityPanel({
 
         <div className="open-orders-meta">
           <span className="orders-count">{count}</span>
-          <span className="refresh-badge">
-            <span className="live-dot" />
-            {tab === 'orders' ? '3s' : '5s'}
-          </span>
+          <button
+            type="button"
+            className="activity-refresh"
+            disabled={refreshing}
+            onClick={() => void handleRefresh()}
+            title="手动刷新当前委托、历史委托、历史成交与历史流水"
+          >
+            <RefreshIcon spinning={refreshing} />
+            {refreshing ? '刷新中…' : '刷新'}
+          </button>
         </div>
       </div>
 

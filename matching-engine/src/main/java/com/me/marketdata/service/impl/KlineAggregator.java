@@ -11,8 +11,9 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * 按 {@code (symbol, interval)} 维护当前 K 线的聚合器。
  *
- * <p>聚合器只持有内存状态，不接触 Spring / QuestDB：写入成功后再由调用方
- * {@link #commit(Kline)}，因此写库失败重试时内存不会领先于持久化结果。
+ * <p>聚合器只持有内存状态，不接触 Spring / QuestDB：调用方在一批成交计算成功后
+ * {@link #commit(Kline)}。K 线由后台线程按固定间隔异步落库，因此内存状态最多领先
+ * 持久化结果一个刷新间隔；进程崩溃会丢失这段未刷新的增量（设计取舍）。
  *
  * <p>同一 symbol 的行情由 Kafka 同一分区单线程消费，因此单条 K 线的“读当前值 → 计算 → 提交”
  * 在调用方是串行的；这里仍用 {@link ConcurrentHashMap} 保证跨线程可见性。
@@ -41,7 +42,7 @@ public final class KlineAggregator {
         return current.get(new Key(symbol, interval));
     }
 
-    /** 持久化成功后再提交内存状态。 */
+    /** 一批成交计算成功后提交内存状态；落库由后台刷新线程异步完成。 */
     public void commit(Kline kline) {
         current.put(new Key(kline.symbol(), kline.interval()), kline);
     }
@@ -85,11 +86,11 @@ public final class KlineAggregator {
             return List.of();
         }
         List<Kline> flats = new ArrayList<>();
-        Instant cursor = current.bucketStart().plus(interval.span());
+        Instant cursor = interval.nextBucket(current.bucketStart());
         while (cursor.isBefore(bucketStart)) {
             flats.add(Kline.flat(current.symbol(), interval, cursor, current.closePrice(),
                     partition, offset));
-            cursor = cursor.plus(interval.span());
+            cursor = interval.nextBucket(cursor);
         }
         return flats;
     }

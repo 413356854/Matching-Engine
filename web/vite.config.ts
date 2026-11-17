@@ -15,6 +15,12 @@ export default defineConfig(({ mode }) => {
           target,
           changeOrigin: true,
         },
+        // 盘口推送 WebSocket：/ws/orderbook → 后端同一端口
+        '/ws': {
+          target,
+          changeOrigin: true,
+          ws: true,
+        },
       },
     },
   };

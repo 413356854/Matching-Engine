@@ -54,6 +54,9 @@ const REASON_TEXT: Record<string, string> = {
   KLINES_REJECTED: 'K 线查询失败',
   TRADES_REJECTED: '成交查询失败',
   ORDER_BOOK_REJECTED: '订单簿查询失败',
+  ORDER_BOOK_STREAM_ERROR: '盘口推送异常',
+  MESSAGE_INVALID: '盘口订阅消息格式无效',
+  ACTION_INVALID: '不支持的盘口订阅操作',
   DEPTH_INVALID: '订单簿深度档位无效',
   ORDER_LIST_REJECTED: '当前委托查询失败',
   BALANCES_REJECTED: '余额查询失败',
@@ -66,6 +69,9 @@ const REASON_TEXT: Record<string, string> = {
   CLEAR_FAILED: '清空失败，请确认 QuestDB 已启动后重试',
   FUNDS_FLOWS_REJECTED: '资金流水查询失败',
   ADMIN_KLINES_REJECTED: 'K 线查询失败',
+
+  BOT_DISABLED: '机器人模块未启用（app.bot.enabled=false）',
+  BINANCE_UNREACHABLE: '开启需要配置科学联网币安（币安测试接口不可达）',
 };
 
 export function describeReason(reason: string): string {

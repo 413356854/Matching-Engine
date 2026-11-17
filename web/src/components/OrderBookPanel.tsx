@@ -1,6 +1,8 @@
 import { useEffect, useRef } from 'react';
 import type { DepthLevel, OrderBookDepth, Trade, TradingPair } from '../api';
+import type { OrderBookSocketStatus } from '../hooks/useOrderBookSocket';
 import { formatPrice, formatQuantity } from '../format';
+import { StreamBadge } from './StreamBadge';
 
 interface OrderBookPanelProps {
   pair?: TradingPair;
@@ -8,6 +10,7 @@ interface OrderBookPanelProps {
   /** 最新一笔成交（trades 按时间倒序，传第一条）；盘口中间展示它的成交价。 */
   lastTrade?: Trade;
   error: string | null;
+  orderBookStream: OrderBookSocketStatus;
   /** 嵌在共享栏目里时只渲染内容，不渲染独立面板头和边框。 */
   embedded?: boolean;
 }
@@ -30,6 +33,7 @@ export function OrderBookPanel({
   orderBook,
   lastTrade,
   error,
+  orderBookStream,
   embedded = false,
 }: OrderBookPanelProps) {
   const priceScale = pair?.priceScale ?? 0;
@@ -150,10 +154,7 @@ export function OrderBookPanel({
             {pair ? `${pair.baseCurrency}/${pair.quoteCurrency}` : '实时深度'} · 限价单
           </span>
         </div>
-        <span className="refresh-badge">
-          <span className="live-dot" />
-          3s
-        </span>
+        <StreamBadge status={orderBookStream} />
       </div>
       {content}
     </section>

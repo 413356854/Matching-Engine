@@ -116,8 +116,23 @@ interface OrderBookQueryResponse extends OrderBookDepth {
   reason: string | null;
 }
 
-/** 支持的后台 K 线周期（与后端 KlineInterval 对齐）。 */
-export const KLINE_INTERVALS = ['1m', '5m', '15m', '30m', '1h', '4h', '1d'] as const;
+/**
+ * 支持的后台 K 线周期（与后端 KlineInterval 对齐）。
+ * 大小写敏感：'1m' 是 1 分钟，'1M' 是自然月（UTC 每月 1 日对齐）。
+ */
+export const KLINE_INTERVALS = [
+  '1m',
+  '5m',
+  '15m',
+  '30m',
+  '1h',
+  '4h',
+  '12h',
+  '1d',
+  '1M',
+] as const;
+
+export type KlineInterval = (typeof KLINE_INTERVALS)[number];
 
 export type FundsLogType =
   | 'DEPOSIT'
@@ -523,11 +538,12 @@ export async function fetchBalances(
 export async function fetchKlines(
   symbol: string,
   limit = 180,
+  interval: KlineInterval = '1m',
   signal?: AbortSignal,
 ): Promise<Kline[]> {
   const query = new URLSearchParams({
     symbol,
-    interval: '1m',
+    interval,
     limit: String(limit),
   });
   const body = await request<KlineQueryResponse>(
@@ -574,7 +590,7 @@ export async function fetchTrades(
 }
 
 /**
- * 提交下单命令：只写入 Kafka 并返回 202 命令回执；委托状态由「当前委托」轮询获取。
+ * 提交下单命令：只写入 Kafka 并返回 202 命令回执；委托状态由「当前委托」手动刷新获取。
  */
 export function placeOrder(
   order: PlaceOrderRequest,
@@ -589,7 +605,7 @@ export function placeOrder(
 
 /**
  * 提交撤单命令：只写入独立撤单 Disruptor 并返回 202 命令回执；
- * 委托是否可撤、解冻结果由「当前委托」与「资产余额」轮询观察。
+ * 委托是否可撤、解冻结果由「当前委托」与「资产余额」刷新观察。
  */
 export function cancelOrder(
   cancel: CancelOrderRequest,
@@ -956,4 +972,55 @@ export function createSnapshot(signal?: AbortSignal): Promise<CreateSnapshotResp
     method: 'POST',
     signal,
   });
+}
+
+/** 机器人当前使用的币安最新价（展示单位字符串）。 */
+export interface BotQuote {
+  symbol: string;
+  price: string;
+  /** ISO-8601，UTC。 */
+  updatedAt: string;
+}
+
+/** 机器人模拟模块状态（GET /api/v1/bot/status）。 */
+export interface BotStatus {
+  success: boolean;
+  reason: string | null;
+  message: string | null;
+  /** 模块配置开关（app.bot.enabled）。 */
+  enabled: boolean;
+  /** 自动交易是否正在运行。 */
+  trading: boolean;
+  userId: number;
+  symbols: string[];
+  orderIntervalMs: number;
+  /** 币安 WebSocket 是否已连接。 */
+  binanceConnected: boolean;
+  /** 当前网络方式：手动代理 / 系统代理。 */
+  proxy: string;
+  quotes: BotQuote[];
+  ordersPlaced: number;
+  ordersRejected: number;
+  /** ISO-8601，UTC。 */
+  lastOrderAt: string | null;
+  lastError: string | null;
+  binanceError: string | null;
+}
+
+/** 机器人状态：行情与统计随每次轮询刷新。 */
+export function fetchBotStatus(signal?: AbortSignal): Promise<BotStatus> {
+  return request<BotStatus>('/api/v1/bot/status', { signal });
+}
+
+/**
+ * 开启自动交易：后端先调用币安测试接口，不可达时返回 503 BINANCE_UNREACHABLE，
+ * 需要配置可访问币安的网络（代理）。
+ */
+export function enableBotTrading(signal?: AbortSignal): Promise<BotStatus> {
+  return request<BotStatus>('/api/v1/bot/enable', { method: 'POST', signal });
+}
+
+/** 关闭自动交易：停止下单并断开币安行情连接。 */
+export function disableBotTrading(signal?: AbortSignal): Promise<BotStatus> {
+  return request<BotStatus>('/api/v1/bot/disable', { method: 'POST', signal });
 }

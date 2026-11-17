@@ -12,7 +12,13 @@ import {
   type Time,
   type UTCTimestamp,
 } from 'lightweight-charts';
-import type { Kline, TradingPair } from '../api';
+import {
+  KLINE_INTERVALS,
+  type BotStatus,
+  type Kline,
+  type KlineInterval,
+  type TradingPair,
+} from '../api';
 import {
   formatPercent,
   formatPrice,
@@ -20,39 +26,84 @@ import {
   formatTime,
   percentChange,
 } from '../format';
+import { BotTradingButton } from './BotTradingButton';
 import { ChevronDownIcon } from './icons';
 
 interface ChartPanelProps {
   pair?: TradingPair;
   klines: Kline[];
+  interval: KlineInterval;
+  onIntervalChange: (interval: KlineInterval) => void;
   error: string | null;
   onOpenMarkets: () => void;
+  botStatus: BotStatus | null;
+  botBusy: boolean;
+  onToggleBot: () => void;
 }
 
 function toSeconds(iso: string): number {
   return Math.floor(new Date(iso).getTime() / 1000);
 }
 
-/** lightweight-charts 默认按 UTC 渲染时间轴；这里统一改成浏览器本地时间。 */
-function chartTimeLabel(time: Time, withSeconds = false): string {
+function pad(value: number): string {
+  return String(value).padStart(2, '0');
+}
+
+/**
+ * lightweight-charts 默认按 UTC 渲染时间轴；这里统一改成浏览器本地时间。
+ * 周期越大刻度越粗：分钟级显示时分，日线显示月-日，月线显示年-月。
+ */
+function chartTimeLabel(time: Time, interval: KlineInterval, detailed = false): string {
   if (typeof time !== 'number') {
     return '';
   }
   const date = new Date(time * 1000);
-  const pad = (value: number) => String(value).padStart(2, '0');
-  const base = `${pad(date.getHours())}:${pad(date.getMinutes())}`;
-  return withSeconds ? `${base}:${pad(date.getSeconds())}` : base;
+  const yearMonth = `${date.getFullYear()}-${pad(date.getMonth() + 1)}`;
+  const monthDay = `${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+  const hourMinute = `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  if (interval === '1M') {
+    return yearMonth;
+  }
+  if (interval === '1d') {
+    return detailed ? `${yearMonth}-${pad(date.getDate())}` : monthDay;
+  }
+  if (interval === '12h') {
+    return detailed
+      ? `${yearMonth}-${pad(date.getDate())} ${hourMinute}`
+      : `${monthDay} ${hourMinute}`;
+  }
+  return detailed
+    ? `${yearMonth}-${pad(date.getDate())} ${hourMinute}:${pad(date.getSeconds())}`
+    : hourMinute;
 }
 
-export function ChartPanel({ pair, klines, error, onOpenMarkets }: ChartPanelProps) {
+export function ChartPanel({
+  pair,
+  klines,
+  interval,
+  onIntervalChange,
+  error,
+  onOpenMarkets,
+  botStatus,
+  botBusy,
+  onToggleBot,
+}: ChartPanelProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const candleRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
   const volumeRef = useRef<ISeriesApi<'Histogram'> | null>(null);
-  const previousSymbolRef = useRef('');
+  const previousViewRef = useRef('');
   const hasDataRef = useRef(false);
+  // 已经写入图表的最后一根柱子的 bucket 秒值；用于增量 update，让图表自动跟随最新柱子。
+  const seriesLastRef = useRef<number | null>(null);
   const klineMapRef = useRef(new Map<number, Kline>());
+  // 图表创建时注册的刻度格式化回调只执行一次，通过 ref 读取最新周期。
+  const intervalRef = useRef<KlineInterval>(interval);
   const [hoveredTime, setHoveredTime] = useState<number | null>(null);
+
+  useEffect(() => {
+    intervalRef.current = interval;
+  }, [interval]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -76,7 +127,8 @@ export function ChartPanel({ pair, klines, error, onOpenMarkets }: ChartPanelPro
       },
       rightPriceScale: {
         borderVisible: false,
-        scaleMargins: { top: 0.08, bottom: 0.26 },
+        // 顶部留出 OHLC 浮层的高度，避免最高价的蜡烛被图例盖住。
+        scaleMargins: { top: 0.12, bottom: 0.26 },
       },
       timeScale: {
         borderVisible: false,
@@ -85,7 +137,9 @@ export function ChartPanel({ pair, klines, error, onOpenMarkets }: ChartPanelPro
         rightOffset: 4,
         barSpacing: 8,
         minBarSpacing: 3,
-        tickMarkFormatter: (time: Time) => chartTimeLabel(time),
+        // 追加新柱子时保持可视区域跟随最新数据（配合 series.update）。
+        shiftVisibleRangeOnNewBar: true,
+        tickMarkFormatter: (time: Time) => chartTimeLabel(time, intervalRef.current),
       },
       crosshair: {
         mode: CrosshairMode.Normal,
@@ -104,7 +158,8 @@ export function ChartPanel({ pair, klines, error, onOpenMarkets }: ChartPanelPro
       },
       localization: {
         locale: 'zh-CN',
-        timeFormatter: (time: Time) => chartTimeLabel(time, true),
+        timeFormatter: (time: Time) =>
+          chartTimeLabel(time, intervalRef.current, true),
       },
     });
 
@@ -145,7 +200,8 @@ export function ChartPanel({ pair, klines, error, onOpenMarkets }: ChartPanelPro
       chartRef.current = null;
       candleRef.current = null;
       volumeRef.current = null;
-      previousSymbolRef.current = '';
+      previousViewRef.current = '';
+      seriesLastRef.current = null;
     };
   }, []);
 
@@ -163,6 +219,10 @@ export function ChartPanel({ pair, klines, error, onOpenMarkets }: ChartPanelPro
     const unique = new Map<number, Kline>();
 
     for (const kline of klines) {
+      // 切换周期后旧请求的响应可能还在填充状态，只渲染当前周期的数据。
+      if (kline.interval !== interval) {
+        continue;
+      }
       const time = toSeconds(kline.bucketStart);
       if (Number.isFinite(time)) {
         unique.set(time, kline);
@@ -200,21 +260,51 @@ export function ChartPanel({ pair, klines, error, onOpenMarkets }: ChartPanelPro
         minMove: Number((10 ** -precision).toFixed(precision)),
       },
     });
-    candles.setData(candleData);
-    volume.setData(volumeData);
-
-    const symbolChanged = previousSymbolRef.current !== pair.symbol;
-    if (symbolChanged) {
-      previousSymbolRef.current = pair.symbol;
+    // 交易对或周期变化时重置视图：重新铺满可视区域，并清掉旧的十字光标状态。
+    const viewKey = `${pair.symbol}|${interval}`;
+    const viewChanged = previousViewRef.current !== viewKey;
+    if (viewChanged) {
+      previousViewRef.current = viewKey;
       setHoveredTime(null);
     }
-    if (candleData.length > 0 && (symbolChanged || !hasDataRef.current)) {
+
+    const lastTime = times.length > 0 ? times[times.length - 1] : null;
+    const previousLastTime = seriesLastRef.current;
+    const previousBarTime = times.length > 1 ? times[times.length - 2] : null;
+    const lastIndex = candleData.length - 1;
+
+    if (lastTime === null) {
+      candles.setData(candleData);
+      volume.setData(volumeData);
+    } else if (viewChanged || !hasDataRef.current || previousLastTime === null) {
+      // 首次加载 / 切换交易对或周期：整批写入并铺满可视区域。
+      candles.setData(candleData);
+      volume.setData(volumeData);
+    } else if (lastTime === previousLastTime) {
+      // 同一根柱子继续成交：只刷新最后一根，不重建整段数据。
+      candles.update(candleData[lastIndex]);
+      volume.update(volumeData[lastIndex]);
+    } else if (lastTime > previousLastTime && previousBarTime === previousLastTime) {
+      // 正常跨入新周期：update 追加一根，时间轴按 shiftVisibleRangeOnNewBar 跟随最新柱子。
+      candles.update(candleData[lastIndex]);
+      volume.update(volumeData[lastIndex]);
+    } else {
+      // 断线补齐 / REST 重新加载 / 管理端清空：数据整体变化时整批替换。
+      candles.setData(candleData);
+      volume.setData(volumeData);
+    }
+
+    if (lastTime !== null && (viewChanged || !hasDataRef.current)) {
       chart.timeScale().fitContent();
     }
-    hasDataRef.current = candleData.length > 0;
-  }, [klines, pair]);
+    hasDataRef.current = lastTime !== null;
+    seriesLastRef.current = lastTime;
+  }, [interval, klines, pair]);
 
-  const latest = klines.length > 0 ? klines[klines.length - 1] : undefined;
+  const latest =
+    klines.length > 0 && klines[klines.length - 1].interval === interval
+      ? klines[klines.length - 1]
+      : undefined;
   const hovered =
     hoveredTime !== null ? klineMapRef.current.get(hoveredTime) : undefined;
   const legend = hovered ?? latest;
@@ -246,7 +336,7 @@ export function ChartPanel({ pair, klines, error, onOpenMarkets }: ChartPanelPro
               <b>{displaySymbol}</b>
               <ChevronDownIcon />
             </button>
-            <span className="interval-badge">1m</span>
+            <span className="interval-badge">{interval}</span>
           </div>
           <div className={`last-price ${priceDirection}`}>
             {pair && latest ? formatPrice(latest.closePrice, pair.priceScale) : '--'}
@@ -257,13 +347,34 @@ export function ChartPanel({ pair, klines, error, onOpenMarkets }: ChartPanelPro
           </div>
         </div>
 
-        <div className="chart-meta">
-          <span className="live-dot" title="K 线每 5 秒刷新" />
-          <span>1m K 线</span>
-          <span className="meta-divider">·</span>
-          <span>{klines.length} 根</span>
-          {error && <span className="meta-error">{error}</span>}
+        <div className="chart-head-right">
+          <div className="chart-meta">
+            <span className="live-dot" title="K 线通过 WebSocket 实时推送" />
+            <span>{interval} K 线</span>
+            <span className="meta-divider">·</span>
+            <span>{klines.length} 根</span>
+            {error && <span className="meta-error">{error}</span>}
+          </div>
+          <BotTradingButton
+            status={botStatus}
+            busy={botBusy}
+            onToggle={onToggleBot}
+          />
         </div>
+      </div>
+
+      <div className="chart-intervals" role="group" aria-label="K 线周期">
+        {KLINE_INTERVALS.map((value) => (
+          <button
+            key={value}
+            type="button"
+            className={value === interval ? 'interval-switch active' : 'interval-switch'}
+            aria-pressed={value === interval}
+            onClick={() => onIntervalChange(value)}
+          >
+            {value}
+          </button>
+        ))}
       </div>
 
       <div className="chart-shell">
@@ -308,7 +419,7 @@ export function ChartPanel({ pair, klines, error, onOpenMarkets }: ChartPanelPro
             <p>
               {error
                 ? error
-                : '行情模块会把每笔成交聚合成 1m K 线，撮合产生成交后这里会自动出现蜡烛图。'}
+                : `行情模块会把每笔成交聚合成 ${interval} K 线，撮合产生成交后这里会自动出现蜡烛图。`}
             </p>
           </div>
         )}

@@ -9,6 +9,8 @@ import com.me.marketdata.repository.MarketDataRepository;
 import com.me.marketdata.service.MarketDataRecord;
 import com.me.marketdata.service.MarketDataService;
 import com.me.shared.event.MatchPairEvent;
+import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -18,12 +20,26 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 /**
- * 行情归档实现：按 Kafka poll 批次批量写成交明细，K 线按 {@code (symbol, interval)} 聚合后
- * 每个 bucket 只写最终快照。
+ * 行情归档实现：按 Kafka poll 批次批量写成交明细，K 线在进程内聚合后按固定间隔批量落库。
+ *
+ * <p><b>1 秒刷新</b>：消费线程收到成交时只更新 {@link KlineAggregator} 里的当前 K 线，并把
+ * 最新快照放进 {@link #pendingKlines}；独立的后台线程每
+ * {@code app.marketdata.kline-flush-interval-ms}（默认 1000ms）把有待更新的 bucket 整批写入
+ * QuestDB，同一 bucket 只写最新一份。这样行情消费路径不做 K 线落库 I/O，写入次数也从
+ * “每批一次”降到“每秒每个有成交的 bucket 一次”。
+ *
+ * <p>代价是数据库里的当前 K 线最多滞后一个刷新间隔；进程崩溃时，已提交 Kafka offset 但还没
+ * 刷新的最多 1 秒 K 线增量会丢失。成交明细 {@code md_trade} 仍按批次同步写入，不受影响；
+ * 需要精确口径时应以成交明细重算。
  *
  * <p><b>锚点与补线</b>：每个 {@code (symbol, interval)} 在 {@code md_kline_anchor} 里有一行
  * 锚点，记录已经计算到的最新 bucket。开始计算前先确认当前位置（内存未命中时才读库）：
@@ -34,65 +50,110 @@ import org.springframework.stereotype.Service;
  *   <li>锚点等于事件 bucket：取出已有 K 线更新。</li>
  * </ul>
  * 锚点晚于事件 bucket 的迟到成交不参与 K 线计算。补线只针对开始消费之后的缺口，锚点之前
- * 没有 K 线的历史区间不回溯生成。
+ * 没有 K 线的历史区间不回溯生成。刷新线程只在 K 线写成功后才推进锚点，因此锚点永远不会
+ * 领先于已落库的快照。
  *
  * <p><b>成交明细</b>：每个 poll 批次只归档最后 {@value #TRADE_ARCHIVE_LIMIT} 条成交，
- * 避免 {@code md_trade} 随订单量线性膨胀；K 线仍然使用批内全部成交聚合。
+ * 避免 {@code md_trade} 随订单量线性膨胀；归档前先推进每个交易对的最新成交内存缓存，
+ * 接口与 WebSocket 推送都读缓存。K 线仍然使用批内全部成交聚合。
  *
- * <p><b>K 线写入节流</b>：同一 {@code (symbol, interval, bucket)} 首次出现时立即写入，
- * 之后每 {@code app.marketdata.kline-write-every-batches} 个批次再更新一次；跨 bucket 时
- * 强制写入上一根的最终快照并补齐空 bucket。这样同一分钟的 K 线只有“首次 + 每 N 批 + 收尾”
- * 几次写入，而不是每批都写。
- *
- * <p><b>幂等与重启</b>：整批成交先批量写 {@code md_trade}（QuestDB DEDUP 去重），再在本地状态上
- * 计算各周期 K 线，最后批量写 {@code md_kline} 并推进锚点。K 线快照带
- * {@code (source_partition, source_offset)} 水位，重投时已包含的记录直接跳过。批量写成功后才
- * 提交内存状态，因此写库失败重试不会让内存领先于持久化结果；K 线写成功但锚点写失败时，
- * 重投会按锚点恢复，读到已落库的快照并跳过重复累计，同时补写锚点。
- *
- * <p>节流的代价是：当前分钟未到写入窗口时，最新累计状态只在内存中；进程此时崩溃，
- * 该窗口内已提交 Kafka offset 的成交不会重放，K 线会缺少这一小段。对实时快照口径可接受。
+ * <p><b>幂等与重启</b>：整批成交先批量写 {@code md_trade}（QuestDB DEDUP 去重），再在本地
+ * 状态上计算各周期 K 线。K 线快照带 {@code (source_partition, source_offset)} 水位，重投时
+ * 已包含的记录直接跳过。写库失败时待写快照保留在内存，下一个刷新间隔重试；进程重启后按
+ * 锚点 / 库里最新快照恢复聚合位置，最多丢失崩溃前一个刷新间隔内的 K 线增量。
  */
 @Service
 public class MarketDataServiceImpl implements MarketDataService {
 
-    /** 每个 poll 批次最多归档的成交明细条数；K 线仍聚合本批全部成交。 */
-    static final int TRADE_ARCHIVE_LIMIT = 20;
+    private static final Logger log = LoggerFactory.getLogger(MarketDataServiceImpl.class);
+
+    /** 每个 poll 批次最多归档的成交明细条数，与缓存 / 前端展示上限一致。 */
+    static final int TRADE_ARCHIVE_LIMIT = MarketDataService.RECENT_TRADES_LIMIT;
+
+    private static final String FLUSH_THREAD_NAME = "kline-flush";
 
     private final KlineAggregator aggregator;
     private final MarketDataRepository repository;
-    private final int klineWriteEveryBatches;
+    private final RecentTradeCache tradeCache;
+    private final long flushIntervalMs;
+
     /**
-     * 当前 bucket 自上次写入后经过的批次数；没有 key 表示该 bucket 还没写过。
-     * marketdata 消费并发为 1，单线程访问；如果把该 stage 并发调大，需要改成线程安全容器
-     * 或按分区拆状态。
+     * 待落库的最新 K 线快照，key 为 {@code (symbol, interval, bucketStart)}。
+     *
+     * <p>消费线程只做 put（同一 bucket 后写覆盖先写），刷新线程整批写入。
+     * ConcurrentHashMap 保证跨线程可见性；刷新线程只删除“仍是本次写入那一份”的条目，
+     * 避免刷新期间消费线程写入的新快照被误删。
      */
-    private final Map<KlineBucketKey, Integer> batchesSinceKlineWrite = new ConcurrentHashMap<>();
-    /** 自上次成功写入后又被更新过的 bucket；跨批次保留，用于判断收尾时是否需要强制写最终快照。 */
-    private final Set<KlineBucketKey> dirtyBuckets = ConcurrentHashMap.newKeySet();
+    private final ConcurrentHashMap<KlineBucketKey, Kline> pendingKlines =
+            new ConcurrentHashMap<>();
+
+    /** 已落库 K 线对应的锚点，等刷新线程写入；只在 {@link #flushMonitor} 内访问。 */
+    private final Map<KlineKey, Instant> pendingAnchors = new HashMap<>();
+
+    /** 已经成功写入的锚点 bucket，避免每个刷新间隔重复覆盖同一行。 */
+    private final Map<KlineKey, Instant> writtenAnchors = new HashMap<>();
+
+    /** 串行化刷新与管理端清空，避免清空 K 线后又被旧的刷新批次写回。 */
+    private final Object flushMonitor = new Object();
+
+    private volatile ScheduledExecutorService flusher;
 
     @Autowired
     public MarketDataServiceImpl(KlineAggregator aggregator, MarketDataRepository repository,
-                                 MarketDataProperties properties) {
-        this(aggregator, repository, properties.klineWriteEveryBatches());
+                                 RecentTradeCache tradeCache, MarketDataProperties properties) {
+        this(aggregator, repository, tradeCache, properties.klineFlushIntervalMs());
     }
 
-    /** 测试用：直接指定 K 线写入间隔（1 = 每批都写）。 */
+    /** 测试用：直接指定刷新间隔（毫秒）。测试不会启动后台线程，需手动调用 flushPending。 */
     MarketDataServiceImpl(KlineAggregator aggregator, MarketDataRepository repository,
-                          int klineWriteEveryBatches) {
-        if (klineWriteEveryBatches < 1) {
-            throw new IllegalArgumentException(
-                    "klineWriteEveryBatches must be >= 1: " + klineWriteEveryBatches);
+                          RecentTradeCache tradeCache, long flushIntervalMs) {
+        if (flushIntervalMs < 1) {
+            throw new IllegalArgumentException("flushIntervalMs must be >= 1: " + flushIntervalMs);
         }
         this.aggregator = aggregator;
         this.repository = repository;
-        this.klineWriteEveryBatches = klineWriteEveryBatches;
+        this.tradeCache = tradeCache;
+        this.flushIntervalMs = flushIntervalMs;
+    }
+
+    /** 启动 K 线刷新线程；固定延迟调度，单线程，不与其他模块的定时任务抢线程。 */
+    @PostConstruct
+    void startFlusher() {
+        ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor(runnable -> {
+            Thread thread = new Thread(runnable, FLUSH_THREAD_NAME);
+            thread.setDaemon(true);
+            return thread;
+        });
+        flusher = executor;
+        executor.scheduleWithFixedDelay(this::flushSafely,
+                flushIntervalMs, flushIntervalMs, TimeUnit.MILLISECONDS);
+    }
+
+    /** 停机前再刷一次，尽量不丢最后一个间隔内的快照；宕机场景仍会丢最多一个间隔。 */
+    @PreDestroy
+    void stopFlusher() {
+        ScheduledExecutorService executor = flusher;
+        if (executor != null) {
+            executor.shutdown();
+            try {
+                if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
+                    executor.shutdownNow();
+                }
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+                executor.shutdownNow();
+            }
+        }
+        flushSafely();
     }
 
     @Override
     public void clearWriteState() {
-        batchesSinceKlineWrite.clear();
-        dirtyBuckets.clear();
+        synchronized (flushMonitor) {
+            pendingKlines.clear();
+            pendingAnchors.clear();
+            writtenAnchors.clear();
+        }
     }
 
     @Override
@@ -107,20 +168,25 @@ public class MarketDataServiceImpl implements MarketDataService {
             }
         }
 
-        // 只归档本批最后 20 条成交；K 线仍使用全部 records 聚合。
-        // DEDUP 键保证整批重投不会产生重复成交。
-        List<MatchPairEvent> trades =
-                records.stream().map(MarketDataRecord::event).toList();
+        // 只归档本批最后 50 条成交；K 线仍使用全部 records 聚合。
+        // 先推进内存缓存再落库：接口 / WebSocket 立即能看到最新成交；落库失败重投时
+        // 缓存按 tradeId 去重，QuestDB 由 DEDUP 键兜底。
+        List<MatchPairEvent> trades = records.stream().map(MarketDataRecord::event).toList();
         int tradeFrom = Math.max(0, trades.size() - TRADE_ARCHIVE_LIMIT);
-        repository.insertTrades(List.copyOf(trades.subList(tradeFrom, trades.size())));
+        List<MatchPairEvent> archivedTrades =
+                List.copyOf(trades.subList(tradeFrom, trades.size()));
+        tradeCache.add(archivedTrades);
+        repository.insertTrades(archivedTrades);
 
-        // 本批次内先在本地状态上计算，写库成功后再提交给 aggregator。
+        // 本批次内先在本地状态上计算，全部成功后再合并到待刷新的内存缓存并提交给 aggregator；
+        // 中途异常时 aggregator / pendingKlines 都不变，Kafka 整批重投不会重复累计。
         Map<KlineKey, Kline> working = new HashMap<>();
         Set<KlineKey> resolved = new HashSet<>();
-        // 每个 (symbol, interval) 在库里的锚点 bucket；null 表示还没有锚点记录。
-        // 批次结束时只有 bucket 前进了（或首次建锚点）才写回，避免每批都覆盖同一行。
-        Map<KlineKey, Instant> anchorBaselines = new HashMap<>();
-        Map<KlineBucketKey, Kline> pending = new LinkedHashMap<>();
+        // 本批产生的最新快照；同一 bucket 只保留最终状态。
+        Map<KlineBucketKey, Kline> batchPending = new LinkedHashMap<>();
+        // 本批从库里恢复出的锚点 bucket；内存命中时不需要。锚点存在但快照缺失时，
+        // 早于锚点的迟到成交不重新开线。
+        Map<KlineKey, Instant> restoredAnchors = new HashMap<>();
         // 一条批量消息包含多笔成交，同一 symbol 的多笔成交共享 (partition, offset)。
         // 水位检查必须以整条 Kafka 记录为单位：首次遇到该记录的 symbol+interval+bucket 时
         // 判断是否已聚合，已聚合则跳过该记录内该 bucket 的全部成交；否则全部处理。不能逐笔
@@ -138,12 +204,12 @@ public class MarketDataServiceImpl implements MarketDataService {
                 if (!resolved.contains(key)) {
                     resolved.add(key);
                     current = aggregator.current(trade.symbol(), interval);
-                    if (current != null) {
-                        anchorBaselines.put(key, current.bucketStart());
-                    } else {
+                    if (current == null) {
                         Restored restored = restoreFromStore(key, bucketStart,
-                                record.partition(), record.offset(), pending);
-                        anchorBaselines.put(key, restored.anchorBucket());
+                                record.partition(), record.offset(), batchPending);
+                        if (restored.anchorBucket() != null) {
+                            restoredAnchors.put(key, restored.anchorBucket());
+                        }
                         current = restored.current();
                     }
                     if (current != null) {
@@ -163,25 +229,17 @@ public class MarketDataServiceImpl implements MarketDataService {
                 }
 
                 if (current == null) {
-                    Instant anchorBucket = anchorBaselines.get(key);
+                    Instant anchorBucket = restoredAnchors.get(key);
                     if (anchorBucket != null && bucketStart.isBefore(anchorBucket)) {
                         continue;
                     }
                 } else if (current.bucketStart().isBefore(bucketStart)) {
-                    // 当前 K 线早于事件 bucket：如果本 bucket 自上次写入后又被更新过，
-                    // 把最终快照放进 pending（下面按“已完成 bucket”强制写入）；
-                    // 否则它只是从库里恢复出来的旧快照，不需要重复写。
-                    KlineBucketKey previousKey = new KlineBucketKey(
-                            current.symbol(), interval, current.bucketStart());
-                    if (dirtyBuckets.contains(previousKey)) {
-                        pending.put(previousKey, current);
-                    } else {
-                        // 上一根已经是最新持久化状态，清理它的节流计数，避免跨分钟累积。
-                        batchesSinceKlineWrite.remove(previousKey);
-                    }
+                    // 当前 K 线早于事件 bucket：中间没有成交的 bucket 补成平线。
+                    // 当前 bucket 的最终快照无需在此强制写入——它的每次更新都已经放进
+                    // pendingKlines，刷新线程会写入最新状态。
                     for (Kline flat : aggregator.flatsUntil(current, interval, bucketStart,
                             record.partition(), record.offset())) {
-                        pending.put(new KlineBucketKey(
+                        batchPending.put(new KlineBucketKey(
                                 trade.symbol(), interval, flat.bucketStart()), flat);
                     }
                 }
@@ -192,75 +250,13 @@ public class MarketDataServiceImpl implements MarketDataService {
                     continue;
                 }
                 working.put(key, next);
-                dirtyBuckets.add(bucketKey);
-                // 同一 bucket 只保留最终快照；批内中间状态对查询没有意义。
-                pending.put(bucketKey, next);
+                batchPending.put(bucketKey, next);
             }
         }
 
-        // 已完成 bucket（working 已经前进到更晚的 bucket）强制写最终快照；
-        // 当前 bucket 首次立即写，之后每 N 批更新一次。
-        List<Kline> toWrite = new ArrayList<>();
-        for (Map.Entry<KlineBucketKey, Kline> entry : pending.entrySet()) {
-            Kline kline = entry.getValue();
-            Kline current = working.get(new KlineKey(kline.symbol(), kline.interval()));
-            boolean finalSnapshot = current == null
-                    || kline.bucketStart().isBefore(current.bucketStart());
-            if (finalSnapshot) {
-                toWrite.add(kline);
-                batchesSinceKlineWrite.remove(entry.getKey());
-                continue;
-            }
-            Integer written = batchesSinceKlineWrite.get(entry.getKey());
-            if (written == null) {
-                // 当前 bucket 的第一根快照：立即写入，保证查询能看到本分钟开盘。
-                toWrite.add(kline);
-                batchesSinceKlineWrite.put(entry.getKey(), 0);
-            } else if (written + 1 >= klineWriteEveryBatches) {
-                toWrite.add(kline);
-                batchesSinceKlineWrite.put(entry.getKey(), 0);
-            } else {
-                batchesSinceKlineWrite.put(entry.getKey(), written + 1);
-            }
-        }
-        if (!toWrite.isEmpty()) {
-            repository.insertKlines(toWrite);
-            for (Kline kline : toWrite) {
-                dirtyBuckets.remove(new KlineBucketKey(
-                        kline.symbol(), kline.interval(), kline.bucketStart()));
-            }
-        }
-        // 只按已经持久化的 K 线推进锚点，避免锚点领先于快照：
-        // 1) 本批真正写入的 bucket；
-        // 2) 没有待写入更新（dirty）的当前 bucket——它要么是刚从库里恢复的，要么上一批已写过。
-        Map<KlineKey, Instant> anchorBuckets = new HashMap<>();
-        for (Kline kline : toWrite) {
-            KlineKey key = new KlineKey(kline.symbol(), kline.interval());
-            Instant existing = anchorBuckets.get(key);
-            if (existing == null || kline.bucketStart().isAfter(existing)) {
-                anchorBuckets.put(key, kline.bucketStart());
-            }
-        }
-        for (Map.Entry<KlineKey, Kline> entry : working.entrySet()) {
-            Kline kline = entry.getValue();
-            KlineBucketKey bucketKey = new KlineBucketKey(
-                    kline.symbol(), kline.interval(), kline.bucketStart());
-            if (!dirtyBuckets.contains(bucketKey) && !anchorBuckets.containsKey(entry.getKey())) {
-                anchorBuckets.put(entry.getKey(), kline.bucketStart());
-            }
-        }
-        List<KlineAnchor> anchors = new ArrayList<>();
-        for (Map.Entry<KlineKey, Instant> entry : anchorBuckets.entrySet()) {
-            Instant baseline = anchorBaselines.get(entry.getKey());
-            if (baseline == null || entry.getValue().isAfter(baseline)) {
-                anchors.add(new KlineAnchor(entry.getKey().symbol(),
-                        entry.getKey().interval(), entry.getValue()));
-            }
-        }
-        if (!anchors.isEmpty()) {
-            repository.upsertAnchors(anchors);
-        }
-        // 写库成功后才提交内存状态；失败时异常向上抛，aggregator 停在上一个成功批次。
+        // 计算全部成功后一次性合并；此后由后台刷新线程按间隔落库。
+        pendingKlines.putAll(batchPending);
+        // 写库失败重试 / 进程重启时从 aggregator 或库里恢复，不会重复累计。
         working.values().forEach(aggregator::commit);
     }
 
@@ -277,7 +273,8 @@ public class MarketDataServiceImpl implements MarketDataService {
      * <p>没有锚点：锚点表刚上线 / 锚点丢失时库里可能已有历史 K 线，读取该
      * {@code (symbol, interval)} 最新的一根作为“上一根”。事件 bucket 更晚时由调用方补平
      * 中间的空柱并以它的 close 续线开盘；事件 bucket 相同则更新已有快照，更早则按迟到成交
-     * 忽略。只有库里一根 K 线都没有时才是真正的新线。处理完成后会把当前 bucket 补写成锚点。
+     * 忽略。只有库里一根 K 线都没有时才是真正的新线。对应的 K 线刷新成功后由刷新线程
+     * 推进锚点。
      */
     private Restored restoreFromStore(KlineKey key, Instant bucketStart,
                                       int partition, long offset,
@@ -302,7 +299,7 @@ public class MarketDataServiceImpl implements MarketDataService {
 
         Kline previous = null;
         for (Instant cursor = anchorBucket; cursor.isBefore(bucketStart);
-             cursor = cursor.plus(interval.span())) {
+             cursor = interval.nextBucket(cursor)) {
             Kline stored = byBucket.get(cursor);
             if (stored != null) {
                 previous = stored;
@@ -326,6 +323,70 @@ public class MarketDataServiceImpl implements MarketDataService {
         return new Restored(current, anchorBucket);
     }
 
+    /**
+     * 把待落库的 K 线快照整批写入 QuestDB，成功后推进锚点。
+     *
+     * <p>每个 bucket 只写最新一份快照；写库失败时快照保留在内存，下一个刷新间隔重试。
+     * 先写 K 线再写锚点，且只有 K 线写成功后才把对应 bucket 加入锚点，保证锚点不领先于
+     * 已持久化的快照。包级可见便于单测直接触发刷新。
+     */
+    void flushPending() {
+        synchronized (flushMonitor) {
+            List<Map.Entry<KlineBucketKey, Kline>> snapshot =
+                    new ArrayList<>(pendingKlines.entrySet());
+            if (!snapshot.isEmpty()) {
+                List<Kline> klines = new ArrayList<>(snapshot.size());
+                for (Map.Entry<KlineBucketKey, Kline> entry : snapshot) {
+                    klines.add(entry.getValue());
+                }
+                repository.insertKlines(klines);
+                for (Kline kline : klines) {
+                    // 只删除仍是本次写入的那份快照：刷新期间消费线程可能已经 put 了更新的版本，
+                    // 它必须留在 pendingKlines 里等下一个间隔。
+                    KlineBucketKey key = new KlineBucketKey(
+                            kline.symbol(), kline.interval(), kline.bucketStart());
+                    pendingKlines.remove(key, kline);
+                    pendingAnchors.merge(new KlineKey(kline.symbol(), kline.interval()),
+                            kline.bucketStart(), MarketDataServiceImpl::later);
+                }
+            }
+
+            if (pendingAnchors.isEmpty()) {
+                return;
+            }
+            List<KlineAnchor> anchors = new ArrayList<>(pendingAnchors.size());
+            for (Map.Entry<KlineKey, Instant> entry : pendingAnchors.entrySet()) {
+                Instant written = writtenAnchors.get(entry.getKey());
+                if (written == null || entry.getValue().isAfter(written)) {
+                    anchors.add(new KlineAnchor(entry.getKey().symbol(),
+                            entry.getKey().interval(), entry.getValue()));
+                }
+            }
+            if (anchors.isEmpty()) {
+                // 待写锚点都已被更新过的锚点覆盖，无需重复覆盖同一行。
+                pendingAnchors.clear();
+                return;
+            }
+            repository.upsertAnchors(anchors);
+            for (KlineAnchor anchor : anchors) {
+                KlineKey key = new KlineKey(anchor.symbol(), anchor.interval());
+                writtenAnchors.put(key, anchor.bucketStart());
+            }
+            // 锚点写入成功后清空待写标记；期间没有其它线程会修改 pendingAnchors。
+            pendingAnchors.clear();
+        }
+    }
+
+    private void flushSafely() {
+        try {
+            flushPending();
+        } catch (RuntimeException ex) {
+            // 快照仍留在 pendingKlines，下一个间隔继续重试；QuestDB 恢复后自动追上。
+            log.warn("kline flush failed, {} snapshot(s) kept for retry: {}",
+                    pendingKlines.size(), ex.toString());
+        }
+    }
+
     @Override
     public List<Kline> klines(String symbol, KlineInterval interval, int limit) {
         if (symbol == null || symbol.isBlank()) {
@@ -335,11 +396,31 @@ public class MarketDataServiceImpl implements MarketDataService {
     }
 
     @Override
+    public List<Kline> latestKlines(String symbol) {
+        if (symbol == null || symbol.isBlank()) {
+            throw new IllegalArgumentException("symbol is required");
+        }
+        List<Kline> latest = new ArrayList<>(aggregator.intervals().size());
+        for (KlineInterval interval : aggregator.intervals()) {
+            Kline current = aggregator.current(symbol, interval);
+            if (current != null) {
+                latest.add(current);
+            }
+        }
+        return List.copyOf(latest);
+    }
+
+    @Override
     public List<TradeRecord> recentTrades(String symbol, int limit) {
         if (symbol == null || symbol.isBlank()) {
             throw new IllegalArgumentException("symbol is required");
         }
-        return repository.findTrades(symbol, limit);
+        // 只读内存缓存；limit 超过缓存容量时由缓存按容量截断。
+        return tradeCache.recent(symbol, limit);
+    }
+
+    private static Instant later(Instant left, Instant right) {
+        return left.isAfter(right) ? left : right;
     }
 
     private record KlineKey(String symbol, KlineInterval interval) {

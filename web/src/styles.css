@@ -267,6 +267,59 @@ button:disabled {
   border-color: rgba(240, 185, 11, 0.52);
 }
 
+/* 机器人自动交易开关：绿色=运行且行情已连接，琥珀=等待行情，灰色=已停止 */
+.bot-button {
+  height: 34px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-raised);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+
+.bot-button i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.bot-button.off:hover:not(:disabled) {
+  color: var(--text);
+  border-color: #35414e;
+}
+
+.bot-button.on {
+  color: var(--green);
+  border-color: var(--green-line);
+  background: var(--green-soft);
+}
+
+.bot-button.on:hover:not(:disabled) {
+  background: rgba(14, 203, 129, 0.17);
+}
+
+.bot-button.waiting {
+  color: var(--amber);
+  border-color: rgba(240, 185, 11, 0.35);
+  background: var(--amber-soft);
+}
+
+.bot-button.waiting i {
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+.bot-button:disabled {
+  opacity: 0.55;
+}
+
 /* ------------------------------------------------------------------ */
 /* Main layout                                                         */
 /* ------------------------------------------------------------------ */
@@ -282,7 +335,8 @@ button:disabled {
 
 .center-column {
   display: grid;
-  grid-template-rows: minmax(0, 1fr) 214px;
+  /* 底部用户记录列表压低一点，把更多高度让给 K 线图，避免高位蜡烛贴住顶部图例。 */
+  grid-template-rows: minmax(0, 1fr) 188px;
   gap: 10px;
   min-height: 0;
   min-width: 0;
@@ -395,6 +449,18 @@ button:disabled {
   box-shadow: 0 0 0 3px rgba(14, 203, 129, 0.12);
   animation: pulse 2s ease-in-out infinite;
   flex: 0 0 auto;
+}
+
+/* 盘口推送：连接中（黄）/ 断开重连中（红，停止呼吸效果）。 */
+.live-dot.pending {
+  background: var(--amber);
+  box-shadow: 0 0 0 3px var(--amber-soft);
+}
+
+.live-dot.offline {
+  background: var(--red);
+  box-shadow: 0 0 0 3px var(--red-soft);
+  animation: none;
 }
 
 .mono {
@@ -655,6 +721,27 @@ button:disabled {
   white-space: nowrap;
 }
 
+/* K 线面板右上角：刷新信息 + 机器人自动交易开关 */
+.chart-head-right {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-left: auto;
+  flex: 0 0 auto;
+  align-self: center;
+}
+
+.chart-head-right .chart-meta {
+  padding-top: 0;
+}
+
+.chart-head .bot-button {
+  height: 28px;
+  padding: 0 10px;
+  border-radius: 7px;
+  font-size: 11px;
+}
+
 .meta-divider {
   color: #303a45;
 }
@@ -665,6 +752,49 @@ button:disabled {
   text-overflow: ellipsis;
   color: var(--red);
   margin-left: 6px;
+}
+
+.chart-intervals {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0 16px 8px;
+  flex: 0 0 auto;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.chart-intervals::-webkit-scrollbar {
+  display: none;
+}
+
+.interval-switch {
+  border: 0;
+  border-radius: 5px;
+  padding: 3px 8px;
+  background: transparent;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.3px;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.interval-switch:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.045);
+}
+
+.interval-switch.active {
+  color: var(--amber);
+  background: var(--amber-soft);
+}
+
+.interval-switch:focus-visible {
+  outline: 1px solid rgba(240, 185, 11, 0.55);
+  outline-offset: 1px;
 }
 
 .chart-shell {
@@ -1553,7 +1683,8 @@ button:disabled {
   background: rgba(255, 255, 255, 0.03);
 }
 
-.balance-refresh {
+.balance-refresh,
+.activity-refresh {
   height: 27px;
   display: inline-flex;
   align-items: center;
@@ -1568,10 +1699,16 @@ button:disabled {
   transition: color 120ms ease, border-color 120ms ease, background 120ms ease;
 }
 
-.balance-refresh:hover {
+.balance-refresh:hover,
+.activity-refresh:hover {
   color: var(--text);
   border-color: #35414e;
   background: rgba(255, 255, 255, 0.03);
+}
+
+.activity-refresh:disabled {
+  opacity: 0.65;
+  cursor: default;
 }
 
 .spin {
@@ -1699,6 +1836,10 @@ button:disabled {
 
 .status-dot.online {
   background: var(--green);
+}
+
+.status-dot.pending {
+  background: var(--amber);
 }
 
 .status-dot.offline {
@@ -2810,6 +2951,11 @@ button:disabled {
     height: 250px;
   }
 
+  /* 移动端列表高度固定为 250px，同步网格行高，避免内容溢出到下一个面板。 */
+  .center-column {
+    grid-template-rows: auto 250px;
+  }
+
   .right-column {
     display: flex;
     flex-direction: column;
@@ -2828,6 +2974,10 @@ button:disabled {
 
   .chart-head {
     padding: 11px 12px 8px;
+  }
+
+  .chart-intervals {
+    padding: 0 12px 8px;
   }
 
   .pair-heading {

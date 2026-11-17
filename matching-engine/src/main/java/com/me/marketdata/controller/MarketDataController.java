@@ -21,13 +21,15 @@ import org.springframework.web.bind.annotation.RestController;
  * 返回最近 N 条 K 线，按 bucket 起点升序（便于直接画图）。
  *
  * <p>{@code GET /api/v1/marketdata/trades?symbol=BTC-USDT&limit=50}
- * 返回最近 N 笔成交，按成交时间倒序（最新在前），供前端「最新成交」列表使用。
+ * 返回最近 N 笔成交，按成交时间倒序（最新在前）。数据来自每个交易对的内存缓存，
+ * 不再实时查询 QuestDB；{@code limit} 超过 50 时按 50 截断。
  *
  * <p>K 线：{@code symbol} 必填并统一转大写；{@code interval} 缺省 {@code 1m}，支持
- * {@code 1m / 5m / 15m / 30m / 1h / 4h / 1d}；{@code limit} 缺省 100、上限 1000。
- * 没有成交的周期不会生成 K 线，返回空列表。
+ * {@code 1m / 5m / 15m / 30m / 1h / 4h / 12h / 1d / 1M}；{@code limit} 缺省 100、上限
+ * 1000。周期 label 大小写敏感：{@code 1m} 是 1 分钟，{@code 1M} 是自然月（UTC 每月 1 日
+ * 对齐）。没有成交的周期不会生成 K 线，返回空列表。
  *
- * <p>成交：{@code symbol} 必填并统一转大写；{@code limit} 缺省 50、上限 500。
+ * <p>成交：{@code symbol} 必填并统一转大写；{@code limit} 缺省 50、上限 50。
  */
 @RestController
 @RequestMapping("/api/v1/marketdata")
@@ -47,9 +49,10 @@ public class MarketDataController {
             @RequestParam(name = "interval", required = false) String interval,
             @RequestParam(name = "limit", defaultValue = "100") int limit) {
         String normalizedSymbol = symbol == null ? "" : symbol.strip().toUpperCase(Locale.ROOT);
+        // 周期 label 区分大小写（1m = 1 分钟，1M = 1 个月），不能统一转小写。
         String normalizedInterval = interval == null || interval.isBlank()
                 ? DEFAULT_INTERVAL
-                : interval.strip().toLowerCase(Locale.ROOT);
+                : interval.strip();
 
         if (normalizedSymbol.isEmpty()) {
             return ResponseEntity.badRequest()

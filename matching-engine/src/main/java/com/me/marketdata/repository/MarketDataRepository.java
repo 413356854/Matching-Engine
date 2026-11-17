@@ -29,7 +29,7 @@ import org.springframework.stereotype.Repository;
  * {@code md_kline_anchor}。
  *
  * <p>复用 admin 模块建立的 QuestDB 独立数据源（PostgreSQL wire，8812），通过 bean 名注入，
- * 不直接依赖 admin 的类。写入按 Kafka poll 批次走 JDBC batch（{@code batchUpdate}）；
+ * 不直接依赖 admin 的类。成交明细按 Kafka poll 批次、K 线按后台刷新间隔走批量写入；
  * 三张表都用 DEDUP 做重投幂等，锚点表以固定时间戳作 DEDUP 键实现按
  * {@code (symbol, interval)} 覆盖写。
  */
@@ -125,6 +125,9 @@ public class MarketDataRepository {
             ORDER BY executed_at DESC, trade_id DESC
             LIMIT %d
             """;
+
+    /** 启动预热最新成交缓存：列出成交表里已有的交易对。 */
+    private static final String SELECT_TRADE_SYMBOLS_SQL = "SELECT DISTINCT symbol FROM md_trade";
 
     private final JdbcTemplate jdbcTemplate;
     private final QuestDbIngestClient ingestClient;
@@ -403,7 +406,19 @@ public class MarketDataRepository {
     }
 
     /**
+     * 查询成交表里出现过的交易对，供启动时预热最新成交缓存。
+     *
+     * @return 交易对列表；表为空时返回空列表
+     */
+    public List<String> findTradeSymbols() {
+        ensureTables();
+        return jdbcTemplate.queryForList(SELECT_TRADE_SYMBOLS_SQL, String.class);
+    }
+
+    /**
      * 查询最近 {@code limit} 笔成交，按成交时间倒序返回（最新在前）。
+     *
+     * <p>运行时查询接口读内存缓存，本方法只用于启动预热 / 缓存懒加载。
      *
      * @param limit 1..500，超出范围会被夹到边界值
      */
