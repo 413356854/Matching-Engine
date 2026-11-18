@@ -27,11 +27,11 @@ import org.slf4j.LoggerFactory;
  * 重试会在脏状态上重复执行；后续由外部监控重启整个进程来丢弃内存状态。
  * 监控接入前，失败只记录 error 日志，进程不会自动重启。
  *
- * <p><b>有状态 stage</b>：在模块锁内完成业务、分配 seq，输出写入 runner 显式创建的
- * {@link BatchOutput}，再连同输入 offset 封装成 {@link SendPackage} 放入模块 FIFO 队列；
- * 队列满时阻塞入队，不拒绝。
- * 释放模块锁后等待 committer 的提交结果，再 poll 下一批。committer 单线程按入队顺序
- * 提交，保证提交顺序 == seq 顺序；同时下一批业务可以和上一批的 Kafka 提交重叠执行。
+ * <p><b>有状态 stage</b>：service impl 在自己的模块锁内完成业务、分配 seq，
+ * 输出写入 runner 显式创建的 {@link BatchOutput}，再连同输入 offset 封装成
+ * {@link SendPackage} 放入模块 FIFO 队列；队列满时阻塞入队，不拒绝。
+ * 入队后 runner 立即 poll 下一批，<b>不等待</b> committer 提交；committer 单线程按
+ * 入队顺序提交，保证提交顺序 == seq 顺序，下一批业务可以和上一批的 Kafka 提交重叠执行。
  *
  * <p><b>审计 / 投影 stage</b>：仍由本 runner 直接开启事务，发送消息并提交 offset
  * （{@code beginTransaction → send → sendOffsetsToTransaction → commitTransaction}）。
@@ -221,10 +221,9 @@ public final class KafkaConsumerRunner<T> implements Runnable {
     private void consume() {
         while (running.get() && !Thread.currentThread().isInterrupted()) {
             PolledBatch<T> current = pollBatch(properties.pollTimeoutMs());
-            if (current == null) {
-                continue;
+            if (current != null) {
+                processBatch(current.records());
             }
-            processBatch(current.records());
         }
     }
 

@@ -17,8 +17,9 @@ import org.springframework.stereotype.Component;
  * service 以整条 Kafka 记录为水位单位，首次遇到时判断该记录是否已聚合，避免同一批次内的
  * 后续成交被误判为重复。
  *
- * <p>批量消费一个 poll 批次一个 Kafka 事务，整批一次 {@code ingestBatch} 批量写库；
- * 处理失败异常向上抛出，整批回滚重投；`md_trade` DEDUP 与 K 线 offset 水位保证重投不重复累计。
+ * <p>批量消费一个 poll 批次一个 Kafka 事务；{@code ingestBatch} 只更新内存缓存 / 分钟线，
+ * 成交明细与 K 线由后台线程按间隔批量写库。处理失败异常向上抛出，整批回滚重投；
+ * {@code md_trade} DEDUP 与 K 线 offset 水位保证重投不重复累计。
  */
 @Component
 public class MarketDataListener {

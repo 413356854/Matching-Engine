@@ -6,6 +6,7 @@ import com.me.currency.mapper.CurrencyMapper;
 import com.me.currency.service.CurrencyService;
 import com.me.currency.vo.CurrencyView;
 import java.util.List;
+import java.util.Locale;
 import java.util.Objects;
 import org.springframework.stereotype.Service;
 
@@ -34,12 +35,17 @@ public class CurrencyServiceImpl implements CurrencyService {
     }
 
     private static CurrencyView toView(Currency currency) {
+        // 币种代码在进入缓存前归一化；下游直接使用 view 里的 code。
         return new CurrencyView(
                 Objects.requireNonNullElse(currency.getId(), 0L),
-                currency.getCode(),
+                normalize(currency.getCode()),
                 currency.getName(),
                 Objects.requireNonNullElse(currency.getScale(), 0),
                 Objects.requireNonNullElse(currency.getStatus(), 0),
                 Objects.requireNonNullElse(currency.getSortOrder(), 0));
+    }
+
+    private static String normalize(String value) {
+        return value == null ? null : value.strip().toUpperCase(Locale.ROOT);
     }
 }

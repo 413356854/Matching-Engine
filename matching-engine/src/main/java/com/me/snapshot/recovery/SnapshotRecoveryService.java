@@ -157,14 +157,12 @@ public class SnapshotRecoveryService implements SmartLifecycle {
             return;
         }
         if (!properties.enabled()) {
-            log.info("snapshot recovery is disabled; starting with empty state");
             return;
         }
         recoveryState.running("selecting snapshot");
         try {
             RecoveryStatus status = recover();
             recoveryState.ready(status);
-            log.info("snapshot recovery ready: {}", status);
         } catch (RuntimeException e) {
             recoveryState.failed(e.getMessage());
             log.error("snapshot recovery failed; refusing to start consumers", e);
@@ -213,10 +211,6 @@ public class SnapshotRecoveryService implements SmartLifecycle {
         matchingEngine.restore(payload.books());
         accountOperationService.restoreSeq(payload.accountSeq());
         orderOperationService.restoreSeq(payload.orderSeq());
-        log.info("in-memory state restored: accounts={}, orders={}, books={}, "
-                        + "accountSeq={}, orderSeq={}",
-                payload.accounts().size(), payload.orderState().orders().size(),
-                payload.books().size(), payload.accountSeq(), payload.orderSeq());
 
         try {
             // 4) 读出快照切点之后已提交的「输入记录 → seq」映射，保留原始批次边界。
@@ -265,7 +259,6 @@ public class SnapshotRecoveryService implements SmartLifecycle {
             String message = "snapshot recovery completed: orderRecords="
                     + replayStats.orderRecords() + ", accountRecords="
                     + replayStats.accountRecords() + ", adjustedGroups=" + adjustedGroups;
-            log.info(message);
             return new RecoveryStatus("READY", true, selection.backupId(),
                     selection.path().toString(), payload.createdAt(),
                     payload.accountSeq(), payload.orderSeq(),
@@ -296,7 +289,6 @@ public class SnapshotRecoveryService implements SmartLifecycle {
     private Selection selectSnapshot() {
         if (!properties.file().isBlank()) {
             Path path = Path.of(properties.file());
-            log.info("loading snapshot from explicit file: {}", path);
             return new Selection(path, null, null);
         }
 
@@ -324,8 +316,6 @@ public class SnapshotRecoveryService implements SmartLifecycle {
             throw new SnapshotRecoveryException(
                     "snapshot backup " + record.id() + " has no file path");
         }
-        log.info("selected snapshot backup: id={}, file={}, accountSeq={}, orderSeq={}",
-                record.id(), record.filePath(), record.accountSeq(), record.orderSeq());
         return new Selection(Path.of(record.filePath()), record.id(), record);
     }
 
@@ -472,7 +462,7 @@ public class SnapshotRecoveryService implements SmartLifecycle {
             } catch (ExecutionException e) {
                 if (e.getCause() instanceof UnknownTopicOrPartitionException
                         && System.nanoTime() < deadline) {
-                    log.info("snapshot recovery is waiting for topics to be created: {}",
+                    log.error("snapshot recovery is waiting for topics to be created: {}",
                             e.getCause().getMessage());
                     sleep(OFFSET_RETRY_DELAY_MS);
                     continue;
@@ -843,7 +833,6 @@ public class SnapshotRecoveryService implements SmartLifecycle {
                             new OffsetAndMetadata(partition.resumeOffset()));
         }
         if (byGroup.isEmpty()) {
-            log.info("all consumer group offsets already match the snapshot; no adjustment needed");
             return 0;
         }
 
@@ -857,8 +846,6 @@ public class SnapshotRecoveryService implements SmartLifecycle {
                     adminClient.alterConsumerGroupOffsets(group, entry.getValue())
                             .all()
                             .get(remainingMillis(deadline), TimeUnit.MILLISECONDS);
-                    log.info("consumer group offsets reset to snapshot: group={}, partitions={}",
-                            group, entry.getValue().size());
                     break;
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
@@ -868,7 +855,7 @@ public class SnapshotRecoveryService implements SmartLifecycle {
                     if (e.getCause() instanceof GroupNotEmptyException
                             && System.nanoTime() < deadline) {
                         // 旧进程的成员尚未过期；等 session timeout 后组变空再写。
-                        log.info("consumer group {} still has active members; retrying offset "
+                        log.error("consumer group {} still has active members; retrying offset "
                                 + "reset", group);
                         sleep(OFFSET_RETRY_DELAY_MS);
                         continue;
@@ -902,10 +889,6 @@ public class SnapshotRecoveryService implements SmartLifecycle {
                 replayOffsetRange += partition.brokerOffset() - partition.snapshotOffset();
             }
         }
-        log.info("recovery offset plan: partitions={}, replayPartitions={}, "
-                        + "replayOffsetRange={}, adjustments={}",
-                plan.partitions().size(), replayPartitions,
-                replayOffsetRange, plan.adjustments().size());
     }
 
     // ------------------------------------------------------------------

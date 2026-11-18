@@ -195,7 +195,6 @@ public class BinanceMarketClient {
                     .buildAsync(URI.create(streamUrl), new MiniTickerListener())
                     .get(config.connectTimeoutMs() + 2000L, TimeUnit.MILLISECONDS);
             webSocket = socket;
-            log.info("binance websocket connecting: url={}, proxy={}", streamUrl, proxyDescription);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             onConnectFailure("连接被中断");
@@ -287,7 +286,6 @@ public class BinanceMarketClient {
             log.warn("{}, {}ms 后重连", reason, config.reconnectDelayMs());
             scheduleReconnect();
         } else {
-            log.info(reason);
         }
     }
 
@@ -400,7 +398,6 @@ public class BinanceMarketClient {
             connected = true;
             lastError = null;
             webSocket = socket;
-            log.info("binance websocket connected: {}", streamUrl);
             socket.request(1);
         }
 

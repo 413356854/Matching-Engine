@@ -13,8 +13,9 @@ import org.apache.kafka.clients.consumer.ConsumerRecord;
  *
  * <p>每个 {@code execute*} 方法在全局 {@code orderLock} 内完成一个消费批次：
  * <ol>
- *   <li>批次之间严格串行；批内记录按各链路原有的并发方式执行（下单逐条提交线程池、
- *       冻结回执并发更新 + 聚合撮合 + 并发清算、撤单并发查询 + 聚合撤销 + 并发更新）；</li>
+ *   <li>批次之间严格串行；批内记录在消费线程上顺序执行（下单逐条保存、冻结回执
+ *       顺序更新 + 聚合撮合 + 顺序清算、撤单顺序查询 + 聚合撤销 + 顺序更新）。
+ *       A/B 实测逐单/逐笔线程池的固定开销大于并行收益，已移除 orderOperationExecutor；</li>
  *   <li>处理完成后按 ConsumerRecord 输入顺序，为每条 Kafka 输入记录
  *       {@code orderSeq.incrementAndGet()} 分配独立序号，因此序号顺序就是输入记录被
  *       委托模块处理的顺序；</li>
@@ -29,7 +30,7 @@ import org.apache.kafka.clients.consumer.ConsumerRecord;
  * <p>Kafka 事务仍由 runner 处理：输出在 orderLock 内进入当前批次的 {@link BatchOutput}，
  * runner 打包后交给 committer，让「消费 offset + 输出 + 序列映射」原子提交。
  *
- * <p>批次串行只改变了跨链路的交错关系；批内并发与撮合引擎对象锁的语义保持不变。
+ * <p>批次串行只改变了跨链路的交错关系；当前批内顺序执行，撮合引擎对象锁的语义不变。
  */
 public interface OrderOperationService {
 

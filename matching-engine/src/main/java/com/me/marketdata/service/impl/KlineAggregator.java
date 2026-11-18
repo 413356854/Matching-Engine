@@ -75,6 +75,53 @@ public final class KlineAggregator {
     }
 
     /**
+     * 把一根已完成的分钟线合并进更高周期。
+     *
+     * <p>逐笔只更新分钟线；分钟线完成后由调用方按周期调用本方法。合并规则与逐笔更新等价：
+     * 同 bucket 累加量 / 额 / 笔数并更新 high / low / close；事件进入新 bucket 时以上一根的
+     * close 作为 open，再用分钟线的 OHLC 扩展 high / low。{@code currentCandle} 晚于目标
+     * bucket（迟到分钟线）时返回 {@code null}。
+     *
+     * @param currentCandle 高周期当前 K 线，可为 {@code null}（新周期 / 首次聚合）
+     * @param baseBar       已完成的分钟线，作为聚合输入
+     * @param interval      高周期
+     * @param bucketStart   分钟线所在的周期 bucket
+     * @param partition     分钟线最后一条 Kafka 记录的分区（写入高周期水位）
+     * @param offset        分钟线最后一条 Kafka 记录的 offset
+     */
+    public Kline mergeBaseBar(Kline currentCandle, Kline baseBar, KlineInterval interval,
+                              Instant bucketStart, int partition, long offset) {
+        if (currentCandle == null) {
+            return new Kline(baseBar.symbol(), interval, bucketStart,
+                    baseBar.openPrice(), baseBar.highPrice(), baseBar.lowPrice(),
+                    baseBar.closePrice(), baseBar.volume(), baseBar.amount(),
+                    baseBar.tradeCount(), partition, offset);
+        }
+        if (currentCandle.bucketStart().isAfter(bucketStart)) {
+            return null;
+        }
+        if (currentCandle.bucketStart().isBefore(bucketStart)) {
+            long open = currentCandle.closePrice();
+            return new Kline(baseBar.symbol(), interval, bucketStart,
+                    open,
+                    Math.max(open, baseBar.highPrice()),
+                    Math.min(open, baseBar.lowPrice()),
+                    baseBar.closePrice(),
+                    baseBar.volume(), baseBar.amount(), baseBar.tradeCount(),
+                    partition, offset);
+        }
+        return new Kline(currentCandle.symbol(), interval, currentCandle.bucketStart(),
+                currentCandle.openPrice(),
+                Math.max(currentCandle.highPrice(), baseBar.highPrice()),
+                Math.min(currentCandle.lowPrice(), baseBar.lowPrice()),
+                baseBar.closePrice(),
+                Math.addExact(currentCandle.volume(), baseBar.volume()),
+                Math.addExact(currentCandle.amount(), baseBar.amount()),
+                Math.addExact(currentCandle.tradeCount(), baseBar.tradeCount()),
+                partition, offset);
+    }
+
+    /**
      * 当前 K 线之后、{@code bucketStart} 之前没有成交的 bucket 的平线 K 线。
      *
      * <p>每根平线的 OHLC 都沿用上一根的收盘价，量 / 额 / 笔数为 0；{@code current} 为空或

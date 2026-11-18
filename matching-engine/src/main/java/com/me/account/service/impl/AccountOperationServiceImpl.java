@@ -88,12 +88,15 @@ public class AccountOperationServiceImpl implements AccountOperationService {
     private final AtomicLong accountSeq = new AtomicLong();
 
     /**
-     * 批次级全局锁：充值 / 扣账、冻结、结算三条链路的批次在这里串行，
+     * 批次级全局锁（来自 {@link AccountBatchLock}，公平可重入）：
+     * 充值 / 扣账、冻结、结算三条链路的批次在这里串行，
      * 保证 accountSeq 顺序与输入记录被账户模块处理的顺序一致。
      *
-     * <p>runner 在 beginTransaction 前先获取同一把锁，并在 commit/abort 之后释放；
-     * 本类内部再次获取可重入锁。因此本类释放后，runner 仍保持锁到 Kafka 事务结束，
-     * 下一批不会在失败批次的脏状态上继续执行。
+     * <p>由本类的 {@code execute*} 方法在消费线程里获取；锁内完成
+     * 「按 slot 并发处理 → 分配 accountSeq → 发布资金流水 / 冻结回执 / offset-seq →
+     * output.enqueue()」。锁在 {@code output.enqueue()} 返回后释放，<b>不覆盖</b>
+     * committer 的 Kafka send / commit：runner 入队后立即 poll 下一批，
+     * 提交失败由 committer 进入 fatal，不会回到本锁内重试。
      */
     private final ReentrantLock accountLock;
 

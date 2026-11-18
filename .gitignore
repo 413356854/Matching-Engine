@@ -7,6 +7,7 @@ loadtest/out/
 # 压测中间文件：临时压测脚本、编译类与测试报告（.log 由下方 *.log 覆盖）
 loadtest/*.java
 loadtest/*.class
+loadtest/*.ps1
 loadtest/TEST-REPORT*.md
 # 汇总报告需要保留在仓库中
 !loadtest/TEST-REPORT.md

@@ -2,7 +2,6 @@ package com.me.account.dto;
 
 import com.me.shared.event.FundsLogType;
 import java.util.List;
-import java.util.Locale;
 
 /**
  * 双边成交结算命令，作为 {@link TradeSettlementBatch#getMsgList()} 的元素发往
@@ -25,7 +24,9 @@ import java.util.Locale;
  *
  * <p>{@code requestId} 是结算命令的唯一标识（演示版由委托模块的进程内计数器生成，
  * 后续随内存状态持久化/恢复）；仅用于日志、审计与资金流水，不再作为账户幂等键。
- * 币种统一转为大写。
+ * {@code symbol} / {@code currency} 由调用方保证已归一化（strip + 大写）：
+ * 下单入口的 {@code OrderCommand} 已归一化 symbol，缓存中的交易对/币种视图也在
+ * 入库前归一化，因此这里直接取值，不再逐笔做字符串转换。
  */
 public record TradeSettlementCommand(
         String requestId,
@@ -36,21 +37,13 @@ public record TradeSettlementCommand(
         List<SettlementLeg> legs) {
 
     public TradeSettlementCommand {
-        if (symbol != null) {
-            symbol = symbol.strip().toUpperCase(Locale.ROOT);
-        }
         legs = legs == null ? List.of() : List.copyOf(legs);
     }
 
     /**
      * 一条资金腿：对 {@code userId} 的 {@code currency} 余额执行 {@code logType} 对应的原子操作。
+     * {@code currency} 由调用方保证已归一化。
      */
     public record SettlementLeg(long userId, String currency, FundsLogType logType, long amount) {
-
-        public SettlementLeg {
-            if (currency != null) {
-                currency = currency.strip().toUpperCase(Locale.ROOT);
-            }
-        }
     }
 }

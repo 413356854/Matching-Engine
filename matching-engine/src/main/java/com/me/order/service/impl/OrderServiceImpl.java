@@ -307,18 +307,19 @@ public class OrderServiceImpl implements OrderService {
                     FundsLogType.ORDER_UNFREEZE, refund));
         }
 
-        // 一个成交对生成两条单用户命令；requestId 加 -b/-s 后缀保证资金流水 eventId
-        // （requestId + ":" + legIndex）仍然唯一。计数器后续随内存状态持久化/恢复。
-        long settlementId = tradeSettlementIdGenerator.getAndIncrement();
+        // 一个成交对生成两条单用户命令；每条命令独立取一个 requestId，
+        // 唯一性由生成器保证，不再拼 -b/-s 后缀。计数器随内存状态持久化/恢复。
+        long buyerSettlementId = tradeSettlementIdGenerator.getAndIncrement();
+        long sellerSettlementId = tradeSettlementIdGenerator.getAndIncrement();
         TradeSettlementCommand buyerCommand = new TradeSettlementCommand(
-                Long.toString(settlementId) + "-b",
+                Long.toString(buyerSettlementId),
                 trade.tradeId(),
                 trade.symbol(),
                 trade.takerOrderId(),
                 trade.makerOrderId(),
                 buyerLegs);
         TradeSettlementCommand sellerCommand = new TradeSettlementCommand(
-                Long.toString(settlementId) + "-s",
+                Long.toString(sellerSettlementId),
                 trade.tradeId(),
                 trade.symbol(),
                 trade.takerOrderId(),
@@ -479,8 +480,6 @@ public class OrderServiceImpl implements OrderService {
             if (refund == 0) {
                 resultRef.set(OrderCancelApplyResult.canceled(
                         0L, List.of(), historyEvent));
-                log.info("order canceled without refund: orderId={}, status={}",
-                        orderId, order.status());
                 return canceled;
             }
 
@@ -496,8 +495,6 @@ public class OrderServiceImpl implements OrderService {
                             FundsLogType.ORDER_UNFREEZE, refund)));
             resultRef.set(OrderCancelApplyResult.canceled(
                     refund, List.of(command), historyEvent));
-            log.info("order canceled: orderId={}, filledQuantity={}, refund={} {}",
-                    orderId, order.filledQuantity(), refund, order.frozenCurrency());
             return canceled;
         });
         OrderCancelApplyResult result = resultRef.get();
@@ -873,8 +870,10 @@ public class OrderServiceImpl implements OrderService {
             if (dash <= 0 || dash != symbol.lastIndexOf('-') || dash == symbol.length() - 1) {
                 return null;
             }
-            String base = symbol.substring(0, dash).strip();
-            String quote = symbol.substring(dash + 1).strip();
+            // 调用方传入的 symbol 已由 OrderCommand 归一化（strip + 大写），
+            // 这里直接截取，不再重复 strip。
+            String base = symbol.substring(0, dash);
+            String quote = symbol.substring(dash + 1);
             return base.isEmpty() || quote.isEmpty() ? null : new ParsedSymbol(base, quote);
         }
     }

@@ -69,8 +69,6 @@ public class SnapshotWriter {
             }
             moveAtomically(temporary, target);
             long size = Files.size(target);
-            log.info("snapshot file written: path={}, size={}B, checksum={}, formatVersion={}",
-                    target, size, checksum, SnapshotFile.CURRENT_FORMAT_VERSION);
             return new SnapshotWriteResult(target, checksum, size);
         } catch (IOException | RuntimeException e) {
             deleteQuietly(temporary);

@@ -94,10 +94,6 @@ public class OffsetSeqReplayReader {
                 orderInputs, payload.orderSeq(), payload.replayCheckpoints());
         List<ReplayBatch> account = readTopic(accountTopic, AccountOffsetSeqBatch.class,
                 accountInputs, payload.accountSeq(), payload.replayCheckpoints());
-        log.info("offset-seq replay mappings read: orderBatches={}, orderRecords={}, "
-                        + "accountBatches={}, accountRecords={}",
-                order.size(), order.stream().mapToLong(b -> b.mappings().size()).sum(),
-                account.size(), account.stream().mapToLong(b -> b.mappings().size()).sum());
         return new ReplayMappings(order, account);
     }
 

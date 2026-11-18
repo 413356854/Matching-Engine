@@ -53,13 +53,6 @@ public class SnapshotLoader {
         }
         SnapshotCodec.verifyChecksum(file, normalized);
         validatePayload(file.payload(), normalized);
-        log.info("snapshot loaded: path={}, createdAt={}, accountSeq={}, orderSeq={}, "
-                        + "accounts={}, orders={}, books={}, offsets={}, checkpoints={}",
-                normalized, file.payload().createdAt(), file.payload().accountSeq(),
-                file.payload().orderSeq(), file.payload().accounts().size(),
-                file.payload().orderState().orders().size(), file.payload().books().size(),
-                file.payload().inputOffsets().size(),
-                file.payload().replayCheckpoints().size());
         return new LoadedSnapshot(normalized, file);
     }
 

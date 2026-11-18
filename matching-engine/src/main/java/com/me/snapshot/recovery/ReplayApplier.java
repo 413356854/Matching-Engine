@@ -65,10 +65,6 @@ public class ReplayApplier {
     public ReplayStats replay(ReplayMappings mappings) {
         ModuleStats account = replayAccount(mappings.accountBatches());
         ModuleStats order = replayOrder(mappings.orderBatches());
-        log.info("state replay completed: orderBatches={}, orderRecords={}, "
-                        + "accountBatches={}, accountRecords={}, orderSeq={}, accountSeq={}",
-                order.batches(), order.records(), account.batches(), account.records(),
-                orderOperationService.currentSeq(), accountOperationService.currentSeq());
         return new ReplayStats(order.batches(), order.records(),
                 account.batches(), account.records());
     }

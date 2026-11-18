@@ -53,16 +53,18 @@ public class PairServiceImpl implements PairService {
         }
         TradingPair pair = tradingPairMapper.selectOne(
                 Wrappers.<TradingPair>lambdaQuery()
-                        .eq(TradingPair::getSymbol, symbol.strip().toUpperCase(Locale.ROOT)));
+                        .eq(TradingPair::getSymbol, normalize(symbol)));
         return pair == null ? null : toView(pair);
     }
 
     private static TradingPairView toView(TradingPair pair) {
+        // 交易对/币种在进入缓存前归一化；下游（委托、结算、bot）直接使用 view 里的字符串，
+        // 不再逐笔做 strip().toUpperCase()。
         return new TradingPairView(
                 Objects.requireNonNullElse(pair.getId(), 0L),
-                pair.getSymbol(),
-                pair.getBaseCurrency(),
-                pair.getQuoteCurrency(),
+                normalize(pair.getSymbol()),
+                normalize(pair.getBaseCurrency()),
+                normalize(pair.getQuoteCurrency()),
                 Objects.requireNonNullElse(pair.getPriceScale(), 0),
                 Objects.requireNonNullElse(pair.getQuantityScale(), 0),
                 Objects.requireNonNullElse(pair.getMinOrderQuantity(), 0L),
@@ -71,5 +73,9 @@ public class PairServiceImpl implements PairService {
                 Objects.requireNonNullElse(pair.getTakerFeeBps(), 0),
                 Objects.requireNonNullElse(pair.getStatus(), 0),
                 Objects.requireNonNullElse(pair.getSortOrder(), 0));
+    }
+
+    private static String normalize(String value) {
+        return value == null ? null : value.strip().toUpperCase(Locale.ROOT);
     }
 }

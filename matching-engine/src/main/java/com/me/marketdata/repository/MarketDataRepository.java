@@ -139,7 +139,7 @@ public class MarketDataRepository {
         this.ingestClient = ingestClient;
     }
 
-    /** 批量写入一个 Kafka poll 批次中的成交；DEDUP 键保证消费重投不会产生重复行。 */
+    /** 批量写入后台刷新线程积攒的成交样本；DEDUP 键保证消费重投不会产生重复行。 */
     public void insertTrades(List<MatchPairEvent> events) {
         if (events.isEmpty()) {
             return;

@@ -276,7 +276,6 @@ public class ReplayInputFetcher implements AutoCloseable {
                             + entry.getValue().start() + ", " + entry.getValue().end() + ")");
                 }
             }
-            log.info("replay coverage validated: topic={}, partitions={}", topic, ranges.size());
         } catch (SnapshotRecoveryException e) {
             throw e;
         } catch (RuntimeException e) {

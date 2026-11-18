@@ -61,7 +61,8 @@ public class QuestDbIngestClient {
         try (Sender sender = db.borrowSender()) {
             writer.accept(sender);
             long fsn = sender.flushAndGetSequence();
-            if (!sender.awaitAckedFsn(fsn, ACK_TIMEOUT_MS)) {
+            boolean acked = sender.awaitAckedFsn(fsn, ACK_TIMEOUT_MS);
+            if (!acked) {
                 throw new IllegalStateException(
                         "QuestDB QWP batch was not acknowledged within " + ACK_TIMEOUT_MS + " ms");
             }

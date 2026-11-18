@@ -116,10 +116,6 @@ public class BotTradingService {
         trading.set(true);
         startTicker();
         lastError = null;
-        log.info("bot auto trading enabled: userId={}, symbols={}, interval={}ms, "
-                        + "binance latency={}ms, proxy={}",
-                properties.userId(), properties.symbols(), properties.orderIntervalMs(),
-                test.latencyMs(), marketClient.proxyDescription());
         return new EnableResult(true, null, "自动交易已开启", test.latencyMs());
     }
 
@@ -133,7 +129,6 @@ public class BotTradingService {
         }
         marketClient.disconnect();
         if (wasTrading) {
-            log.info("bot auto trading disabled: userId={}", properties.userId());
         }
     }
 

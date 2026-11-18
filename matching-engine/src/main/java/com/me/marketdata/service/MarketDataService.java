@@ -16,14 +16,15 @@ public interface MarketDataService {
     int RECENT_TRADES_LIMIT = 50;
 
     /**
-     * 批量处理一个 Kafka poll 批次：先把本批最后 {@value #RECENT_TRADES_LIMIT} 条成交推进
-     * 内存缓存，再归档到 QuestDB，最后用批内全部成交更新进程内的当前 K 线。
+     * 批量处理一个 Kafka poll 批次：把本批最后 {@value #RECENT_TRADES_LIMIT} 条成交推进
+     * 内存缓存并放入待写队列，再用批内全部成交更新进程内的当前分钟线。
      *
-     * <p>K 线不在消费线程落库：每个 bucket 的最新快照先放进内存，由后台线程按
-     * {@code app.marketdata.kline-flush-interval-ms}（默认 1000ms）整批刷新到 QuestDB。
-     * 进程崩溃时最多丢失一个刷新间隔内已提交 offset 的 K 线增量。
+     * <p>成交明细与 K 线都不在消费线程落库：成交队列和每个 bucket 的最新 K 线快照先放进
+     * 内存，由后台线程按 {@code app.marketdata.kline-flush-interval-ms}（默认 1000ms）
+     * 整批刷新到 QuestDB。进程崩溃时最多丢失一个刷新间隔内已提交 offset 的增量。
      *
-     * <p>分区 + offset 是 K 线的幂等水位：同一条 Kafka 记录重投时跳过已聚合的周期。
+     * <p>逐笔只更新分钟线；分钟线完成后由后台聚合到更高周期。
+     * 分区 + offset 是 K 线的幂等水位：同一条 Kafka 记录重投时跳过已聚合的周期。
      *
      * @param records 同一批次内的行情记录（按消费顺序）
      */

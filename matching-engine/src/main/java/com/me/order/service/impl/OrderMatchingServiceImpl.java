@@ -118,8 +118,8 @@ public class OrderMatchingServiceImpl implements OrderMatchingService {
 
         for (Trade trade : result.trades()) {
             matchPairEvents.add(toMatchPair(trade, executedAt));
-
-            OrderTradeApplyResult cleared = orderService.onTrade(toTradeEvent(trade, executedAt));
+            TradeEvent tradeEvent = toTradeEvent(trade, executedAt);
+            OrderTradeApplyResult cleared = orderService.onTrade(tradeEvent);
             if (cleared.handled()) {
                 settlementCommands.addAll(cleared.settlementCommands());
                 historyEvents.addAll(cleared.historyEvents());

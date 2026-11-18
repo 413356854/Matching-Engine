@@ -126,13 +126,14 @@ public class KafkaConsumerConfiguration {
 
         // 下单入口已改为批量消息：每条 record 是一个 OrderCommandBatch（≤2000 条命令），
         // 使用 batch-max-poll-records，避免一个事务处理过多元素。批次业务由
-        // OrderOperationService 全局锁串行，批内仍逐条提交共享的 orderOperationExecutor。
+        // OrderOperationService 全局锁串行，批内顺序执行（线程池并发收益为负，
+        // 已移除 orderOperationExecutor）。
         all.addAll(createRunners(properties, clientFactory,
                 "order-command", "order-commands", "order",
                 OrderCommandBatch.class, true, orderCommandListener::onCommand));
 
-        // 冻结回执批次业务同样由 OrderOperationService 全局锁串行；批内先并发更新委托，
-        // 再在引擎对象锁内聚合撮合、并发清算。
+        // 冻结回执批次业务同样由 OrderOperationService 全局锁串行；批内顺序更新委托，
+        // 再在引擎对象锁内聚合撮合、顺序清算。
         all.addAll(createRunners(properties, clientFactory,
                 "order-freeze-result", "order-freeze-results", "order-freeze-result",
                 OrderFreezeResultBatch.class, true, orderFreezeResultListener::onFreezeResult));

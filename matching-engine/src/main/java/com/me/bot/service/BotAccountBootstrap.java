@@ -47,7 +47,6 @@ public class BotAccountBootstrap {
     @EventListener(ApplicationReadyEvent.class)
     public void bootstrap() {
         if (!properties.enabled()) {
-            log.info("bot module disabled (app.bot.enabled=false), skip initial deposits");
             return;
         }
 
@@ -70,15 +69,11 @@ public class BotAccountBootstrap {
             }
             long held = balances.getOrDefault(currency.code(), 0L);
             if (held >= target) {
-                log.info("bot initial deposit already satisfied: userId={}, currency={}, "
-                        + "held={}, target={}", userId, currency.code(), held, target);
                 return;
             }
             long delta = target - held;
             try {
                 String requestId = rechargeService.recharge(userId, currency.code(), delta);
-                log.info("bot initial deposit submitted: userId={}, currency={}, amount={}, "
-                                + "requestId={}", userId, currency.code(), delta, requestId);
             } catch (RuntimeException e) {
                 log.warn("bot initial deposit failed: userId={}, currency={}, amount={}",
                         userId, currency.code(), delta, e);

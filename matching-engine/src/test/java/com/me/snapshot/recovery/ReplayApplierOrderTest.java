@@ -32,8 +32,6 @@ import com.me.shared.order.OrderStatus;
 import com.me.shared.order.OrderType;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.junit.jupiter.api.Test;
 
@@ -114,7 +112,6 @@ class ReplayApplierOrderTest {
 
     private static final class Fixture implements AutoCloseable {
 
-        private final ExecutorService executor = Executors.newFixedThreadPool(2);
         private final OrderServiceImpl orderService = new OrderServiceImpl();
         private final OrderOperationServiceImpl operations;
         private final ReplayInputFetcher fetcher = mock(ReplayInputFetcher.class);
@@ -132,7 +129,6 @@ class ReplayApplierOrderTest {
                     configCache,
                     new OrderMatchingServiceImpl(matchingEngine, orderService),
                     matchingEngine,
-                    executor,
                     new OrderBatchLock(),
                     new OrderEntryLocks(),
                     new OrderFreezeCommandPublisher("freeze"),
@@ -165,7 +161,7 @@ class ReplayApplierOrderTest {
 
         @Override
         public void close() {
-            executor.shutdownNow();
+            // 当前实现使用消费线程顺序执行，没有需要关闭的线程池。
         }
     }
 }

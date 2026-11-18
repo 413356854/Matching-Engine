@@ -5,7 +5,8 @@ package com.me.marketdata.config;
  *
  * <h2>表设计</h2>
  * <ul>
- *   <li>{@code md_trade}：每笔成交一行，指定时间戳 {@code executed_at}，
+ *   <li>{@code md_trade}：每笔成交一行，消费端只保留每个 poll 的最后 50 条样本，
+ *       由后台线程按刷新间隔（默认 1s）批量写入；指定时间戳 {@code executed_at}，
  *       按 {@code (executed_at, symbol, taker_order_id, maker_order_id)} 去重，
  *       消费重投不会产生重复成交。</li>
  *   <li>{@code md_kline}：消费端在内存聚合，后台线程每个刷新间隔（默认 1s）把有变化的

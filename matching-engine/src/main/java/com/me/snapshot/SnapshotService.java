@@ -254,14 +254,6 @@ public class SnapshotService {
             long captureMillis = TimeUnit.NANOSECONDS.toMillis(captureNanos - startNanos);
             long backupId = recordBackup(payload, written, durationMillis);
 
-            log.info("snapshot completed: backupId={}, path={}, accounts={}, orders={}, "
-                            + "books={}, offsets={}, replayCheckpoints={}, accountSeq={}, "
-                            + "orderSeq={}, capture={}ms, total={}ms, checksum={}",
-                    backupId, written.path(), payload.accounts().size(),
-                    payload.orderState().orders().size(), payload.books().size(),
-                    payload.inputOffsets().size(), payload.replayCheckpoints().size(),
-                    payload.accountSeq(), payload.orderSeq(),
-                    captureMillis, durationMillis, written.checksum());
 
             return new SnapshotResult(
                     backupId,
@@ -370,7 +362,6 @@ public class SnapshotService {
                             // 两个模块都停下来后再 flush 一次：合并事务期间可能还有包在途。
                             flushPipelines(deadline);
                             if (internalTopicsDrained(deadline)) {
-                                log.info("snapshot reached quiescence after {} attempt(s)", attempt);
                                 return capture(deadline);
                             }
                         }
@@ -391,12 +382,6 @@ public class SnapshotService {
                         + properties.drainTimeoutMs() + "ms");
             }
             if (attempt % 25 == 0) {
-                log.info("snapshot still draining: attempt={}, inFlight(order={}, account={}), "
-                                + "remaining={}ms",
-                        attempt,
-                        orderCommitPipeline.inFlightPackages(),
-                        accountCommitPipeline.inFlightPackages(),
-                        TimeUnit.NANOSECONDS.toMillis(remainingNanos));
             }
             sleep(Math.min(RETRY_DELAY_MS,
                     Math.max(1L, TimeUnit.NANOSECONDS.toMillis(remainingNanos))));
