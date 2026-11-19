@@ -6,6 +6,7 @@ import com.me.order.dto.OrderCancelBeginResult;
 import com.me.order.dto.OrderCancelContext;
 import com.me.order.dto.OrderCancelPrepareResult;
 import com.me.order.dto.OrderFreezeApplyResult;
+import com.me.order.dto.OrderLookupRecord;
 import com.me.order.dto.OrderStateSnapshot;
 import com.me.order.dto.OrderTradeApplyResult;
 import com.me.order.vo.OrderView;
@@ -104,6 +105,20 @@ public interface OrderService {
      * 按委托号查询；委托不存在时返回 {@code null}。
      */
     OrderView view(long orderId);
+
+    /**
+     * 按 {@code userId + requestId} 查询当前内存中的委托；不存在时返回 {@code null}。
+     *
+     * <p>不限制委托状态：内存中仍保留的 {@code REJECTED} / {@code FILLED} /
+     * {@code CANCELED} 委托也能查到。同一用户重复使用同一个 {@code requestId} 产生多笔
+     * 委托时，返回 {@code orderId} 最大（最新）的一笔。
+     *
+     * <p>本方法只做查询；{@code requestId} 索引不改变演示版“不做 requestId 防重”的重投语义。
+     *
+     * @param userId    用户 ID，必须为正数
+     * @param requestId 请求标识，不能为空
+     */
+    OrderLookupRecord findByRequestId(long userId, String requestId);
 
     /**
      * 查询用户当前未完成的委托（{@code ACCEPTED} / {@code PAID} / {@code PARTIALLY_FILLED}），

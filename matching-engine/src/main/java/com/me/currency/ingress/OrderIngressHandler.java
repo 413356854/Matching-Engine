@@ -33,11 +33,13 @@ final class OrderIngressHandler implements EventHandler<OrderIngressEvent> {
 
     private final int batchSize;
     private final OrderBatchSender sender;
+    private final boolean publishEnabled;
     private final Map<String, List<OrderCommand>> pendingBySymbol = new LinkedHashMap<>();
 
     OrderIngressHandler(OrderIngressProperties properties, OrderBatchSender sender) {
         this.batchSize = properties.batchSize();
         this.sender = sender;
+        this.publishEnabled = properties.publishEnabled();
     }
 
     @Override
@@ -79,6 +81,9 @@ final class OrderIngressHandler implements EventHandler<OrderIngressEvent> {
         }
         Map<String, List<OrderCommand>> batch = new LinkedHashMap<>(pendingBySymbol);
         pendingBySymbol.clear();
+        if (!publishEnabled) {
+            return;
+        }
 
         for (Map.Entry<String, List<OrderCommand>> entry : batch.entrySet()) {
             try {

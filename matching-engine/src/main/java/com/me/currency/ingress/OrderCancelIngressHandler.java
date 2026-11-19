@@ -32,12 +32,14 @@ final class OrderCancelIngressHandler implements EventHandler<OrderCancelIngress
 
     private final int batchSize;
     private final OrderCancelBatchSender sender;
+    private final boolean publishEnabled;
     private final Map<String, List<OrderCancelCommand>> pendingBySymbol = new LinkedHashMap<>();
 
     OrderCancelIngressHandler(OrderCancelIngressProperties properties,
                               OrderCancelBatchSender sender) {
         this.batchSize = properties.batchSize();
         this.sender = sender;
+        this.publishEnabled = properties.publishEnabled();
     }
 
     @Override
@@ -79,6 +81,9 @@ final class OrderCancelIngressHandler implements EventHandler<OrderCancelIngress
         }
         Map<String, List<OrderCancelCommand>> batch = new LinkedHashMap<>(pendingBySymbol);
         pendingBySymbol.clear();
+        if (!publishEnabled) {
+            return;
+        }
 
         for (Map.Entry<String, List<OrderCancelCommand>> entry : batch.entrySet()) {
             try {

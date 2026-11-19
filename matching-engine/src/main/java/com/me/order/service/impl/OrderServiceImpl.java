@@ -8,6 +8,7 @@ import com.me.order.dto.OrderCancelBeginResult;
 import com.me.order.dto.OrderCancelContext;
 import com.me.order.dto.OrderCancelPrepareResult;
 import com.me.order.dto.OrderFreezeApplyResult;
+import com.me.order.dto.OrderLookupRecord;
 import com.me.order.dto.OrderSnapshot;
 import com.me.order.dto.OrderStateSnapshot;
 import com.me.order.dto.OrderTradeApplyResult;
@@ -51,6 +52,9 @@ import org.springframework.stereotype.Service;
  * 拒绝。Kafka 事务正常提交时不会重复；事务回滚后的重投可能丢结算命令，这是演示版的取舍。
  * 后续会补备份消息与内存状态恢复，再替换成持久化幂等/重放。
  *
+ * <p>{@code userId + requestId → 最新 orderId} 的索引只服务于按 requestId 查询，
+ * 不参与防重：同一 requestId 重复下单仍会生成新委托，索引返回其中最新的一笔。
+ *
  * <p><b>冻结金额</b>：限价买单冻结计价币 {@code price × quantity}；市价买入冻结前端提交的
  * 计价币预算 {@code amount}（参考价 × 1.05 × 数量），撮合完成后未用完的部分退回；卖单冻结
  * 基础币 {@code quantity}。
@@ -76,6 +80,15 @@ public class OrderServiceImpl implements OrderService {
     private static final String FREEZE_REQUEST_PREFIX = "order-freeze:";
 
     private final ConcurrentHashMap<Long, Order> orders = new ConcurrentHashMap<>();
+
+    /**
+     * 按 requestId 查询的辅助索引：{@code (userId, requestId) → 最新的 orderId}。
+     *
+     * <p>同一 requestId 重复下单会生成多个 orderId，这里用 {@code Math.max} 保留最新一笔，
+     * 与历史查询 {@code ORDER BY final_at DESC, order_id DESC LIMIT 1} 的口径一致。
+     * 索引是派生数据，不进入快照；{@link #restoreState} 时按恢复后的委托重建。
+     */
+    private final ConcurrentHashMap<RequestKey, Long> orderIdsByRequest = new ConcurrentHashMap<>();
 
     /**
      * 成交结算 requestId 生成器：演示版用当前毫秒时间戳起步的进程内计数器，避免每笔成交
@@ -140,14 +153,57 @@ public class OrderServiceImpl implements OrderService {
         if (existing != null) {
             if (existing.requestId().equals(command.requestId())) {
                 // 同一 orderId + requestId 重投：返回当前状态，必要时重发冻结。
+                indexByRequest(existing);
                 return successOf(existing);
             }
             log.warn("order rejected, orderId already exists: orderId={}, requestId={}",
                     command.orderId(), command.requestId());
             return OrderApplyResult.rejected("ORDER_ID_ALREADY_EXISTS");
         }
+        indexByRequest(order);
 
         return successOf(order);
+    }
+
+    @Override
+    public OrderLookupRecord findByRequestId(long userId, String requestId) {
+        if (userId <= 0) {
+            return null;
+        }
+        String normalizedRequestId = normalizeRequestId(requestId);
+        if (normalizedRequestId == null) {
+            return null;
+        }
+        Long orderId = orderIdsByRequest.get(new RequestKey(userId, normalizedRequestId));
+        if (orderId == null) {
+            return null;
+        }
+        Order order = orders.get(orderId);
+        if (order == null || order.userId() != userId
+                || !normalizedRequestId.equals(normalizeRequestId(order.requestId()))) {
+            return null;
+        }
+        return order.toLookupRecord();
+    }
+
+    /** 把委托写入 requestId 查询索引；同一 requestId 保留最新（orderId 最大）的一笔。 */
+    private void indexByRequest(Order order) {
+        String normalizedRequestId = normalizeRequestId(order.requestId());
+        if (normalizedRequestId == null) {
+            return;
+        }
+        orderIdsByRequest.merge(
+                new RequestKey(order.userId(), normalizedRequestId),
+                order.orderId(),
+                Math::max);
+    }
+
+    private static String normalizeRequestId(String requestId) {
+        if (requestId == null) {
+            return null;
+        }
+        String normalized = requestId.strip();
+        return normalized.isEmpty() ? null : normalized;
     }
 
     @Override
@@ -634,6 +690,10 @@ public class OrderServiceImpl implements OrderService {
         }
         orders.clear();
         orders.putAll(restored);
+        orderIdsByRequest.clear();
+        for (Order order : restored.values()) {
+            indexByRequest(order);
+        }
         tradeSettlementIdGenerator.set(state.tradeSettlementIdGenerator());
     }
 
@@ -704,6 +764,10 @@ public class OrderServiceImpl implements OrderService {
         return null;
     }
 
+    /** requestId 查询索引的键：用户内 requestId 唯一。 */
+    private record RequestKey(long userId, String requestId) {
+    }
+
     private record Order(
             String requestId,
             long orderId,
@@ -769,6 +833,13 @@ public class OrderServiceImpl implements OrderService {
             return new OrderView(
                     orderId, userId, symbol, side, type, price, quantity, filledQuantity,
                     frozenCurrency, frozenAmount, status, seq, createdAt);
+        }
+
+        private OrderLookupRecord toLookupRecord() {
+            return new OrderLookupRecord(
+                    orderId, requestId, userId, symbol, side, type, status, price, quantity,
+                    filledQuantity, frozenCurrency, frozenAmount, priceScale, quantityScale,
+                    quoteScale, seq, createdAt, finalAt);
         }
 
         /**

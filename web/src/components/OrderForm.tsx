@@ -1,13 +1,13 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import {
   ApiError,
-  placeOrder,
   type AccountBalance,
   type OrderSide,
   type OrderType,
   type TradingPair,
 } from '../api';
 import { describeError, describeReason } from '../errors';
+import { useTradeSocket } from '../hooks/useTradeSocket';
 import {
   MARKET_BUY_BUFFER_DENOMINATOR,
   MARKET_BUY_BUFFER_NUMERATOR,
@@ -74,6 +74,7 @@ export function OrderForm({
   const [submitting, setSubmitting] = useState(false);
   const [result, setResult] = useState<OrderResult | null>(null);
   const requestIdRef = useRef<string | null>(null);
+  const tradeSocket = useTradeSocket(userId);
 
   const symbol = pair?.symbol;
 
@@ -351,7 +352,7 @@ export function OrderForm({
 
     setSubmitting(true);
     try {
-      const response = await placeOrder({
+      const response = await tradeSocket.placeOrder({
         requestId,
         userId,
         symbol: pair.symbol,
@@ -368,7 +369,7 @@ export function OrderForm({
 
       requestIdRef.current = null;
       const title = `委托命令已提交 · #${response.orderId}`;
-      const detail = '下单命令已写入 Kafka，等待资金冻结与撮合结果';
+      const detail = '下单命令已进入交易入口，等待资金冻结与撮合结果';
       setResult({ kind: 'success', title, detail });
       notify('success', `委托命令已提交：${side === 'BUY' ? '买入' : '卖出'} ${formatQuantity(
         quantityNumber,
@@ -383,7 +384,7 @@ export function OrderForm({
         title: '下单失败',
         detail:
           code === 'ORDER_COMMAND_PUBLISH_FAILED'
-            ? `${describeReason(code)}。点击提交会复用同一个 requestId 重试。`
+            ? `${describeReason(code)}。请先查询委托状态，确认未提交后再重试。`
             : message,
         code,
       });
@@ -569,7 +570,7 @@ export function OrderForm({
         </button>
 
         <p className="idempotency-hint">
-          提交时自动生成 requestId；网络异常重试会复用同一个幂等键。
+          提交时自动生成 requestId 用于关联异步回执；超时或网络异常请先查询委托，不要自动重试。
         </p>
       </form>
 

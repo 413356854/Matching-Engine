@@ -21,8 +21,11 @@ import org.springframework.stereotype.Component;
 @Component
 public class QuestDbIngestClient {
 
-    /** 单批等待 QuestDB ack 的上限；超时抛异常，Kafka 事务回滚并重投。 */
-    static final long ACK_TIMEOUT_MS = 30_000;
+    /**
+     * 单批等待 QuestDB ack 的上限；超时抛异常，Kafka 事务回滚并重投。
+     * 1M 级历史/流水归档时 QWP 可能排队超过 30s，放宽到 120s；仍超时才 fatal。
+     */
+    static final long ACK_TIMEOUT_MS = 120_000;
 
     private final QuestDB db;
     private final boolean enabled;
@@ -61,8 +64,7 @@ public class QuestDbIngestClient {
         try (Sender sender = db.borrowSender()) {
             writer.accept(sender);
             long fsn = sender.flushAndGetSequence();
-            boolean acked = sender.awaitAckedFsn(fsn, ACK_TIMEOUT_MS);
-            if (!acked) {
+            if (!sender.awaitAckedFsn(fsn, ACK_TIMEOUT_MS)) {
                 throw new IllegalStateException(
                         "QuestDB QWP batch was not acknowledged within " + ACK_TIMEOUT_MS + " ms");
             }

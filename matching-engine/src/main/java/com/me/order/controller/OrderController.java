@@ -1,11 +1,15 @@
 package com.me.order.controller;
 
+import com.me.currency.service.OrderHistoryLookupService;
+import com.me.order.dto.OrderLookupRecord;
 import com.me.order.service.OrderService;
 import com.me.order.vo.OrderHistoryQueryView;
 import com.me.order.vo.OrderHistoryView;
+import com.me.order.vo.OrderLookupView;
 import com.me.order.vo.OrderQueryView;
 import com.me.order.vo.OrderView;
 import com.me.shared.order.OrderHistoryQueryPort;
+import com.me.shared.order.OrderHistoryRecord;
 import java.util.List;
 import java.util.Locale;
 import org.slf4j.Logger;
@@ -30,6 +34,11 @@ import org.springframework.web.bind.annotation.RestController;
  * <p>{@code GET /api/v1/orders/history?userId=...&symbol=...&limit=...} 通过 shared 的
  * {@link OrderHistoryQueryPort} 查询 QuestDB {@code ord_history} 中已撤单 / 已撮合完成的委托，
  * 按最终时间倒序。委托模块不直接访问该表，QuestDB 访问层由 admin 模块负责。
+ *
+ * <p>{@code GET /api/v1/orders/by-request-id?userId=...&requestId=...} 按 requestId 查询
+ * 一笔委托：先查委托模块内存中的当前委托（任意状态，含 {@code REJECTED}），未命中再通过
+ * 币币模块的 {@link OrderHistoryLookupService} 查 QuestDB 历史委托；两处都没有返回 404
+ * {@code ORDER_NOT_FOUND}。
  */
 @RestController
 @RequestMapping("/api/v1/orders")
@@ -38,14 +47,18 @@ public class OrderController {
     private static final Logger log = LoggerFactory.getLogger(OrderController.class);
 
     private static final int MAX_SYMBOL_LENGTH = 32;
+    private static final int MAX_REQUEST_ID_LENGTH = 128;
 
     private final OrderService orderService;
     private final OrderHistoryQueryPort historyQueryPort;
+    private final OrderHistoryLookupService historyLookupService;
 
     public OrderController(OrderService orderService,
-                           OrderHistoryQueryPort historyQueryPort) {
+                           OrderHistoryQueryPort historyQueryPort,
+                           OrderHistoryLookupService historyLookupService) {
         this.orderService = orderService;
         this.historyQueryPort = historyQueryPort;
+        this.historyLookupService = historyLookupService;
     }
 
     /**
@@ -81,6 +94,52 @@ public class OrderController {
 
         List<OrderView> orders = orderService.openOrders(userId, normalizedSymbol, limit);
         return ResponseEntity.ok(OrderQueryView.success(userId, normalizedSymbol, orders));
+    }
+
+    /**
+     * 按 requestId 查询一笔委托：先查内存中的当前委托，再查 QuestDB 历史委托。
+     *
+     * <p>当前委托不限制状态，因此冻结失败变成 {@code REJECTED} 的委托也能查到；历史委托
+     * 只包含 {@code CANCELED} / {@code FILLED}。两处都没有时返回 404 + {@code ORDER_NOT_FOUND}。
+     */
+    @GetMapping("/by-request-id")
+    public ResponseEntity<OrderLookupView> byRequestId(
+            @RequestParam(name = "userId", required = false) Long userId,
+            @RequestParam(name = "requestId", required = false) String requestId) {
+        if (userId == null) {
+            return lookupBadRequest("USER_ID_REQUIRED");
+        }
+        if (userId <= 0) {
+            return lookupBadRequest("USER_ID_INVALID");
+        }
+        String normalizedRequestId = requestId == null ? null : requestId.strip();
+        if (normalizedRequestId == null || normalizedRequestId.isEmpty()) {
+            return lookupBadRequest("REQUEST_ID_REQUIRED");
+        }
+        if (normalizedRequestId.length() > MAX_REQUEST_ID_LENGTH) {
+            return lookupBadRequest("REQUEST_ID_INVALID");
+        }
+
+        OrderLookupRecord current = orderService.findByRequestId(userId, normalizedRequestId);
+        if (current != null) {
+            return ResponseEntity.ok(OrderLookupView.current(current));
+        }
+
+        try {
+            OrderHistoryRecord history =
+                    historyLookupService.findByRequestId(userId, normalizedRequestId);
+            if (history != null) {
+                return ResponseEntity.ok(OrderLookupView.history(history));
+            }
+        } catch (DataAccessException e) {
+            log.error("order lookup by requestId failed: userId={}, requestId={}",
+                    userId, normalizedRequestId, e);
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                    .body(OrderLookupView.rejected("QUERY_FAILED"));
+        }
+
+        return ResponseEntity.status(HttpStatus.NOT_FOUND)
+                .body(OrderLookupView.notFound(userId, normalizedRequestId));
     }
 
     /**
@@ -140,5 +199,9 @@ public class OrderController {
     private static ResponseEntity<OrderQueryView> orderBadRequest(
             long userId, String symbol, String reason) {
         return ResponseEntity.badRequest().body(OrderQueryView.rejected(userId, symbol, reason));
+    }
+
+    private static ResponseEntity<OrderLookupView> lookupBadRequest(String reason) {
+        return ResponseEntity.badRequest().body(OrderLookupView.rejected(reason));
     }
 }

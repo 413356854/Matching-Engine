@@ -17,4 +17,10 @@ public interface OrderCancelIngress {
      * @throws IllegalStateException ring 未启动或已满；调用方（controller）应返回 503
      */
     void submit(OrderCancelCommand command);
+
+    /**
+     * 非阻塞入队并返回结果，供 Aeron 消费者区分 ring 满、未启动和异常。
+     * 本方法不抛出入队异常（未预期异常返回 {@link IngressSubmitResult#ERROR}）。
+     */
+    IngressSubmitResult trySubmit(OrderCancelCommand command);
 }

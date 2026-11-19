@@ -161,6 +161,30 @@ public class OrderHistoryRepository {
                 params.toArray());
     }
 
+    /**
+     * 按 {@code userId + requestId} 查询一条历史委托，按最终时间倒序取最新一条。
+     *
+     * <p>{@code request_id} 是普通 STRING 列（不是 SYMBOL），这里先走 {@code user_id}
+     * 的 symbol 索引缩小范围，再按 request_id 过滤；只用于按请求标识做点查，不是高频列表查询。
+     *
+     * @return 命中的历史行；不存在返回 {@code null}
+     */
+    public OrderHistoryRow findByRequestId(long userId, String requestId) {
+        ensureTable();
+        String sql = """
+                SELECT order_id, request_id, user_id, symbol, side, type, status, price, quantity,
+                       filled_quantity, frozen_currency, frozen_amount, price_scale,
+                       quantity_scale, quote_scale, seq, created_at, final_at
+                FROM ord_history
+                WHERE user_id = ? AND request_id = ?
+                ORDER BY final_at DESC, order_id DESC
+                LIMIT 1
+                """;
+        List<OrderHistoryRow> rows = jdbcTemplate.query(sql, OrderHistoryRepository::mapRow,
+                String.valueOf(userId), requestId);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
     private static OrderHistoryRow mapRow(ResultSet rs, int rowNum) throws SQLException {
         return new OrderHistoryRow(
                 rs.getLong("order_id"),

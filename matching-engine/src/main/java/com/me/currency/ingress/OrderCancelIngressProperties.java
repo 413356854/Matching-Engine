@@ -9,12 +9,14 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
  * @param ringSize        ring 槽位数，必须是 2 的幂；HTTP 线程非阻塞入队，满时返回 503
  * @param batchSize       单个 symbol 的待发送撤单达到该数量后立即 flush 整个 map
  * @param flushIntervalMs 聚合时间窗口：定时 tick 到达时 flush 整个 map
+ * @param publishEnabled  是否把聚合后的批次发送到 Kafka；false 时只 drain ring
  */
 @ConfigurationProperties("app.currency.cancel-ingress")
 public record OrderCancelIngressProperties(
         @DefaultValue("65536") int ringSize,
         @DefaultValue("1000") int batchSize,
-        @DefaultValue("20") long flushIntervalMs) {
+        @DefaultValue("20") long flushIntervalMs,
+        @DefaultValue("true") boolean publishEnabled) {
 
     public OrderCancelIngressProperties {
         if (ringSize <= 0 || Integer.bitCount(ringSize) != 1) {

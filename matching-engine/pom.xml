@@ -20,6 +20,10 @@
     <properties>
         <java.version>21</java.version>
         <mybatis-plus.version>3.5.18.1</mybatis-plus.version>
+        <!-- Aeron：WS 下单/撤单与币币模块之间的同机 IPC 传输 -->
+        <aeron.version>1.44.1</aeron.version>
+        <!-- SBE：WS 交易二进制协议；生成代码在 target/generated-sources/sbe -->
+        <sbe.version>1.32.0</sbe.version>
     </properties>
 
     <dependencies>
@@ -99,6 +103,26 @@
             <artifactId>disruptor</artifactId>
             <version>4.0.0</version>
         </dependency>
+
+        <!-- Aeron：WebSocket 交易端点 → 币币 ingress 的同机 IPC 传输。
+             client 用于 publication/subscription，driver 用于内嵌 media driver。 -->
+        <dependency>
+            <groupId>io.aeron</groupId>
+            <artifactId>aeron-client</artifactId>
+            <version>${aeron.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.aeron</groupId>
+            <artifactId>aeron-driver</artifactId>
+            <version>${aeron.version}</version>
+        </dependency>
+
+        <!-- SBE：WS 交易二进制协议生成器；生成代码只依赖 Agrona（Aeron 已引入） -->
+        <dependency>
+            <groupId>uk.co.real-logic</groupId>
+            <artifactId>sbe-tool</artifactId>
+            <version>${sbe.version}</version>
+        </dependency>
     </dependencies>
 
     <build>
@@ -106,6 +130,60 @@
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+            <!-- 生成 SBE codec：inline 到 target/generated-sources/sbe 并加入编译源 -->
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>exec-maven-plugin</artifactId>
+                <version>3.5.0</version>
+                <executions>
+                    <execution>
+                        <id>generate-sbe</id>
+                        <phase>generate-sources</phase>
+                        <goals>
+                            <goal>java</goal>
+                        </goals>
+                        <configuration>
+                            <mainClass>uk.co.real_logic.sbe.SbeTool</mainClass>
+                            <arguments>
+                                <argument>${project.basedir}/src/main/resources/sbe/trade-ws.xml</argument>
+                            </arguments>
+                            <systemProperties>
+                                <systemProperty>
+                                    <key>sbe.output.dir</key>
+                                    <value>${project.build.directory}/generated-sources/sbe</value>
+                                </systemProperty>
+                                <systemProperty>
+                                    <key>sbe.target.language</key>
+                                    <value>Java</value>
+                                </systemProperty>
+                                <systemProperty>
+                                    <key>sbe.validation.stop.on.error</key>
+                                    <value>true</value>
+                                </systemProperty>
+                            </systemProperties>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>build-helper-maven-plugin</artifactId>
+                <version>3.6.0</version>
+                <executions>
+                    <execution>
+                        <id>add-sbe-sources</id>
+                        <phase>generate-sources</phase>
+                        <goals>
+                            <goal>add-source</goal>
+                        </goals>
+                        <configuration>
+                            <sources>
+                                <source>${project.build.directory}/generated-sources/sbe</source>
+                            </sources>
+                        </configuration>
+                    </execution>
+                </executions>
             </plugin>
         </plugins>
     </build>

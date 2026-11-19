@@ -8,6 +8,7 @@ loadtest/out/
 loadtest/*.java
 loadtest/*.class
 loadtest/*.ps1
+loadtest/*-window.txt
 loadtest/TEST-REPORT*.md
 # 汇总报告需要保留在仓库中
 !loadtest/TEST-REPORT.md

@@ -1,7 +1,6 @@
 import { useMemo, useState } from 'react';
 import {
   ApiError,
-  cancelOrder,
   type FundsFlow,
   type OrderHistory,
   type OrderStatus,
@@ -11,6 +10,7 @@ import {
 } from '../api';
 import { describeError } from '../errors';
 import { formatDateTime, formatPrice, formatQuantity, formatUnits } from '../format';
+import { useTradeSocket } from '../hooks/useTradeSocket';
 import { RefreshIcon } from './icons';
 import type { ToastKind } from './ToastStack';
 
@@ -100,6 +100,7 @@ export function AccountActivityPanel({
   const [tab, setTab] = useState<ActivityTab>('orders');
   const [cancelingOrderId, setCancelingOrderId] = useState<number | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  const tradeSocket = useTradeSocket(userId);
 
   const pairMap = useMemo(
     () => new Map(pairs.map((item) => [item.symbol, item])),
@@ -117,7 +118,7 @@ export function AccountActivityPanel({
     }
     setCancelingOrderId(order.orderId);
     try {
-      const response = await cancelOrder({
+      const response = await tradeSocket.cancelOrder({
         requestId: crypto.randomUUID(),
         userId,
         symbol: order.symbol,

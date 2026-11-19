@@ -102,21 +102,34 @@ public final class OrderCancelIngressRing implements OrderCancelIngress, SmartLi
 
     @Override
     public void submit(OrderCancelCommand command) {
+        IngressSubmitResult result = trySubmit(command);
+        switch (result) {
+            case ACCEPTED -> {
+            }
+            case NOT_RUNNING -> throw new IllegalStateException(
+                    "order cancel ingress ring is not running");
+            case FULL -> throw new IllegalStateException(
+                    "order cancel ingress ring is full: capacity="
+                            + properties.ringSize() + ", orderId=" + command.orderId());
+            case ERROR -> throw new IllegalStateException(
+                    "failed to enqueue order cancel command: orderId=" + command.orderId());
+        }
+    }
+
+    @Override
+    public IngressSubmitResult trySubmit(OrderCancelCommand command) {
         RingBuffer<OrderCancelIngressEvent> buffer = ringBuffer;
         if (!running || buffer == null) {
-            throw new IllegalStateException("order cancel ingress ring is not running");
+            return IngressSubmitResult.NOT_RUNNING;
         }
-        boolean published;
         try {
-            published = buffer.tryPublishEvent(
+            boolean published = buffer.tryPublishEvent(
                     (event, sequence, cancel) -> event.set(cancel), command);
+            return published ? IngressSubmitResult.ACCEPTED : IngressSubmitResult.FULL;
         } catch (RuntimeException e) {
-            throw new IllegalStateException(
-                    "failed to enqueue order cancel command: orderId=" + command.orderId(), e);
-        }
-        if (!published) {
-            throw new IllegalStateException("order cancel ingress ring is full: capacity="
-                    + properties.ringSize() + ", orderId=" + command.orderId());
+            log.error("failed to enqueue order cancel command: orderId={}",
+                    command.orderId(), e);
+            return IngressSubmitResult.ERROR;
         }
     }
 

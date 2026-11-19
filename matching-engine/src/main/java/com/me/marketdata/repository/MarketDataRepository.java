@@ -322,7 +322,8 @@ public class MarketDataRepository {
     public List<Kline> findKlinesBetween(String symbol, KlineInterval interval,
                                          Instant from, Instant to) {
         ensureTables();
-        return jdbcTemplate.query(SELECT_KLINES_BETWEEN_SQL, MarketDataRepository::mapKline,
+        return jdbcTemplate.query(
+                SELECT_KLINES_BETWEEN_SQL, MarketDataRepository::mapKline,
                 symbol, interval.label(), Timestamp.from(from), Timestamp.from(to));
     }
 
@@ -333,8 +334,9 @@ public class MarketDataRepository {
      */
     public Kline findLatestKline(String symbol, KlineInterval interval) {
         ensureTables();
-        List<Kline> rows = jdbcTemplate.query(SELECT_LATEST_KLINE_SQL,
-                MarketDataRepository::mapKline, symbol, interval.label());
+        List<Kline> rows = jdbcTemplate.query(
+                SELECT_LATEST_KLINE_SQL, MarketDataRepository::mapKline,
+                symbol, interval.label());
         return rows.isEmpty() ? null : rows.get(0);
     }
 
@@ -479,4 +481,5 @@ public class MarketDataRepository {
             tablesReady = true;
         }
     }
+
 }

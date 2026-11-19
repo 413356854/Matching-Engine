@@ -662,6 +662,53 @@ export async function fetchOrderHistory(
   return body.orders ?? [];
 }
 
+/**
+ * 按 requestId 查询委托：先查当前委托，再查历史委托。
+ *
+ * <p>两处都没有时后端返回 404，`request` 会抛出 reason=ORDER_NOT_FOUND 的 ApiError；
+ * 成功时 `source` 为 CURRENT 或 HISTORY。
+ */
+export interface OrderLookup {
+  success: boolean;
+  reason: string | null;
+  source: 'CURRENT' | 'HISTORY' | null;
+  orderId: number | null;
+  requestId: string | null;
+  userId: number | null;
+  symbol: string | null;
+  side: OrderSide | null;
+  type: OrderType | null;
+  status: OrderStatus | null;
+  price: number;
+  quantity: number;
+  filledQuantity: number;
+  frozenCurrency: string | null;
+  frozenAmount: number;
+  priceScale: number;
+  quantityScale: number;
+  quoteScale: number;
+  seq: number;
+  /** ISO-8601，UTC。 */
+  createdAt: string | null;
+  /** 进入终态的时间；当前未完成委托为 null。 */
+  finalAt: string | null;
+}
+
+export function fetchOrderByRequestId(
+  userId: number,
+  requestId: string,
+  signal?: AbortSignal,
+): Promise<OrderLookup> {
+  const query = new URLSearchParams({
+    userId: String(userId),
+    requestId,
+  });
+  return request<OrderLookup>(
+    `/api/v1/orders/by-request-id?${query.toString()}`,
+    { signal },
+  );
+}
+
 interface UserTradeHistoryQueryResponse {
   success: boolean;
   reason: string | null;

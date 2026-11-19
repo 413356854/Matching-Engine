@@ -19,7 +19,7 @@
 | 语言 / 运行时 | Java（JDK） | **21 (LTS)** | 编译与运行统一 `--release 21`；Spring Boot 4.1.2 要求 JDK **≥ 17**、兼容至 **27** |
 | 应用框架 | Spring Boot | **4.1.2** | 当前 GA 稳定版（2026-10-23 发布），依赖 Spring Framework **7.0.10+**；负责单体启动、DI、配置 |
 | 构建工具 | Maven | **3.6.3+** | Spring Boot 4.1.2 官方最低要求；本机验证 3.9.11 |
-| 接入层 | Spring MVC / Spring WebSocket / Netty | — | REST 下单、交易对/余额/行情查询、管理端充值已实现（`/api/v1`）；盘口 WebSocket 实时推送已实现（`/ws/orderbook`）；Netty TCP 网关（规划） |
+| 接入层 | Spring MVC / Spring WebSocket / Netty | — | REST 下单、交易对/余额/行情查询、管理端充值已实现（`/api/v1`）；盘口 WebSocket 实时推送已实现（`/ws/orderbook`）；WebSocket 下单/撤单已实现（`/ws/trade`，Aeron IPC）；Netty TCP 网关（规划） |
 | 消息 / 持久化 | Apache Kafka | broker **4.4.0** / client **4.2.2** | 直接使用 `org.apache.kafka:kafka-clients`（不引入 Spring Kafka）；冻结回执、单用户结算与行情事件，详见「持久化组件（当前实现与规划）」；本地单节点已装，见「本地 Kafka 环境（4.4.0）」 |
 | 查询投影 | QuestDB（当前）/ ClickHouse / PostgreSQL | — | 异步写入，不进撮合热路径 |
 | 前端 | React + Vite + lightweight-charts | — | `web/` 演示前端（已实现）：币币交易（交易对、余额、下单、多周期 K 线、最新成交）+ 后台管理（流水管理、委托历史、成交记录、K 线管理） |
@@ -46,7 +46,7 @@
 | ⑤ | **结算中心** | `com.me.settlement` | （规划）双边记账、手续费、资金划转、清算幂等、日终对账；当前仅保留包结构，结算逻辑在 account / order 内 | 规划 | account、order |
 | ⑥ | **行情模块** | `com.me.marketdata` | 消费撮合对、K 线聚合、成交 / 深度查询；落 QuestDB | `MarketDataListener`、`MarketDataService`、`MarketDataRepository`、`KlineAggregator` | 撮合对事件（order → marketdata） |
 
-另有 `com.me.websocket`：演示用 WebSocket 盘口推送接入层（**不是业务模块**），只读查询撮合引擎订单簿并向浏览器推送，协议见「WebSocket 盘口实时推送」。
+另有 `com.me.websocket`：演示用 WebSocket 接入层（**不是业务模块**）。`/ws/orderbook` 只读查询撮合引擎订单簿并向浏览器推送；`/ws/trade` 通过 Aeron IPC 把客户端下单/撤单交给币币模块，不直接依赖 `currency` / `order`，协议见「WebSocket 盘口实时推送」与「WebSocket 下单 / 撤单」。
 
 ### 依赖方向（单向，无环）
 
@@ -56,7 +56,7 @@
 - `matching` → 只依赖 `shared` 的命令/事件 DTO；**纯 JDK、零 Spring、零 Kafka**，不依赖 account / order / settlement
 - `settlement` → `account`、`order`
 - `marketdata` → 订阅 `order` 进程内撮合后输出的撮合对事件（只认 `shared` 事件类型）
-- `websocket`（演示接入层，非业务模块）→ 只读调用撮合引擎 `MatchingEngine.depth()`，向前端推送盘口；不修改订单簿、不走 Kafka、不落库
+- `websocket`（演示接入层，非业务模块）→ 盘口端点只读调用撮合引擎 `MatchingEngine.depth()`；交易端点只发布 `shared` 的 Aeron 下单/撤单契约，不 import `currency` / `order`，不直接修改委托或账户，也不落库
 - `admin` → `account.service`（管理端充值）、`currency.service`（币种校验），消费撮合对事件归档用户成交；只调 service 接口，不直接访问对方 mapper / entity
 
 ### 模块边界规则
@@ -622,6 +622,52 @@ curl "http://localhost:8080/api/v1/orders?userId=1001&limit=20"
 
 错误响应（400）：`USER_ID_REQUIRED` / `USER_ID_INVALID` / `SYMBOL_INVALID` / `LIMIT_INVALID`。
 
+### 按 requestId 查询委托
+
+`GET /api/v1/orders/by-request-id?userId=1001&requestId=req-1`
+
+- `userId` / `requestId` 必填；`requestId` 最长 128 字符。
+- 先查委托模块内存中的当前委托（任意状态，包含 `REJECTED`，以及仍在内存中的已成交 /
+  已撤销委托），未命中再通过币币模块的 `OrderHistoryLookupService` 查询 QuestDB
+  `ord_history`。两处都没有返回 **404 + `ORDER_NOT_FOUND`**。
+- 响应 `source` 表示命中位置：`CURRENT`（当前内存）或 `HISTORY`（已归档终态）。
+- 同一用户重复使用同一 `requestId` 时返回 `orderId` 最大（最新）的一笔；当前委托的
+  `finalAt` 只在终态时非空，历史委托只包含 `CANCELED` / `FILLED`。
+- 参数非法返回 400（`USER_ID_REQUIRED` / `USER_ID_INVALID` / `REQUEST_ID_REQUIRED` /
+  `REQUEST_ID_INVALID`）；QuestDB 不可用时返回 503 `QUERY_FAILED`。
+
+```bash
+curl "http://localhost:8080/api/v1/orders/by-request-id?userId=1001&requestId=req-1"
+```
+
+响应示例（当前委托）：
+
+```json
+{
+  "success": true,
+  "reason": null,
+  "source": "CURRENT",
+  "orderId": 1794568772000001,
+  "requestId": "req-1",
+  "userId": 1001,
+  "symbol": "BTC-USDT",
+  "side": "BUY",
+  "type": "LIMIT",
+  "status": "ACCEPTED",
+  "price": 50000,
+  "quantity": 2,
+  "filledQuantity": 0,
+  "frozenCurrency": "USDT",
+  "frozenAmount": 100000,
+  "priceScale": 2,
+  "quantityScale": 8,
+  "quoteScale": 6,
+  "seq": 1,
+  "createdAt": "2026-11-18T00:00:00Z",
+  "finalAt": null
+}
+```
+
 ### 撤单
 
 `POST /api/v1/currency/orders/cancel`（币币模块）。`symbol` 与 `orderId` 由前端提供，
@@ -685,7 +731,8 @@ curl -X POST http://localhost:8080/api/v1/currency/orders/cancel \
 
 下单后的可观测信号：`me.match-pair-batch` 可消费到撮合对，`me.account.settlements-batch`
 可消费到结算命令，`me.orders` / `me.trades` 不再有新增消息。未充值或余额不足时，委托状态为
-`REJECTED`，不会撮合，可通过 `GET /api/v1/orders` 查询。
+`REJECTED`，不会撮合，可通过 `GET /api/v1/orders/by-request-id?userId=...&requestId=...`
+查询（当前内存委托包含 `REJECTED`；`GET /api/v1/orders` 只返回未完成委托）。
 下单接口每次请求都由服务端生成新的 `orderId`，重复发送同一个 `requestId` 会产生新委托；
 委托模块内部的 `orderId + requestId` 去重只对直接写 Kafka 的外部生产者生效。
 
@@ -1037,13 +1084,107 @@ curl "http://localhost:8080/api/v1/marketdata/orderbook?symbol=BTC-USDT&depth=5"
 - `depth` 缺省 `app.websocket.default-depth`（20），超过 `app.websocket.max-depth`（100）按上限截断；
 - `symbol` 统一转大写，校验规则与 REST 订单簿接口一致；
 - 会话发送统一包装为 `ConcurrentWebSocketSessionDecorator`，发送超时 / 缓冲超限的慢连接会被断开；
-- 本模块只读，订单簿仍由委托模块进程内写入，推送不经过 Kafka，也不写 QuestDB。
+- 盘口推送只读：订单簿仍由委托模块进程内写入，推送不经过 Kafka，也不写 QuestDB。
+  交易端点 `/ws/trade` 是独立的写路径，只发布 Aeron 契约，不直接修改订单簿 / 账户。
 
 前端 `web/src/hooks/useOrderBookSocket.ts` 负责建连、订阅、切换交易对后重新订阅与
 1s→8s 指数退避重连，并从同一帧里同时更新订单簿、最新成交与最新 K 线（均无需额外订阅）；
 `OrderBookPanel` 的徽标从「3s 轮询」改为「WS 500ms」。K 线面板先用 REST 拉取历史 180 根
 （每 5 秒兜底刷新），之后每帧 WS 推送与最后一根比较：时间戳相同覆盖最后一根，时间戳更大
 追加新柱子；REST 结果与实时快照合并时保留成交笔数更多的一份，避免轮询把实时柱子回退。
+
+### WebSocket 下单 / 撤单（/ws/trade）
+
+模块 `com.me.websocket.trading`（演示接入层），端点 `ws://localhost:8080/ws/trade`。
+WS 只负责连接级校验（login、requestId、限流、消息大小）和 Aeron offer；字段级业务校验、
+委托号生成、ingress ring 入队由币币模块的 `AeronRequestProcessor` 复用
+`OrderCommandAssembler` / `OrderCancelAssembler` 完成。WS 不 import `com.me.currency` /
+`com.me.order`，订单只通过 Aeron 传递。
+
+客户端 → 服务端：
+
+```json
+{"action":"login","userId":1001}
+{"action":"placeOrder","requestId":"r-1","symbol":"BTC-USDT","side":"BUY","type":"LIMIT","price":50000,"quantity":2}
+{"action":"cancelOrder","requestId":"r-2","orderId":123,"symbol":"BTC-USDT"}
+{"action":"ping"}
+```
+
+服务端 → 客户端：
+
+```json
+{"type":"loggedIn","userId":1001}
+{"type":"orderAck","stage":"INGRESS","requestId":"r-1","success":true,"orderId":1794568772000001,"symbol":"BTC-USDT"}
+{"type":"orderAck","stage":"INGRESS","requestId":"r-2","success":false,"reason":"SYMBOL_NOT_TRADING"}
+{"type":"error","requestId":"r-1","reason":"SERVER_BUSY"}
+{"type":"orderAckTimeout","requestId":"r-1"}
+```
+
+#### SBE 二进制协议（高性能路径）
+
+同一端点同时接受文本帧（上面的 JSON）和二进制帧（SBE）。连接收到首个二进制帧后固定为
+二进制模式，login / 下单 / 撤单 / ack / 超时全部使用二进制帧；文本连接保持 JSON，兼容
+现有演示前端。schema 见 `matching-engine/src/main/resources/sbe/trade-ws.xml`，由 Maven
+`generate-sources` 生成 codec。一个 WebSocket 二进制帧承载一条 SBE 消息
+（`messageHeader` + 消息体）。
+
+客户端消息：`Login(10)` = userId；`Order(20)` = action / side / orderType（uint8）+
+price / quantity / amount / orderId（int64）+ requestId / symbol（UTF-8 变长）；
+`Ping(42)`。
+
+服务端消息：`LoginAck(11)`；`AckBatch(30)`（重复组：success + orderId + requestId +
+reason）；`Error(40)`；`AckTimeout(41)`；`Pong(43)`。`Order` 中 int64 字段为 0 表示
+“未提供”，解码后还原为 null，交给币币模块复用 REST 的必填校验。
+
+- **批量 ack**：`TradeAckPoller` 把同一次 Aeron poll 内同一连接的多条 ack 聚合为一个
+  `AckBatch` 帧，不额外等待。单帧条数由 `app.websocket.trading.ack-batch-size`（默认 64）
+  和 `max-message-bytes` 共同限制，超出自动拆帧；`ack-batch-size=1` 可关闭批量用于 A/B。
+- **实测**（100 万单、128 连接、inflight=100、同机 4 核 8 线程、隔离 Kafka 下游）：
+  JSON + 逐条 ack 约 **40k/s**；SBE + 逐条 ack 约 **44k/s**；SBE + 批量 ack（batch=64）
+  约 **108k/s**，平均每帧约 33~35 条 ack。详见
+  [`loadtest/TEST-REPORT-WS-SBE-1M.md`](loadtest/TEST-REPORT-WS-SBE-1M.md)。
+
+- **ack 语义**：`orderAck success=true` 只表示请求通过币币模块同步校验并写入下单 / 撤单
+  Disruptor（进入 ingress ring），不代表 Kafka ack、委托受理、冻结或成交。最终状态仍通过
+  `GET /api/v1/orders` 或 `GET /api/v1/orders/by-request-id` 查询。
+- **传输**：当前与 Spring Boot 同进程，使用内嵌 Aeron media driver + `aeron:ipc`；
+  WS → 币币 request stream 1001..1001+stream-count-1，币币 → WS ack stream
+  1101..1101+stream-count-1。按 connectionId 固定分片：同一连接固定落在一个 request/ack
+  stream 上，连接内顺序不变；不同连接分摊到 N 路接收/ack poller。后续 WS 独立部署时把
+  `app.aeron.embedded-driver` 改为 false 共享 driver，或把 `channel` 改为
+  `aeron:udp?endpoint=...`。
+- **失败 / 丢弃**：WS JSON 非法、未登录、限流、offer 失败立即回 `error`；币币校验失败回
+  `orderAck success=false`；ring 满、ring 未启动或内部异常时记录 error 并丢弃订单，
+  best-effort 回 `SERVER_BUSY` / `ENGINE_UNAVAILABLE` / `INTERNAL_ERROR`，**不重试**。
+- **异步发送**：WS handler 在 offer 后立即返回，不等待 ack；客户端可以连续发送多单。
+  `max-pending-requests` 只限制单连接在途跟踪数（内存保护），不是逐单 ack 门闩；
+  压测时可调大（例如 1200）。
+- **ack 回程**：ack publication 遇到 `BACK_PRESSURED` / `ADMIN_ACTION` 时重试（最多 5s），
+  期间反压币币请求 poller；`NOT_CONNECTED` 仍直接丢弃，应用刚启动后第一波 ack 可能
+  因 publication 尚未连接而丢失，客户端应以 `orderAckTimeout` 后查单处理。
+- **无幂等**：同一 requestId 重发仍会生成新委托；客户端收到 `orderAckTimeout` 或连接断开
+  后应查询委托，不能自动重试。`requestId` 只用于关联 ack。
+- **单实例**：Aeron 消费者只能有一个 active 币币实例；多个实例订阅同一 stream 会各自收到
+  全部请求并重复撮合。当前系统仍依赖快照恢复做重启，不是 active-active。
+- **鉴权**：演示期没有 token 校验，`login.userId` 即视为授权；后续生产替换为 token 校验，
+  订单消息不再携带 userId。未鉴权的端点只能本地 / 内网使用，不要公网暴露。
+- **吞吐参考**：
+  - 全链路（200 连接 × 1000 单，JSON，`stream-count=8`）：ingress 提交约 **16,019/s**；
+    到 settlement 消费完的 e2e 约 **9,266/s**，下游 order / matching / settlement 是 e2e 瓶颈。
+  - 隔离下游（100 万单，128 连接 × inflight 100，`publish-enabled=false`）：
+    JSON + 逐条 ack 约 40k/s；SBE + 逐条 ack 约 44k/s；SBE + 批量 ack 约 **108k/s**。
+    逐条 ack 的每帧固定开销是主要瓶颈，批量 ack 把它摊薄约 2.5 倍。
+  - 开启下游（100 万单，128 连接，SBE + 批量 ack，全新应用 / Kafka）：全链路 e2e 约
+    **29.7k/s**，100 万单 33.7s；服务端 5.5/8 核，下游单 symbol 只占一个 Kafka 分区。
+    连续 1M 轮次之间必须重启应用并重置消费组（第 3 轮曾触发 Kafka 事务超时 →
+    FatalState）。详见 [`loadtest/TEST-REPORT-WS-SBE-FULLCHAIN-1M.md`](loadtest/TEST-REPORT-WS-SBE-FULLCHAIN-1M.md)。
+- **配置**：`app.websocket.trading.*`（端点、限流、pending 上限、ack 超时、ack 批量条数、
+  实例 ID）和 `app.aeron.*`（channel、stream、driver 目录、term buffer、消息上限、
+  stream-count）。`stream-count` 同时决定 request/ack 分片数、接收
+  poller 数、ack poller 数和 WS publication 数；`app.currency.ingress.ring-size`
+  在 100k+/s 压测时建议放大到 262144，避免突发填满 ring。
+- **前端**：`web/src/hooks/useTradeSocket.ts` 负责连接、login、requestId pending、超时和
+  1s→8s 重连；WS 未就绪时下单 / 撤单自动回退 REST，已通过 WS 发出后绝不回退，避免重复下单。
 
 ### 本地验证
 

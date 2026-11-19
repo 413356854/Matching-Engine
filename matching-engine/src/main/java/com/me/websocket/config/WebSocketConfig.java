@@ -1,7 +1,10 @@
 package com.me.websocket.config;
 
 import com.me.websocket.handler.OrderBookWebSocketHandler;
+import com.me.websocket.trading.config.TradingProperties;
+import com.me.websocket.trading.handler.TradeWebSocketHandler;
 import java.util.Arrays;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.scheduling.annotation.EnableScheduling;
@@ -19,30 +22,43 @@ import org.springframework.web.socket.config.annotation.WebSocketHandlerRegistry
 @Configuration
 @EnableWebSocket
 @EnableScheduling
-@EnableConfigurationProperties(WebSocketProperties.class)
+@EnableConfigurationProperties({WebSocketProperties.class, TradingProperties.class})
 public class WebSocketConfig implements WebSocketConfigurer {
 
     /** 盘口订阅端点；前端与 Vite 代理配置保持一致。 */
     public static final String ORDER_BOOK_PATH = "/ws/orderbook";
 
     private final OrderBookWebSocketHandler orderBookWebSocketHandler;
+    private final ObjectProvider<TradeWebSocketHandler> tradeWebSocketHandler;
     private final WebSocketProperties properties;
+    private final TradingProperties tradingProperties;
 
     public WebSocketConfig(
             OrderBookWebSocketHandler orderBookWebSocketHandler,
-            WebSocketProperties properties) {
+            ObjectProvider<TradeWebSocketHandler> tradeWebSocketHandler,
+            WebSocketProperties properties,
+            TradingProperties tradingProperties) {
         this.orderBookWebSocketHandler = orderBookWebSocketHandler;
+        this.tradeWebSocketHandler = tradeWebSocketHandler;
         this.properties = properties;
+        this.tradingProperties = tradingProperties;
     }
 
     @Override
     public void registerWebSocketHandlers(WebSocketHandlerRegistry registry) {
         registry.addHandler(orderBookWebSocketHandler, ORDER_BOOK_PATH)
-                .setAllowedOriginPatterns(originPatterns());
+                .setAllowedOriginPatterns(originPatterns(properties.allowedOriginPatterns()));
+
+        TradeWebSocketHandler tradeHandler = tradeWebSocketHandler.getIfAvailable();
+        if (tradingProperties.enabled() && tradeHandler != null) {
+            registry.addHandler(tradeHandler, tradingProperties.path())
+                    .setAllowedOriginPatterns(
+                            originPatterns(tradingProperties.allowedOriginPatterns()));
+        }
     }
 
-    private String[] originPatterns() {
-        String[] patterns = Arrays.stream(properties.allowedOriginPatterns().split(","))
+    private static String[] originPatterns(String raw) {
+        String[] patterns = Arrays.stream(raw.split(","))
                 .map(String::strip)
                 .filter(pattern -> !pattern.isEmpty())
                 .toArray(String[]::new);

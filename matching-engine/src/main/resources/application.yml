@@ -50,6 +50,48 @@ app:
     # 单次发送超时与单连接发送缓冲；客户端读取过慢时断开该连接，避免拖住推送线程
     send-time-limit-ms: 5000
     send-buffer-size-bytes: 524288
+    # 交易端点 /ws/trade：客户端 login 后通过 Aeron IPC 把下单/撤单请求发给币币模块。
+    # 只 ack“已通过币币校验并进入 ingress ring”，不等待 Kafka / 冻结 / 撮合结果。
+    trading:
+      enabled: true
+      path: /ws/trade
+      allowed-origin-patterns: "*"
+      # 单连接每秒最多提交的订单/撤单请求数；<=0 表示不限制
+      max-orders-per-second: 50
+      # 单连接同时等待 ack 的最大请求数；超过返回 RATE_LIMITED
+      max-pending-requests: 100
+      # 发出 Aeron 请求后等待 ack 的时长；超时返回 orderAckTimeout，客户端应查单而不是自动重试
+      ack-timeout-ms: 3000
+      # 超时扫描间隔（ms）
+      ack-sweep-interval-ms: 1000
+      # 二进制连接单个 AckBatch 帧最多携带的 ack 条数；1 = 每帧一条（用于 A/B 对比）
+      ack-batch-size: 64
+      # 单条客户端 JSON / SBE 二进制消息上限；AckBatch 帧超出时会自动拆帧
+      max-message-bytes: 8192
+      # 多 WS 实例部署时用于生成 connectionId 前缀；当前单实例保持 1
+      instance-id: 1
+
+  # Aeron：WS → 币币模块的同机 IPC 通道。
+  # 当前与 Spring Boot 同进程运行，使用内嵌 media driver + aeron:ipc；
+  # 后续 WS 独立部署时可改为 standalone driver 或 aeron:udp。
+  aeron:
+    enabled: true
+    # media driver 目录；相对路径按进程工作目录解析。开发环境启动时清空。
+    dir: "${AERON_DIR:./target/aeron}"
+    channel: "aeron:ipc"
+    # WS → 币币：下单/撤单请求；实际使用 request-stream-id .. +stream-count-1
+    request-stream-id: 1001
+    # 币币 → WS：ingress ack；实际使用 ack-stream-id .. +stream-count-1
+    # 与 request 分片下标一一对应，必须和 request 段不重叠
+    ack-stream-id: 1101
+    # 并行分片数：接收 poller、ack poller、WS publication 各 N 路
+    # 8 路是当前机器上的吞吐拐点；16 路线程/term buffer 竞争反而下降
+    stream-count: 8
+    embedded-driver: true
+    dir-delete-on-start: true
+    term-buffer-length: 16777216
+    # 单条 Aeron 消息上限；下单/撤单请求远小于该值
+    max-message-bytes: 16384
 
   kafka:
     # 关闭后不启动任何裸 consumer/topic initializer
@@ -231,6 +273,9 @@ app:
       batch-size: 2000
       # 聚合时间窗口（ms）；定时 tick 触发发送，命令最多等待这么久
       flush-interval-ms: 50
+      # false 时只把命令从 ring 中 drain 掉，不发送 Kafka；
+      # 用于隔离压测 WS → Aeron → 币币 → ingest ring 这一段
+      publish-enabled: true
 
     # 撤单入口：与下单入口独立的 Disruptor。handler 维护 Map<symbol, List<撤单>>，
     # 任一 symbol 达到 batch-size 或定时 tick 到达时，把 map 中所有 symbol 的撤单
@@ -242,6 +287,8 @@ app:
       batch-size: 1000
       # 聚合时间窗口（ms）；命令最多等待这么久
       flush-interval-ms: 20
+      # false 时只 drain 撤单 ring，不发送 Kafka
+      publish-enabled: true
 
   account:
     operation:

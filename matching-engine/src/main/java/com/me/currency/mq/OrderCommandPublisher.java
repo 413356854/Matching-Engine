@@ -1,5 +1,6 @@
 package com.me.currency.mq;
 
+import com.me.currency.ingress.IngressSubmitResult;
 import com.me.currency.ingress.OrderIngress;
 import com.me.shared.order.OrderCommand;
 import org.springframework.stereotype.Component;
@@ -30,5 +31,10 @@ public class OrderCommandPublisher {
     /** 非阻塞投递一条委托命令；只有 ring 未启动 / 已满才抛出异常，由 controller 返回 503。 */
     public void publish(OrderCommand command) {
         ingress.submit(command);
+    }
+
+    /** 非阻塞投递并返回结果；Aeron 消费者用它区分 ring 满、未启动和异常。 */
+    public IngressSubmitResult tryPublish(OrderCommand command) {
+        return ingress.trySubmit(command);
     }
 }

@@ -37,6 +37,15 @@ public class OrderHistoryQueryServiceImpl
                 .toList();
     }
 
+    @Override
+    public OrderHistoryRecord findByRequestId(long userId, String requestId) {
+        if (userId <= 0 || requestId == null || requestId.isBlank()) {
+            return null;
+        }
+        OrderHistoryRow row = repository.findByRequestId(userId, requestId.strip());
+        return row == null ? null : toRecord(row);
+    }
+
     private static OrderHistoryRecord toRecord(OrderHistoryRow row) {
         return new OrderHistoryRecord(
                 row.orderId(),
