@@ -20,8 +20,6 @@ import com.me.order.service.OrderOperationService;
 import com.me.shared.event.FundsLogType;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.junit.jupiter.api.Test;
 
@@ -31,41 +29,35 @@ class ReplayApplierAccountTest {
 
     @Test
     void replaysAccountCommandBatchAndVerifiesAssignedSeq() {
-        ExecutorService executor = Executors.newFixedThreadPool(2);
-        try {
-            AccountServiceImpl accountService = new AccountServiceImpl();
-            AccountOperationServiceImpl operations = new AccountOperationServiceImpl(
-                    accountService,
-                    executor,
-                    new AccountBatchLock(),
-                    new AccountEntryLock(),
-                    new FundsFlowPublisher("funds", 8),
-                    new OrderFreezeResultPublisher("freeze-results"),
-                    new AccountOffsetSeqPublisher("account-offset-seq"),
-                    new FatalState());
+        AccountServiceImpl accountService = new AccountServiceImpl();
+        AccountOperationServiceImpl operations = new AccountOperationServiceImpl(
+                accountService,
+                new AccountBatchLock(),
+                new AccountEntryLock(),
+                new FundsFlowPublisher("funds", 8),
+                new OrderFreezeResultPublisher("freeze-results"),
+                new AccountOffsetSeqPublisher("account-offset-seq"),
+                new FatalState());
 
-            ReplayInputFetcher fetcher = mock(ReplayInputFetcher.class);
-            FundsCommand command = new FundsCommand(
-                    "req-1", 1L, "USDT", FundsLogType.DEPOSIT, 100L, 0L);
-            ConsumerRecord<String, FundsCommand> record =
-                    new ConsumerRecord<>(ACCOUNT_COMMANDS, 0, 0L, "1", command);
-            ReplayMapping mapping = new ReplayMapping(ACCOUNT_COMMANDS, 0, 0L, 1L);
-            stubFetch(fetcher, record);
+        ReplayInputFetcher fetcher = mock(ReplayInputFetcher.class);
+        FundsCommand command = new FundsCommand(
+                "req-1", 1L, "USDT", FundsLogType.DEPOSIT, 100L, 0L);
+        ConsumerRecord<String, FundsCommand> record =
+                new ConsumerRecord<>(ACCOUNT_COMMANDS, 0, 0L, "1", command);
+        ReplayMapping mapping = new ReplayMapping(ACCOUNT_COMMANDS, 0, 0L, 1L);
+        stubFetch(fetcher, record);
 
-            ReplayApplier applier = new ReplayApplier(
-                    mock(OrderOperationService.class), operations, fetcher,
-                    kafkaProperties());
-            ReplayApplier.ReplayStats stats = applier.replay(new ReplayMappings(
-                    List.of(),
-                    List.of(new ReplayBatch(ACCOUNT_COMMANDS, List.of(mapping)))));
+        ReplayApplier applier = new ReplayApplier(
+                mock(OrderOperationService.class), operations, fetcher,
+                kafkaProperties());
+        ReplayApplier.ReplayStats stats = applier.replay(new ReplayMappings(
+                List.of(),
+                List.of(new ReplayBatch(ACCOUNT_COMMANDS, List.of(mapping)))));
 
-            assertEquals(1L, stats.accountBatches());
-            assertEquals(1L, stats.accountRecords());
-            assertEquals(1L, operations.currentSeq());
-            assertEquals(100L, accountService.view(1L, "USDT").available());
-        } finally {
-            executor.shutdownNow();
-        }
+        assertEquals(1L, stats.accountBatches());
+        assertEquals(1L, stats.accountRecords());
+        assertEquals(1L, operations.currentSeq());
+        assertEquals(100L, accountService.view(1L, "USDT").available());
     }
 
     @SuppressWarnings({"unchecked", "rawtypes"})

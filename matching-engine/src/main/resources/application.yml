@@ -290,12 +290,6 @@ app:
       # false 时只 drain 撤单 ring，不发送 Kafka
       publish-enabled: true
 
-  account:
-    operation:
-      # 账户操作执行线程池（充值/冻结/结算三条链路共用）：
-      # 批次在全局锁内串行，批内再按 userId slot 分组并发
-      worker-threads: 8
-
   marketdata:
     # 每个交易对保留最新 50 笔成交在内存：消费线程立即写缓存，最新成交接口与盘口 WebSocket
     # 都只读缓存；md_trade 与 K 线一样由后台线程按刷新间隔批量落库，启动时从 md_trade 预热。

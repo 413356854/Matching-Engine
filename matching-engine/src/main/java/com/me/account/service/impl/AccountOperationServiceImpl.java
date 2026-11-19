@@ -15,7 +15,6 @@ import com.me.account.service.AccountBatchLock;
 import com.me.account.service.AccountEntryLock;
 import com.me.account.service.AccountOperationService;
 import com.me.account.service.AccountService;
-import com.me.account.sharding.AccountSharding;
 import com.me.kafka.BatchOutput;
 import com.me.kafka.FatalState;
 import com.me.shared.event.FundsFlowEvent;
@@ -27,28 +26,29 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.IntConsumer;
-import java.util.function.IntUnaryOperator;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
 
 /**
  * 账户操作执行器实现。
  *
- * <p><b>批次串行 + 批内按 slot 并发</b>：三条账户输入链路由不同 consumer 线程驱动，
- * 所有批次先竞争 {@code accountLock}。锁内按 {@code slot(userId)} 把批内命令分成最多
- * {@link AccountSharding#SLOTS} 组提交共享线程池并发处理；同一 slot 的命令在组内按输入
- * 顺序串行，不同 slot 可以并行。处理完成后，按 ConsumerRecord 输入顺序为每条输入记录
- * 自增 {@link #accountSeq} 并写入 offset-seq 映射；最后一条 offset 的序号即该批水位。
- * 因此不同批次之间严格串行，批内仍保留账户分片级的并发。
+ * <p><b>批次串行 + 批内顺序执行</b>：三条账户输入链路由不同 consumer 线程驱动，
+ * 所有批次先竞争 {@code accountLock}。锁内按输入顺序逐条处理命令，处理完成后按
+ * ConsumerRecord 输入顺序为每条输入记录自增 {@link #accountSeq} 并写入 offset-seq
+ * 映射；最后一条 offset 的序号即该批水位。因此不同批次之间严格串行，批内也保持
+ * 确定的输入顺序。
+ *
+ * <p><b>为什么不再按 slot 提交线程池</b>：批内并行只在单批业务量足够大时才划算。
+ * 50 万单压测（{@code loadtest/TEST-REPORT-ACCOUNT-CONCURRENCY-500K.md}）显示：
+ * 冻结链路一个 slot 任务只执行约 3.9ms，而线程池从提交到任务真正开始的协调/调度
+ * 延迟约 6.9ms/任务；结算链路每个分区批次只含一个 slot，池化后没有可并行任务，
+ * 提交/唤醒反而占掉约 44% 的批次墙钟。业务作业耗时比线程协调还短，批内并发收益为负，
+ * 因此三条链路都改为在消费线程内顺序执行。
  *
  * <p><b>入口锁</b>：{@code me.account.commands} 入口批次在进入 {@code accountLock} 之前
  * 先获取 {@link AccountEntryLock}；冻结 / 结算内部链路不获取入口锁，因此快照等待内部
@@ -57,7 +57,8 @@ import org.springframework.stereotype.Service;
  * <p><b>为什么整批加锁</b>：offset-seq 的价值在于「accountSeq 的顺序就是输入记录被账户
  * 模块处理的顺序」；每条 Kafka 原生 offset 都有独立序号后，快照恢复可以精确定位每条输入。
  * 如果只锁单条命令，不同 consumer 的批次会交错执行，seq 无法用于快照恢复后的确定性重放。
- * 代价是账户写入的跨链路并发退化为「批内 slot 并发」，吞吐上限由单批大小和 slot 数决定。
+ * 代价是账户写入在批次之间完全串行；在当前批量入口下账户模块只占主链路 drain 的
+ * 12%~23%（顺序执行后约 12%），该串行化不是端到端瓶颈。
  *
  * <p><b>输出发布也在 accountLock 内</b>：资金流水、冻结回执和 offset-seq 映射在
  * {@link #accountLock} 内把记录写入当前批次的 {@link BatchOutput}。
@@ -78,7 +79,6 @@ public class AccountOperationServiceImpl implements AccountOperationService {
     static final int REJECTED_CACHE_LIMIT = 65_536;
 
     private final AccountService accountService;
-    private final ExecutorService slotExecutor;
     private final FundsFlowPublisher flowPublisher;
     private final OrderFreezeResultPublisher freezeResultPublisher;
     private final AccountOffsetSeqPublisher offsetSeqPublisher;
@@ -93,7 +93,7 @@ public class AccountOperationServiceImpl implements AccountOperationService {
      * 保证 accountSeq 顺序与输入记录被账户模块处理的顺序一致。
      *
      * <p>由本类的 {@code execute*} 方法在消费线程里获取；锁内完成
-     * 「按 slot 并发处理 → 分配 accountSeq → 发布资金流水 / 冻结回执 / offset-seq →
+     * 「按输入顺序处理 → 分配 accountSeq → 发布资金流水 / 冻结回执 / offset-seq →
      * output.enqueue()」。锁在 {@code output.enqueue()} 返回后释放，<b>不覆盖</b>
      * committer 的 Kafka send / commit：runner 入队后立即 poll 下一批，
      * 提交失败由 committer 进入 fatal，不会回到本锁内重试。
@@ -112,7 +112,6 @@ public class AccountOperationServiceImpl implements AccountOperationService {
 
     public AccountOperationServiceImpl(
             AccountService accountService,
-            @Qualifier("accountOperationExecutor") ExecutorService slotExecutor,
             AccountBatchLock accountBatchLock,
             AccountEntryLock accountEntryLock,
             FundsFlowPublisher flowPublisher,
@@ -120,7 +119,6 @@ public class AccountOperationServiceImpl implements AccountOperationService {
             AccountOffsetSeqPublisher offsetSeqPublisher,
             FatalState fatalState) {
         this.accountService = accountService;
-        this.slotExecutor = slotExecutor;
         this.accountLock = accountBatchLock.reentrantLock();
         this.commandEntryLock = accountEntryLock.reentrantLock();
         this.flowPublisher = flowPublisher;
@@ -153,8 +151,7 @@ public class AccountOperationServiceImpl implements AccountOperationService {
                         + "] engine is fatal; refusing batch");
             }
             FundsFlowEvent[] outcomes = new FundsFlowEvent[records.size()];
-            executeBySlot(records.size(),
-                    position -> slotOfCommand(records.get(position).value()),
+            executeBatch(records.size(),
                     position -> outcomes[position] = handleCommand(records.get(position)));
 
             List<FundsFlowEvent> flows = new ArrayList<>(records.size());
@@ -192,8 +189,7 @@ public class AccountOperationServiceImpl implements AccountOperationService {
                         + "] engine is fatal; refusing batch");
             }
             FreezeOutcome[] outcomes = new FreezeOutcome[items.size()];
-            executeBySlot(items.size(),
-                    position -> slotOfCommand(items.get(position).command()),
+            executeBatch(items.size(),
                     position -> outcomes[position] = handleFreeze(items.get(position)));
 
             List<FundsFlowEvent> flows = new ArrayList<>(items.size());
@@ -239,8 +235,7 @@ public class AccountOperationServiceImpl implements AccountOperationService {
             }
             @SuppressWarnings("unchecked")
             List<FundsFlowEvent>[] outcomes = new List[items.size()];
-            executeBySlot(items.size(),
-                    position -> slotOfSettlement(items.get(position).command()),
+            executeBatch(items.size(),
                     position -> outcomes[position] = handleSettlement(items.get(position)));
 
             List<FundsFlowEvent> flows = new ArrayList<>(items.size() * 4);
@@ -306,35 +301,21 @@ public class AccountOperationServiceImpl implements AccountOperationService {
     }
 
     /**
-     * 按 slot 分组提交共享线程池；组内按输入顺序执行，全部结束后返回，失败时抛第一个异常。
+     * 在消费线程内按输入顺序执行本批全部命令。
      *
-     * <p>必须先等全部分组结束再抛出失败：失败批次重投时不能让上一次的 worker 仍在修改账户。
+     * <p><b>为什么删掉线程池</b>：业务作业耗时比线程协调短，并发收益为负。
+     * 50 万单压测（{@code loadtest/TEST-REPORT-ACCOUNT-CONCURRENCY-500K.md}）显示：
+     * 冻结链路一个 slot 任务只执行约 3.9ms，而线程池从提交到任务真正开始的
+     * 协调/调度延迟约 6.9ms/任务；结算链路每个分区批次只含一个 slot，池化后
+     * 没有可并行任务，提交/唤醒反而占掉约 44% 的批次墙钟。三条账户链路合计
+     * 并发收益率 -62%，因此改回在消费线程内顺序执行。
+     *
+     * <p>顺序执行天然保持输入顺序；slot 级互斥仍由 {@link AccountService} 的账户锁保证。
      */
-    private void executeBySlot(int itemCount, IntUnaryOperator slotOf, IntConsumer action) {
-        if (itemCount == 0) {
-            return;
-        }
-        List<List<Integer>> bySlot = new ArrayList<>(AccountSharding.SLOTS);
-        for (int slot = 0; slot < AccountSharding.SLOTS; slot++) {
-            bySlot.add(new ArrayList<>());
-        }
+    private void executeBatch(int itemCount, IntConsumer action) {
         for (int position = 0; position < itemCount; position++) {
-            bySlot.get(slotOf.applyAsInt(position)).add(position);
+            action.accept(position);
         }
-
-        List<Future<?>> futures = new ArrayList<>(AccountSharding.SLOTS);
-        for (List<Integer> slotItems : bySlot) {
-            if (slotItems.isEmpty()) {
-                continue;
-            }
-            futures.add(slotExecutor.submit(() -> {
-                for (int position : slotItems) {
-                    action.accept(position);
-                }
-                return null;
-            }));
-        }
-        awaitAll(futures);
     }
 
     // ------------------------------------------------------------------
@@ -495,67 +476,6 @@ public class AccountOperationServiceImpl implements AccountOperationService {
                     accountSeq.incrementAndGet()));
         }
         return offsets;
-    }
-
-    private static int slotOfCommand(FundsCommand command) {
-        return command == null ? 0 : AccountSharding.slot(command.userId());
-    }
-
-    /**
-     * 清算单归组用的 slot。正常命令只含一个用户；多用户命令按第一腿归组，
-     * {@link AccountService#settle} 仍会按升序锁定全部涉及的 slot。
-     */
-    private static int slotOfSettlement(TradeSettlementCommand command) {
-        if (command == null || command.legs() == null || command.legs().isEmpty()) {
-            return 0;
-        }
-        return AccountSharding.slot(command.legs().get(0).userId());
-    }
-
-    /**
-     * 等待全部分组结束后再抛出第一个失败：避免失败批次重投时仍有工作线程修改账户。
-     */
-    private static void awaitAll(List<Future<?>> futures) {
-        boolean interrupted = false;
-        RuntimeException failure = null;
-        for (Future<?> future : futures) {
-            while (true) {
-                try {
-                    future.get();
-                    break;
-                } catch (InterruptedException e) {
-                    interrupted = true;
-                } catch (ExecutionException e) {
-                    if (failure == null) {
-                        failure = unwrap(e);
-                    } else {
-                        log.warn("additional account operation worker failure", e.getCause());
-                    }
-                    break;
-                }
-            }
-        }
-        if (interrupted) {
-            Thread.currentThread().interrupt();
-        }
-        if (failure != null) {
-            throw failure;
-        }
-        if (interrupted) {
-            throw new IllegalStateException(
-                    "interrupted while waiting for account operation workers");
-        }
-    }
-
-    private static RuntimeException unwrap(ExecutionException e) {
-        Throwable cause = e.getCause() == null ? e : e.getCause();
-        if (cause instanceof RuntimeException runtime) {
-            return runtime;
-        }
-        if (cause instanceof Error error) {
-            throw error;
-        }
-        return new IllegalStateException("account operation worker failed", cause);
     }
 
     private static <K, V> Map<K, V> rejectedCache() {
