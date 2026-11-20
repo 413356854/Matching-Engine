@@ -27,9 +27,9 @@ const LONG_MAX = 9_223_372_036_854_775_807n;
 const DEFAULT_AMOUNT = '1000000';
 
 const FALLBACK_CURRENCIES: Currency[] = [
-  { id: -1, code: 'USDT', name: '泰达币', scale: 6, status: 1, sortOrder: 1 },
-  { id: -2, code: 'BTC', name: '比特币', scale: 8, status: 1, sortOrder: 2 },
-  { id: -3, code: 'ETH', name: '以太坊', scale: 8, status: 1, sortOrder: 3 },
+  { id: -1, code: 'USDT', name: '泰达币', scale: 6, rawScale: 6, status: 1, sortOrder: 1 },
+  { id: -2, code: 'BTC', name: '比特币', scale: 8, rawScale: 8, status: 1, sortOrder: 2 },
+  { id: -3, code: 'ETH', name: '以太坊', scale: 8, rawScale: 8, status: 1, sortOrder: 3 },
 ];
 
 function groupDigits(value: number): string {
@@ -104,7 +104,9 @@ export function RechargeModal({
     return null;
   }
 
-  const scale = currencyScales[currency] ?? options.find((item) => item.code === currency)?.scale ?? 6;
+  const scale = currencyScales[currency]
+    ?? options.find((item) => item.code === currency)?.rawScale
+    ?? 6;
   const userId = Number(userIdInput);
   const validUserId = Number.isSafeInteger(userId) && userId > 0;
   const displayAmount = Number(amountInput);
@@ -210,7 +212,7 @@ export function RechargeModal({
             <select value={currency} onChange={(event) => setCurrency(event.target.value)}>
               {options.map((item) => (
                 <option key={item.code} value={item.code}>
-                  {item.code} · {item.name}（精度 {item.scale}）
+                  {item.code} · {item.name}（raw {item.rawScale} / 展示 {item.scale}）
                 </option>
               ))}
             </select>
@@ -252,7 +254,7 @@ export function RechargeModal({
           </div>
 
           <p className="modal-hint">
-            金额是展示单位的整数，后端按 {currency} 精度 {scale} 换算成最小单位后，
+            金额是展示单位的整数，后端按 {currency} raw_scale {scale} 换算成最小单位后，
             通过 Kafka <code>me.account.commands</code> 异步入账；充值成功后自动切换到该用户，
             弹框保持打开，可继续选择其他币种充值。只想切换用户、不充值时使用「登录」。
             演示接口无鉴权。

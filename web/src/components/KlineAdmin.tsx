@@ -9,7 +9,12 @@ import {
   type TradingPair,
 } from '../api';
 import { describeError } from '../errors';
-import { formatDateTime, formatPrice, formatQuantity, formatUnits } from '../format';
+import {
+  formatDateTime,
+  formatDisplayUnits,
+  formatPrice,
+  formatQuantity,
+} from '../format';
 import { RefreshIcon } from './icons';
 import type { ToastKind } from './ToastStack';
 
@@ -241,7 +246,7 @@ export function KlineAdmin({ pairs, currencyScales, notify }: KlineAdminProps) {
               const priceScale = pair?.priceScale ?? 0;
               const quantityScale = pair?.quantityScale ?? 0;
               const quoteCurrency = pair?.quoteCurrency ?? kline.symbol.split('-')[1] ?? '';
-              const amountScale = currencyScales[quoteCurrency] ?? 0;
+              const amountRawScale = currencyScales[quoteCurrency] ?? 0;
               return (
                 <tr key={`${kline.symbol}-${kline.interval}-${kline.bucketStart}`}>
                   <td className="mono muted">{formatDateTime(kline.bucketStart)}</td>
@@ -256,7 +261,9 @@ export function KlineAdmin({ pairs, currencyScales, notify }: KlineAdminProps) {
                   <td className="mono align-right">
                     {formatQuantity(kline.volume, quantityScale)}
                   </td>
-                  <td className="mono align-right">{formatUnits(kline.amount, amountScale)}</td>
+                  <td className="mono align-right">
+                    {formatDisplayUnits(kline.amount, amountRawScale, priceScale)}
+                  </td>
                   <td className="mono align-right muted">{kline.tradeCount}</td>
                 </tr>
               );

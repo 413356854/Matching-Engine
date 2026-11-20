@@ -123,7 +123,7 @@ class ReplayApplierOrderTest {
             when(configCache.pair("BTC-USDT")).thenReturn(new TradingPairView(
                     1L, "BTC-USDT", "BTC", "USDT", 0, 0, 0L, 0L, 0, 0, 1, 0));
             when(configCache.currency("USDT")).thenReturn(new CurrencyView(
-                    1L, "USDT", "Tether", 0, 1, 0));
+                    1L, "USDT", "Tether", 0, 0, 1, 0));
             this.operations = new OrderOperationServiceImpl(
                     orderService,
                     configCache,

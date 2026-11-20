@@ -27,7 +27,10 @@ import org.springframework.stereotype.Service;
  * <p>校验规则与撮合链路的单位约定保持一致：
  * <ul>
  *   <li>价格 / 数量精度 {@code 0..18}（{@code Amounts} 的上限）；</li>
- *   <li>{@code quantityScale} 必须等于基础币种精度，否则委托数量与账户最小单位不一致；</li>
+ *   <li>{@code quantityScale} 必须等于基础币种的 {@code rawScale}，否则委托数量
+ *       与账户最小单位不一致；</li>
+ *   <li>{@code priceScale} 不能超过计价币的 {@code rawScale}：amount 的原始整数
+ *       来自计价币 raw_scale，price_scale 只是 amount 的计算/展示精度；</li>
  *   <li>价格 / 数量精度创建后不可修改：订单簿里的价格和数量是最小单位整数，
  *       改精度会让新旧委托按不同单位撮合；需要不同精度时请下线、撤单后重建；</li>
  *   <li>费率单位是 bps，允许负值返佣，范围 {@code -10000..10000}。</li>
@@ -99,7 +102,8 @@ public class AdminPairServiceImpl implements AdminPairService {
         if (base == null) {
             return AdminPairResult.rejected("BASE_CURRENCY_NOT_FOUND");
         }
-        if (configCache.currency(quoteCurrency) == null) {
+        CurrencyView quote = configCache.currency(quoteCurrency);
+        if (quote == null) {
             return AdminPairResult.rejected("QUOTE_CURRENCY_NOT_FOUND");
         }
 
@@ -112,8 +116,13 @@ public class AdminPairServiceImpl implements AdminPairService {
         if (invalid != null) {
             return AdminPairResult.rejected(invalid);
         }
-        if (quantityScale != base.scale()) {
+        if (quantityScale != base.rawScale()) {
             return AdminPairResult.rejected("QUANTITY_SCALE_MISMATCH");
+        }
+        // amount 的原始精度来自计价币 raw_scale；price_scale 是 amount 的计算/展示
+        // 精度，不能超过 raw_scale，否则 amount 无法换算回计价币原始整数。
+        if (priceScale > quote.rawScale()) {
+            return AdminPairResult.rejected("PRICE_SCALE_EXCEEDS_RAW_SCALE");
         }
 
         // 交易对代码唯一约束兜底并发创建；先查一次能给普通重复请求更明确的错误。
@@ -174,7 +183,7 @@ public class AdminPairServiceImpl implements AdminPairService {
         if (invalid != null) {
             return AdminPairResult.rejected(invalid);
         }
-        if (quantityScale != base.scale()) {
+        if (quantityScale != base.rawScale()) {
             return AdminPairResult.rejected("QUANTITY_SCALE_MISMATCH");
         }
         if (pair.getPriceScale() == null || pair.getPriceScale() != priceScale

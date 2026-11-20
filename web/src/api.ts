@@ -40,8 +40,10 @@ export interface Currency {
   id: number;
   code: string;
   name: string;
-  /** 小数位数：1 BTC = 10^8 最小单位。 */
+  /** 展示小数上限，必须 <= rawScale。 */
   scale: number;
+  /** 账本原始精度：1 BTC = 10^rawScale 最小单位。 */
+  rawScale: number;
   status: number;
   sortOrder: number;
 }

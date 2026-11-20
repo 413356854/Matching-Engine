@@ -6,7 +6,8 @@ import java.math.BigInteger;
  * 价格 × 数量到计价币最小单位金额的换算。
  *
  * <p>价格按 {@code 10^-priceScale}、数量按 {@code 10^-quantityScale} 的整数存储；
- * 计价币金额按 {@code 10^-quoteScale} 的整数存储。因此：
+ * 计价币金额按 {@code 10^-quoteScale} 的整数存储。这里的 {@code quoteScale} 是
+ * 计价币的 <b>raw_scale</b>（账本原始精度），不是币种的展示小数上限。因此：
  *
  * <pre>
  * amount = price × quantity × 10^quoteScale / 10^(priceScale + quantityScale)
@@ -100,6 +101,48 @@ public final class Amounts {
             throw notInteger(price, quantity, priceScale, quantityScale, quoteScale);
         }
         return quotient;
+    }
+
+    /**
+     * 判断委托数量是否对齐交易对的最小数量步长。
+     *
+     * <p>成交金额按
+     * {@code price × quantity × 10^quoteScale / 10^(priceScale + quantityScale)}
+     * 计算并要求整除。限价单可能与不同 maker 的价格成交，仅在自身限价上整除
+     * 不足以保证每一笔成交都能精确记账；因此当
+     * {@code priceScale + quantityScale > quoteScale} 时，数量必须是
+     * {@code 10^(priceScale + quantityScale - quoteScale)} 的整数倍。满足该步长后，
+     * 任意整数价格与数量的乘积都能换算成计价币最小单位。
+     *
+     * <p>若步长指数超过 {@link #MAX_SCALE}（步长大于 {@code Long.MAX_VALUE}），
+     * 任何正 long 数量都无法满足，返回 {@code false}。这是交易对精度配置本身
+     * 不可用，应由入口校验拒绝。
+     *
+     * @param quantity      委托数量，按 {@code 10^-quantityScale} 的最小单位
+     * @param priceScale    价格精度
+     * @param quantityScale 数量精度
+     * @param quoteScale    计价币账本精度
+     * @return 数量是否满足步长
+     * @throws IllegalArgumentException scale 越界
+     */
+    public static boolean isQuantityAligned(long quantity, int priceScale,
+                                            int quantityScale, int quoteScale) {
+        if (quantity <= 0) {
+            return false;
+        }
+        checkScale(priceScale);
+        checkScale(quantityScale);
+        checkScale(quoteScale);
+
+        int netScale = priceScale + quantityScale - quoteScale;
+        if (netScale <= 0) {
+            return true;
+        }
+        if (netScale > MAX_SCALE) {
+            // 步长 >= 10^19 > Long.MAX_VALUE，正 long 数量不可能对齐。
+            return false;
+        }
+        return quantity % POW10[netScale] == 0L;
     }
 
     /**

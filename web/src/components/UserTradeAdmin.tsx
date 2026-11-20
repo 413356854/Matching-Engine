@@ -9,7 +9,12 @@ import {
   type UserTradeRole,
 } from '../api';
 import { describeError } from '../errors';
-import { formatDateTime, formatPrice, formatQuantity, formatUnits } from '../format';
+import {
+  formatDateTime,
+  formatDisplayUnits,
+  formatPrice,
+  formatQuantity,
+} from '../format';
 import { RefreshIcon } from './icons';
 
 interface UserTradeAdminProps {
@@ -241,7 +246,7 @@ export function UserTradeAdmin({ pairs, currencyScales }: UserTradeAdminProps) {
               const quantityScale = pair?.quantityScale ?? 0;
               const quoteCurrency =
                 pair?.quoteCurrency ?? trade.symbol.split('-')[1] ?? '';
-              const amountScale = currencyScales[quoteCurrency] ?? 0;
+              const amountRawScale = currencyScales[quoteCurrency] ?? 0;
               return (
                 <tr
                   key={`${trade.tradeId}-${trade.orderId}`}
@@ -257,7 +262,7 @@ export function UserTradeAdmin({ pairs, currencyScales }: UserTradeAdminProps) {
                     {formatQuantity(trade.quantity, quantityScale)}
                   </td>
                   <td className="mono align-right">
-                    {formatUnits(trade.amount, amountScale)}
+                    {formatDisplayUnits(trade.amount, amountRawScale, priceScale)}
                   </td>
                   <td>
                     <span className="admin-type">{trade.role}</span>

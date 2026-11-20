@@ -26,9 +26,10 @@ import java.util.List;
 public interface OrderService {
 
     /**
-     * 保存一笔委托并给出需要发送的冻结命令。同一 {@code orderId + requestId} 重投时返回已有
-     * 委托的当前状态；同一 {@code orderId} 换 {@code requestId} 返回拒绝。演示版不做 requestId
-     * 级别的缓存，后续由持久化状态恢复替代。
+     * 保存一笔委托并给出需要发送的冻结命令。生产链路不会重复投递同一命令；同一
+     * {@code orderId + requestId} 再次出现视为合同被破坏，返回
+     * {@code ORDER_DUPLICATE_COMMAND} 并记录 error，不重发冻结命令。同一
+     * {@code orderId} 换 {@code requestId} 返回 {@code ORDER_ID_ALREADY_EXISTS}。
      */
     OrderApplyResult apply(OrderCommand command);
 

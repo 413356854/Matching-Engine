@@ -11,13 +11,17 @@ import { useTradeSocket } from '../hooks/useTradeSocket';
 import {
   MARKET_BUY_BUFFER_DENOMINATOR,
   MARKET_BUY_BUFFER_NUMERATOR,
+  alignQuantityDown,
+  exactQuoteAmount,
+  formatDisplayUnits,
   formatInputValue,
   formatPrice,
   formatQuantity,
   formatUnits,
+  isQuantityAligned,
   marketBuyAmount,
   parseUnits,
-  quoteAmount,
+  quantityStep,
   toSafeNumber,
 } from '../format';
 import type { ToastKind } from './ToastStack';
@@ -139,7 +143,9 @@ export function OrderForm({
       return {
         raw: quantityRaw,
         currency: pair.baseCurrency,
-        scale: baseScale,
+        rawScale: baseScale,
+        displayScale: pair.quantityScale,
+        exact: true,
       };
     }
     if (type === 'MARKET') {
@@ -148,29 +154,34 @@ export function OrderForm({
         : {
             raw: marketAmount,
             currency: pair.quoteCurrency,
-            scale: quoteScale,
+            rawScale: quoteScale,
+            displayScale: pair.priceScale,
+            exact: true,
           };
     }
     if (priceRaw === null || priceRaw <= 0n) {
       return null;
     }
+    const amount = exactQuoteAmount(
+      priceRaw,
+      quantityRaw,
+      pair.priceScale,
+      pair.quantityScale,
+      quoteScale,
+    );
     return {
-      raw: quoteAmount(
-        priceRaw,
-        quantityRaw,
-        pair.priceScale,
-        pair.quantityScale,
-        quoteScale,
-      ),
+      raw: amount ?? 0n,
       currency: pair.quoteCurrency,
-      scale: quoteScale,
+      rawScale: quoteScale,
+      displayScale: pair.priceScale,
+      exact: amount !== null,
     };
   }, [pair, quantityRaw, side, type, priceRaw, baseScale, quoteScale, marketAmount]);
 
   // 前端余额校验：限价买 / 市价买按冻结金额比可用计价币，卖单按数量比可用基础币。
   // 余额快照不自动轮询，成交/充值后可能短暂滞后；提交时若判定不足会主动刷新一次再让用户确认。
   const availableRawBig = BigInt(Math.trunc(availableRaw));
-  const balanceInsufficient = freeze !== null && freeze.raw > availableRawBig;
+  const balanceInsufficient = freeze !== null && freeze.exact && freeze.raw > availableRawBig;
   const balanceShortfall = balanceInsufficient ? freeze.raw - availableRawBig : null;
 
   const changePrice = (value: string) => {
@@ -199,7 +210,12 @@ export function OrderForm({
     }
     requestIdRef.current = null;
     if (side === 'SELL') {
-      const quantity = (BigInt(baseBalance) * BigInt(percent)) / 100n;
+      const quantity = alignQuantityDown(
+        (BigInt(baseBalance) * BigInt(percent)) / 100n,
+        pair.priceScale,
+        pair.quantityScale,
+        quoteScale,
+      );
       setQuantityInput(formatInputValue(quantity, pair.quantityScale));
       return;
     }
@@ -218,7 +234,12 @@ export function OrderForm({
         BigInt(Math.trunc(referencePrice)) *
         MARKET_BUY_BUFFER_NUMERATOR *
         10n ** BigInt(quoteScale);
-      const quantity = numerator / denominator;
+      const quantity = alignQuantityDown(
+        numerator / denominator,
+        pair.priceScale,
+        pair.quantityScale,
+        quoteScale,
+      );
       if (quantity <= 0n) {
         notify('info', '可用余额不足');
         return;
@@ -231,7 +252,15 @@ export function OrderForm({
       return;
     }
     const budget = (BigInt(quoteBalance) * BigInt(percent)) / 100n;
-    setQuantityInput(formatInputValue(budget / priceRaw, pair.quantityScale));
+    setQuantityInput(formatInputValue(
+      alignQuantityDown(
+        budget / priceRaw,
+        pair.priceScale,
+        pair.quantityScale,
+        quoteScale,
+      ),
+      pair.quantityScale,
+    ));
   };
 
   const handleSubmit = async (event: FormEvent) => {
@@ -256,6 +285,19 @@ export function OrderForm({
       notify('error', message);
       return;
     }
+    if (pair.priceScale > quoteScale) {
+      const message = `交易对精度配置无效：价格精度 ${pair.priceScale} 高于 `
+        + `${pair.quoteCurrency} 的 raw_scale ${quoteScale}，amount 无法换算回原始整数；`
+        + '请联系管理员调整计价币 raw_scale';
+      setResult({
+        kind: 'error',
+        title: '下单失败',
+        detail: message,
+        code: 'PRICE_SCALE_EXCEEDS_RAW_SCALE',
+      });
+      notify('error', message);
+      return;
+    }
     if (pair.minOrderQuantity > 0 && parsedQuantity < BigInt(pair.minOrderQuantity)) {
       const message = `低于最小下单量 ${formatQuantity(
         pair.minOrderQuantity,
@@ -264,6 +306,47 @@ export function OrderForm({
       setResult({ kind: 'error', title: '下单失败', detail: message, code: 'BELOW_MIN_ORDER_QUANTITY' });
       notify('error', message);
       return;
+    }
+    if (!isQuantityAligned(
+      parsedQuantity,
+      pair.priceScale,
+      pair.quantityScale,
+      quoteScale,
+    )) {
+      const step = quantityStep(pair.priceScale, pair.quantityScale, quoteScale);
+      const message = `数量必须是最小步长 ${formatInputValue(
+        step,
+        pair.quantityScale,
+      )} ${pair.baseCurrency} 的整数倍`;
+      setResult({ kind: 'error', title: '下单失败', detail: message, code: 'QUANTITY_STEP_INVALID' });
+      notify('error', message);
+      return;
+    }
+    let limitAmount: bigint | null = null;
+    if (type === 'LIMIT' && parsedPrice !== null && parsedPrice > 0n) {
+      limitAmount = exactQuoteAmount(
+        parsedPrice,
+        parsedQuantity,
+        pair.priceScale,
+        pair.quantityScale,
+        quoteScale,
+      );
+      if (limitAmount === null) {
+        const step = quantityStep(pair.priceScale, pair.quantityScale, quoteScale);
+        const message = `当前价格 × 数量无法精确换算为 ${pair.quoteCurrency} 最小单位；`
+          + `请调整数量（最小步长 ${formatInputValue(
+            step,
+            pair.quantityScale,
+          )} ${pair.baseCurrency}）或提高计价币 raw_scale`;
+        setResult({
+          kind: 'error',
+          title: '下单失败',
+          detail: message,
+          code: 'AMOUNT_NOT_REPRESENTABLE',
+        });
+        notify('error', message);
+        return;
+      }
     }
     if (isMarketBuy) {
       if (!hasReferencePrice || marketAmount === null || marketAmount <= 0n) {
@@ -289,16 +372,9 @@ export function OrderForm({
     }
     if (
       type === 'LIMIT' &&
-      parsedPrice !== null &&
-      parsedPrice > 0n &&
+      limitAmount !== null &&
       pair.minOrderAmount > 0 &&
-      quoteAmount(
-        parsedPrice,
-        parsedQuantity,
-        pair.priceScale,
-        pair.quantityScale,
-        quoteScale,
-      ) < BigInt(pair.minOrderAmount)
+      limitAmount < BigInt(pair.minOrderAmount)
     ) {
       const message = `低于最小下单金额 ${formatUnits(
         pair.minOrderAmount,
@@ -308,15 +384,20 @@ export function OrderForm({
       notify('error', message);
       return;
     }
-    if (freeze !== null && freeze.raw > availableRawBig) {
+    if (freeze !== null && freeze.exact && freeze.raw > availableRawBig) {
       const shortfall = freeze.raw - availableRawBig;
-      const message = `可用余额不足：需要 ${formatUnits(
+      const message = `可用余额不足：需要 ${formatDisplayUnits(
         freeze.raw,
-        freeze.scale,
+        freeze.rawScale,
+        freeze.displayScale,
       )} ${freeze.currency}，当前可用 ${formatUnits(
         availableRaw,
         availableScale,
-      )} ${freeze.currency}，还差 ${formatUnits(shortfall, freeze.scale)} ${freeze.currency}。`;
+      )} ${freeze.currency}，还差 ${formatDisplayUnits(
+        shortfall,
+        freeze.rawScale,
+        freeze.displayScale,
+      )} ${freeze.currency}。`;
       setResult({
         kind: 'error',
         title: '余额不足',
@@ -523,18 +604,30 @@ export function OrderForm({
               账本冻结
             </span>
             <b title="按后端账本最小单位换算">
-              {freeze
-                ? `${formatUnits(freeze.raw, freeze.scale)} ${freeze.currency}`
+              {freeze && freeze.exact
+                ? `${formatDisplayUnits(
+                  freeze.raw,
+                  freeze.rawScale,
+                  freeze.displayScale,
+                )} ${freeze.currency}`
                 : '--'}
             </b>
           </div>
         </div>
 
+        {freeze && !freeze.exact && (
+          <p className="min-hint">
+            当前价格 × 数量无法用 {pair?.quoteCurrency} 的 raw_scale 精确表示，
+            不同价格可能显示成同一个金额；请调整数量或价格。
+          </p>
+        )}
+
         {pair && (pair.minOrderQuantity > 0 || pair.minOrderAmount > 0) && (
           <p className="min-hint">
             最小下单量 {formatQuantity(pair.minOrderQuantity, pair.quantityScale)}{' '}
             {pair.baseCurrency} · 最小金额{' '}
-            {formatUnits(pair.minOrderAmount, quoteScale)} {pair.quoteCurrency}
+            {formatDisplayUnits(pair.minOrderAmount, quoteScale, pair.priceScale)}{' '}
+            {pair.quoteCurrency}
           </p>
         )}
 
@@ -551,9 +644,17 @@ export function OrderForm({
 
         {balanceInsufficient && balanceShortfall !== null && freeze && (
           <p className="form-warning">
-            可用余额不足：需要 {formatUnits(freeze.raw, freeze.scale)} {freeze.currency}，
+            可用余额不足：需要 {formatDisplayUnits(
+              freeze.raw,
+              freeze.rawScale,
+              freeze.displayScale,
+            )} {freeze.currency}，
             当前可用 {formatUnits(availableRaw, availableScale)} {availableCurrency}，
-            还差 {formatUnits(balanceShortfall, freeze.scale)} {freeze.currency}。
+            还差 {formatDisplayUnits(
+              balanceShortfall,
+              freeze.rawScale,
+              freeze.displayScale,
+            )} {freeze.currency}。
           </p>
         )}
 

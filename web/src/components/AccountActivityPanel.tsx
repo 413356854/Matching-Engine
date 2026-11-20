@@ -9,7 +9,13 @@ import {
   type UserTrade,
 } from '../api';
 import { describeError } from '../errors';
-import { formatDateTime, formatPrice, formatQuantity, formatUnits } from '../format';
+import {
+  formatDateTime,
+  formatDisplayUnits,
+  formatPrice,
+  formatQuantity,
+  formatUnits,
+} from '../format';
 import { useTradeSocket } from '../hooks/useTradeSocket';
 import { RefreshIcon } from './icons';
 import type { ToastKind } from './ToastStack';
@@ -25,6 +31,7 @@ interface AccountActivityPanelProps {
   flows: FundsFlow[];
   flowsError: string | null;
   currencyScales: Record<string, number>;
+  currencyDisplayScales: Record<string, number>;
   userId: number;
   onOrderCanceled: () => void;
   /** 手动刷新当前委托、历史委托、历史成交与历史流水。 */
@@ -92,6 +99,7 @@ export function AccountActivityPanel({
   flows,
   flowsError,
   currencyScales,
+  currencyDisplayScales,
   userId,
   onOrderCanceled,
   onRefreshActivity,
@@ -372,7 +380,7 @@ export function AccountActivityPanel({
                 const quantityScale = tradePair?.quantityScale ?? 0;
                 const quoteCurrency =
                   tradePair?.quoteCurrency ?? trade.symbol.split('-')[1] ?? '';
-                const amountScale = currencyScales[quoteCurrency] ?? 0;
+                const amountRawScale = currencyScales[quoteCurrency] ?? 0;
                 return (
                   <tr
                     key={`${trade.tradeId}-${trade.orderId}`}
@@ -386,7 +394,7 @@ export function AccountActivityPanel({
                       {formatQuantity(trade.quantity, quantityScale)}
                     </td>
                     <td className="mono align-right">
-                      {formatUnits(trade.amount, amountScale)}
+                      {formatDisplayUnits(trade.amount, amountRawScale, priceScale)}
                     </td>
                     <td className="mono muted">{formatDateTime(trade.executedAt)}</td>
                     <td>{trade.symbol}</td>
@@ -421,7 +429,8 @@ export function AccountActivityPanel({
             </thead>
             <tbody>
               {flows.map((flow) => {
-                const scale = currencyScales[flow.currency] ?? 0;
+                const rawScale = currencyScales[flow.currency] ?? 0;
+                const displayScale = currencyDisplayScales[flow.currency] ?? rawScale;
                 const direction = flowDirection(flow.op);
                 return (
                   <tr
@@ -436,25 +445,35 @@ export function AccountActivityPanel({
                     </td>
                     <td className={`mono align-right flow-amount ${direction}`}>
                       {flowSign(flow.op)}
-                      {formatUnits(flow.amount, scale)}
+                      {formatDisplayUnits(flow.amount, rawScale, displayScale)}
                     </td>
                     <td
                       className="mono align-right"
-                      title={`可用 ${formatUnits(flow.availableBefore, scale)} → ${formatUnits(
+                      title={`可用 ${formatDisplayUnits(
+                        flow.availableBefore,
+                        rawScale,
+                        displayScale,
+                      )} → ${formatDisplayUnits(
                         flow.availableAfter,
-                        scale,
+                        rawScale,
+                        displayScale,
                       )}`}
                     >
-                      {formatUnits(flow.availableAfter, scale)}
+                      {formatDisplayUnits(flow.availableAfter, rawScale, displayScale)}
                     </td>
                     <td
                       className="mono align-right"
-                      title={`冻结 ${formatUnits(flow.frozenBefore, scale)} → ${formatUnits(
+                      title={`冻结 ${formatDisplayUnits(
+                        flow.frozenBefore,
+                        rawScale,
+                        displayScale,
+                      )} → ${formatDisplayUnits(
                         flow.frozenAfter,
-                        scale,
+                        rawScale,
+                        displayScale,
                       )}`}
                     >
-                      {formatUnits(flow.frozenAfter, scale)}
+                      {formatDisplayUnits(flow.frozenAfter, rawScale, displayScale)}
                     </td>
                   </tr>
                 );

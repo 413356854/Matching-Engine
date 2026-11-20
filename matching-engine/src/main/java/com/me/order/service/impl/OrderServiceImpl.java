@@ -46,11 +46,13 @@ import org.springframework.stereotype.Service;
  *
  * <p>委托按 {@code orderId} 保存在 {@link ConcurrentHashMap} 中，不落库；进程重启后委托全部丢失。
  *
- * <p><b>演示版重投语义</b>：不做 requestId / 成交对级别的防重缓存。同一 orderId + requestId
- * 重投时由 {@link ConcurrentHashMap#putIfAbsent} 发现已有委托并返回当前状态；同一 orderId
- * 换 requestId 会被拒绝；成交重投时由订单状态（已 FILLED / PARTIALLY_FILLED 不可再成交）
- * 拒绝。Kafka 事务正常提交时不会重复；事务回滚后的重投可能丢结算命令，这是演示版的取舍。
- * 后续会补备份消息与内存状态恢复，再替换成持久化幂等/重放。
+ * <p><b>重复命令语义</b>：{@code me.order.commands-batch} 只由应用内部的
+ * {@code OrderCommandBatchPublisher} 写入（幂等 producer，不重发），消费端把输出与
+ * 输入 offset 放在同一个 Kafka 事务提交，失败即 fatal，因此生产链路不会把同一条命令
+ * 处理两次。同一 orderId + requestId 再次出现说明合同被破坏（时钟回拨撞号、代码回归
+ * 或新增外部/重试入口）：这里显式拒绝并记录 error，<b>不再重发冻结命令</b>；同一
+ * orderId 换 requestId 返回 {@code ORDER_ID_ALREADY_EXISTS}；成交重投由订单状态
+ * （已 FILLED / PARTIALLY_FILLED 不可再成交）拒绝。
  *
  * <p>{@code userId + requestId → 最新 orderId} 的索引只服务于按 requestId 查询，
  * 不参与防重：同一 requestId 重复下单仍会生成新委托，索引返回其中最新的一笔。
@@ -76,7 +78,7 @@ public class OrderServiceImpl implements OrderService {
     /** 单次当前委托查询最多返回的记录数。 */
     private static final int MAX_OPEN_ORDERS = 200;
 
-    /** 冻结命令 requestId 前缀，后接 orderId，保证同一委托重发时账户模块可以幂等去重。 */
+    /** 冻结命令 requestId 前缀，后接 orderId；账户模块不做 requestId 去重，前缀仅用于定位委托。 */
     private static final String FREEZE_REQUEST_PREFIX = "order-freeze:";
 
     private final ConcurrentHashMap<Long, Order> orders = new ConcurrentHashMap<>();
@@ -152,9 +154,12 @@ public class OrderServiceImpl implements OrderService {
         Order existing = orders.putIfAbsent(order.orderId(), order);
         if (existing != null) {
             if (existing.requestId().equals(command.requestId())) {
-                // 同一 orderId + requestId 重投：返回当前状态，必要时重发冻结。
-                indexByRequest(existing);
-                return successOf(existing);
+                // 生产链路不会重投同一命令（应用内 producer 不重发，消费端输出与 offset
+                // 同事务、失败 fatal）。重复只可能来自合同被破坏，例如时钟回拨撞号、
+                // 代码回归或新增外部/重试入口；重发冻结会永久多冻一笔，这里显式拒绝。
+                log.error("order rejected, duplicate orderId + requestId: orderId={}, "
+                        + "requestId={}", command.orderId(), command.requestId());
+                return OrderApplyResult.rejected("ORDER_DUPLICATE_COMMAND");
             }
             log.warn("order rejected, orderId already exists: orderId={}, requestId={}",
                     command.orderId(), command.requestId());

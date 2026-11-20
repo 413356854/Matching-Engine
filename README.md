@@ -139,7 +139,7 @@ MatchingEngine（订单簿，价格-时间优先，M0 集合版）
 1. 撮合在委托模块冻结回执流程中进程内执行；冻结回执消费端用线程池并发推进委托状态与成交清算，撮合阶段在引擎对象锁内按回执顺序串行，保证按 symbol 过滤后的价格-时间优先；`me.order.commands-batch` 与 `me.account.order-freeze-commands-batch` 都按 symbol 分区并可多 consumer 并行，同一 symbol 仍由单分区/单 consumer 串行处理；充值等非冻结资金命令留在 `me.account.commands`（key=userId）
 2. 撮合在冻结回执线程内同步完成；行情、结算、K 线通过 Kafka 异步解耦
 3. 订单簿**先集合版、后数组化**：M0 用 `TreeMap` 价格梯 + `LinkedHashMap` FIFO + `HashMap` 索引，先把正确性与确定性跑通；数组化（分页价格梯 + 两级位图 + 64B 订单槽 + 侵入式 FIFO，全 O(1)、零分配）列为 M3，换实现不动 `OrderBook` 接口
-4. 批量：下单入口 Disruptor 按 symbol 维护 `Map<String, List<Order>>`，任一 symbol 达到 2000 条或 50ms 窗口到达时，把 map 中所有 symbol 的订单分别封装为 `OrderCommandBatch`；批量 topic 消费 `max.poll.records=10`（逐条的 `me.account.commands` 仍为 2000）+ `fetch.max.wait.ms=50ms` + `fetch.min.bytes≈1MB`，每个 poll 批次一个 Kafka 事务；整批回滚后在**新事务**中重投，账户拒绝按记录身份缓存、资金流水按 eventId 去重、QuestDB 按 poll 批次批量写入
+4. 批量：下单入口 Disruptor 按 symbol 维护 `Map<String, List<Order>>`，任一 symbol 达到 2000 条或 50ms 窗口到达时，把 map 中所有 symbol 的订单分别封装为 `OrderCommandBatch`；批量 topic 消费 `max.poll.records=10`（逐条的 `me.account.commands` 仍为 2000）+ `fetch.max.wait.ms=50ms` + `fetch.min.bytes≈1MB`，每个 poll 批次一个 Kafka 事务；提交失败即 abort 并进入 fatal，不做整批重试，进程重启后从 committed offset 继续消费，账户拒绝按记录身份缓存、资金流水按 eventId 去重、QuestDB 按 poll 批次批量写入
 5. 确定性：冻结回执按 symbol 分区并行消费（同一 symbol 内仍单线程）、进程内按 symbol 串行撮合、整数运算；演示版**不缓存撮合输出**，同一订单的重复回执由匹配引擎按 `orderId` 去重，不再产生行情/结算；充值（key=userId）、冻结（key=symbol）、结算（key=slot）三条链路的批次由 `AccountOperationService` 全局锁串行，并按 Kafka 输入记录分配 `accountSeq`，跨链路的输入记录执行先后由该序号确定，批内不同 slot 仍并发、余额正确性由账户分片锁保证；委托侧下单 / 冻结回执 / 撤单三条链路由 `OrderOperationService` 全局锁串行，并按 Kafka 输入记录分配 `orderSeq`；快照/内存恢复列为后续计划
 6. 资金预占前置，撮合器只接收已冻结订单
 7. 背压快速失败（Kafka buffer / consumer lag 水位），绝不无限排队
@@ -254,7 +254,7 @@ pwsh -File .\stop-kafka.ps1
 
 | topic | 分区 | 用途 |
 |---|---|---|
-| `me.order.commands-batch` | 8 | 委托命令批量消息（`key=symbol`，每个 symbol 一条，body=`OrderCommandBatch`；币币 REST 经 Disruptor 按 symbol 攒批，任一 symbol 2000 条或 50ms flush，外部生产者需按同样格式写入；委托模块唯一接单入口，消费端线程池并发保存、冻结命令按原顺序聚合） |
+| `me.order.commands-batch` | 8 | 委托命令批量消息（`key=symbol`，每个 symbol 一条，body=`OrderCommandBatch`；币币 REST 经 Disruptor 按 symbol 攒批，任一 symbol 2000 条或 50ms flush，委托模块唯一接单入口；应用内部 topic，只由币币模块的批量 producer 写入，不支持外部直写；消费端按原顺序保存、冻结命令按原顺序聚合） |
 | `me.order.cancels-batch` | 8 | 撤单批量消息（`key=symbol`，每个 symbol 一条，body=`OrderCancelBatch`；币币 REST 经**独立撤单 Disruptor** 按「单 symbol 1000 条或 20ms」聚合，委托模块消费后撤销挂单并解冻剩余资金） |
 | `me.account.commands` | 8 | 充值 / 扣账等**非冻结**资金命令（`key=userId`，`logType` 指定业务日志类型；逐条消息） |
 | `me.account.order-freeze-commands-batch` | 8 | 下单冻结命令批量消息（`logType=ORDER_FREEZE`，`key=symbol`；每个 symbol 一条，body=`OrderFreezeCommandsBatch`；账户冻结按 symbol 分区并行，同一 symbol 内保序） |
@@ -416,9 +416,18 @@ curl -G http://localhost:9000/exec `
 - **新增交易对**：`POST /api/v1/admin/pairs`
   - 请求体包含 `baseCurrency` / `quoteCurrency`、价格 / 数量精度、最小下单量 / 金额、
     maker / taker 费率、状态与排序；symbol 由 `基础币-计价币` 派生。
-  - `quantityScale` 必须等于基础币种精度，价格 / 数量精度范围 `0~18`，费率范围
-    `-10000~10000` bps（负值返佣）。成功后立即刷新币币入口与委托模块的配置缓存，
-    无需重启应用。
+  - `quantityScale` 必须等于基础币种的 `raw_scale`，价格 / 数量精度范围 `0~18`，
+    费率范围 `-10000~10000` bps（负值返佣）。`priceScale` 不能高于计价币的
+    `raw_scale`（`priceScale <= quoteCurrency.raw_scale`），否则 amount 无法换算回
+    计价币原始整数，创建请求返回 `PRICE_SCALE_EXCEEDS_RAW_SCALE`。
+  - 币种表的 `scale` 是**展示小数上限**，`raw_scale` 是**账本原始精度**，必须
+    `scale <= raw_scale`。例如 USDT `scale=2, raw_scale=6`：内部按 6 位记账，
+    界面最多展示 2 位；这时 `0.1211` 与 `0.1299` 的 amount 仍是两个不同的 raw 值。
+    最小下单量按基础币 `raw_scale`、最小下单金额按计价币 `raw_scale` 存储。
+  - 启动时 `OrderConfigCache` 还会校验每个上线交易对：`quantityScale ==
+    base.raw_scale` 且 `priceScale <= quote.raw_scale`；不满足会直接启动失败，
+    避免带着单位不一致的配置接单（升级 `raw_scale` 前需迁移交易对 quantityScale）。
+  - 成功后立即刷新币币入口与委托模块的配置缓存，无需重启应用。
 - **修改交易对**：`PUT /api/v1/admin/pairs/{id}`
   - 可调整最小下单量 / 金额、费率、状态与排序；symbol、币种与价格 / 数量精度不可修改
     （订单簿按最小单位整数撮合，改精度会让新旧委托混用单位）。
@@ -582,7 +591,8 @@ curl "http://localhost:8080/api/v1/currency/user-trades?userId=1001&limit=50"
    （`key=symbol`）发送 `OrderFreezeCommandsBatch`（每个 symbol 一条，元素为 `FundsCommand`）：
    - `logType=ORDER_FREEZE`，`requestId=order-freeze:<orderId>`，`refId=orderId`；
    - 限价买单按 `price × quantity × 10^quoteScale / 10^(priceScale + quantityScale)` 换算成
-     计价币最小单位后冻结；卖单冻结基础币 `quantity`；
+     计价币**原始最小单位**后冻结（`quoteScale` 是计价币 `raw_scale`）；卖单冻结基础币
+     `quantity`（基础币 raw 单位）；
    - 市价买入冻结前端提交的 `amount`（卖一价，没有卖一则最新价 × 1.05 × 数量）。
      撮合时按实际卖价把预算换算成可买数量，未用完的金额在撮合结束后退回。
 3. **账户回执**：账户模块处理完冻结命令后，把成功 / 失败原因作为 `OrderFreezeResultEvent`
@@ -606,14 +616,23 @@ curl "http://localhost:8080/api/v1/currency/user-trades?userId=1001&limit=50"
 - **命令字段**：`requestId`（命令标识；演示版不做 requestId 级防重）、`orderId`、`userId`、`symbol`（`BASE-QUOTE`）、
   `side`（`BUY` / `SELL`）、`type`（`LIMIT` / `MARKET`）、`price`、`quantity`、`amount`，以及
   `priceScale` / `quantityScale` / `quoteScale`。价格按 `10^-priceScale`、数量按
-  `10^-quantityScale` 存储；金额按计价币 `10^-quoteScale` 换算（见 `com.me.shared.money.Amounts`）。
+  `10^-quantityScale` 存储；`quantityScale` 等于基础币 `raw_scale`，`quoteScale`
+  等于计价币 `raw_scale`，金额按计价币 `10^-quoteScale` 的原始整数换算
+  （见 `com.me.shared.money.Amounts`）。amount 的展示精度由 `priceScale` 决定，
+  与计价币 `scale` 的展示上限解耦。
+  数量必须是对齐最小步长 `10^max(0, priceScale + quantityScale - quoteScale)` 的整数倍；
+  否则与不同 maker 价格成交时金额可能无法整除成计价币原始单位，入口直接返回
+  `QUANTITY_STEP_INVALID`（例如 BTC-USDT 的步长是 `10^4`，即 0.0001 BTC）。
 - **参数校验**：`requestId` / `orderId` / `userId` / `symbol` / `side` / `type` 必填且合法；
   `symbol` 必须是 `BASE-QUOTE` 形式；限价单 `price > 0`，市价单 `price = 0`，`quantity > 0`；
   市价买入必须携带 `amount > 0`（计价币冻结预算），其他委托类型不允许携带 `amount`。
-- **重投语义（演示版）**：不做 requestId / 成交对 / 撮合输出的内存防重缓存。同一
-  `orderId + requestId` 重投返回已有委托的当前状态；同一 `orderId` 换 `requestId` 返回
-  `ORDER_ID_ALREADY_EXISTS`；成交重投由订单状态拒绝。冻结命令 `requestId` 固定，但账户模块
-  不按 `requestId` 去重，重投会再次执行。后续补备份消息与内存状态恢复，再替换为持久化幂等/重放。
+- **重复命令语义**：不做 requestId / 成交对 / 撮合输出的内存防重缓存。生产链路不会重复
+  投递同一命令：`me.order.commands-batch` 只由币币模块的批量 producer 写入（幂等、不重发），
+  消费端把输出与 offset 放在同一 Kafka 事务，失败即 fatal。同一 `orderId + requestId`
+  再次出现视为合同被破坏（时钟回拨撞号、回归或新增外部/重试入口），返回
+  `ORDER_DUPLICATE_COMMAND` 并记录 error，不重发冻结命令；同一 `orderId` 换 `requestId`
+  返回 `ORDER_ID_ALREADY_EXISTS`；成交重投由订单状态拒绝。账户模块不按 `requestId` 去重，
+  但只有上面的合同破坏路径才会让它看到重复的冻结命令。
 - **查询**：`OrderService.view(orderId)`，委托不存在返回 `null`；`OrderView` 携带状态、
   委托内状态序号 `seq`，以及冻结的币种和金额。`OrderService.openOrders(userId, symbol, limit)`
   返回用户当前未完成委托。
@@ -750,7 +769,9 @@ curl -X POST http://localhost:8080/api/v1/currency/orders/cancel \
 `REJECTED`，不会撮合，可通过 `GET /api/v1/orders/by-request-id?userId=...&requestId=...`
 查询（当前内存委托包含 `REJECTED`；`GET /api/v1/orders` 只返回未完成委托）。
 下单接口每次请求都由服务端生成新的 `orderId`，重复发送同一个 `requestId` 会产生新委托；
-委托模块内部的 `orderId + requestId` 去重只对直接写 Kafka 的外部生产者生效。
+`me.order.commands-batch` 是应用内部 topic，只由币币模块的批量 producer 写入，不支持外部
+生产者直写。委托模块对同一 `orderId + requestId` 再次出现会返回 `ORDER_DUPLICATE_COMMAND`
+并告警（正常链路不会发生）。
 
 ## 已实现：撮合内核 M0（集合版订单簿，委托模块进程内）
 
@@ -762,6 +783,9 @@ curl -X POST http://localhost:8080/api/v1/currency/orders/cancel \
 `com.me.config.MatchingConfig` 注册。
 
 ### 进程内化与重投语义（演示版）
+
+> 本文中的“重投”均指进程重启后从 committed offset 重新消费。消费端提交失败会 abort 并
+> 进入 fatal，不在本进程内整批重试。
 
 - 去掉 `me.orders`、`me.trades` 两次 Kafka 往返和两个消费阶段；一单从“冻结回执”直接进入撮合。
 - 冻结回执按 symbol 分区：同一 symbol 的消息固定落一个分区、由同一个 consumer 处理，
@@ -825,7 +849,7 @@ curl -X POST http://localhost:8080/api/v1/currency/orders/cancel \
 - `MatchingEngine.place()` 同步返回 `MatchResult`，按 `orderId` 幂等去重；
 - 成交清算在线程池中并发调用 `OrderMatchingService.clear`，委托状态推进后再聚合发送输出；
 - 委托模块先按 symbol 分组发布 `me.match-pair-batch` 撮合对批量消息，再按 userId slot 分组发布
-  `me.account.settlements-batch` 结算批量消息（`amount` 已按交易对 / 币种精度换算成计价币最小单位）；
+  `me.account.settlements-batch` 结算批量消息（`amount` 已按交易对 / 币种 raw_scale 换算成计价币原始最小单位）；
 - 撮合对/结算发送与 `me.order.freeze-results-batch` 消费 offset 在同一个 Kafka 事务内提交；
   行情模块与 admin 各自以独立消费组消费 `me.match-pair-batch`（见「行情模块 M0」与「用户成交记录」）。
 
@@ -1255,7 +1279,8 @@ curl http://localhost:8080/api/v1/pairs
 ```
 
 演示数据见 [`doc/mysql/pair_seed.sql`](doc/mysql/pair_seed.sql)，建表脚本为
-[`pair_currency.sql`](doc/mysql/pair_currency.sql) / [`pair_symbol.sql`](doc/mysql/pair_symbol.sql)；
+[`pair_currency.sql`](doc/mysql/pair_currency.sql) / [`pair_symbol.sql`](doc/mysql/pair_symbol.sql)
+（`pair_currency` 直接包含 `raw_scale` 与 `CHECK (scale <= raw_scale)`）；
 备份快照记录表见 [`snapshot_backup.sql`](doc/mysql/snapshot_backup.sql)：
 
 ```powershell
@@ -1298,15 +1323,16 @@ curl -X POST http://localhost:8080/api/v1/currency/orders \
 - **异步部分**：Kafka broker ack、委托保存、`ACCEPTED → PAID / REJECTED`、进程内撮合、
   成交清算全部由委托模块消费 `me.order.commands-batch` 后推进。余额不足（`REJECTED`）、
   成交状态、冻结失败等都不会通过本接口返回，可通过 `GET /api/v1/orders` 观察；
-  外部生产者直接写 Kafka 时，同一 `orderId` 换 `requestId` 会返回 `ORDER_ID_ALREADY_EXISTS`。
+  委托模块对同一 `orderId` 换 `requestId` 返回 `ORDER_ID_ALREADY_EXISTS`（正常链路不会发生）。
 - **模块边界**：币币模块不 import / 调用任何 `com.me.order` 类型或服务；
   `OrderCommandListener` 是唯一接单入口。
 - **字段**：`requestId` 缺省时服务端生成 UUID，客户端重试应带上；<b>`orderId` 始终由币币模块
   生成，请求不接受客户端指定</b>。
 - **校验错误**（`400 Bad Request`）：`SYMBOL_NOT_FOUND`、`SYMBOL_NOT_TRADING`、
-  `BELOW_MIN_ORDER_QUANTITY`、`BELOW_MIN_ORDER_AMOUNT`、`PRICE_REQUIRED_FOR_LIMIT`、
-  `PRICE_NOT_ALLOWED_FOR_MARKET`、`QUANTITY_INVALID`、`AMOUNT_OVERFLOW`、
-  `AMOUNT_REQUIRED_FOR_MARKET_BUY`、`AMOUNT_NOT_ALLOWED` 等。
+  `BELOW_MIN_ORDER_QUANTITY`、`BELOW_MIN_ORDER_AMOUNT`、`QUANTITY_STEP_INVALID`、
+  `PRICE_SCALE_EXCEEDS_RAW_SCALE`、`PRICE_REQUIRED_FOR_LIMIT`、
+  `PRICE_NOT_ALLOWED_FOR_MARKET`、`QUANTITY_INVALID`、
+  `AMOUNT_OVERFLOW`、`AMOUNT_REQUIRED_FOR_MARKET_BUY`、`AMOUNT_NOT_ALLOWED` 等。
 - **同步入队失败**（producer 已关闭、序列化失败、缓冲区满等）返回
   `503 Service Unavailable` + `ORDER_COMMAND_PUBLISH_FAILED`；入队后的 broker 侧发送失败
   只在服务端记录错误日志，不会返回给调用方。客户端重试会得到新的 `orderId`（即新委托）；
@@ -1374,8 +1400,10 @@ curl http://localhost:8080/api/v1/accounts/1001/balances
 
 ### 币种列表
 
-`GET /api/v1/currencies` 返回启用中的币种及其精度（`pair_currency.scale`），按展示顺序升序。
-前端用 `scale` 把余额、价格、数量等最小单位整数换算成展示值：
+`GET /api/v1/currencies` 返回启用中的币种及其精度（`pair_currency.scale` /
+`pair_currency.raw_scale`），按展示顺序升序。`raw_scale` 是账本原始精度，用于把余额、
+冻结、数量、成交金额等最小单位整数换算成真实值；`scale` 是展示小数上限，
+必须 `scale <= raw_scale`：
 
 ```bash
 curl http://localhost:8080/api/v1/currencies
@@ -1383,15 +1411,18 @@ curl http://localhost:8080/api/v1/currencies
 
 ```json
 [
-  { "id": 1, "code": "BTC", "name": "比特币", "scale": 8, "status": 1, "sortOrder": 1 },
-  { "id": 3, "code": "USDT", "name": "泰达币", "scale": 6, "status": 1, "sortOrder": 3 }
+  { "id": 1, "code": "BTC", "name": "比特币", "scale": 8, "rawScale": 8, "status": 1, "sortOrder": 1 },
+  { "id": 3, "code": "USDT", "name": "泰达币", "scale": 2, "rawScale": 6, "status": 1, "sortOrder": 3 }
 ]
 ```
+
+> `pair_seed.sql` 使用 USDT `scale=2 / raw_scale=6`（展示 2 位、账本 6 位）；
+> 调整 `raw_scale` 前必须按比例迁移余额、冻结、流水与历史成交金额。
 
 ### 管理端充值（模拟登录）
 
 `POST /api/v1/admin/recharges` 接收用户 ID、币种和**展示金额**（按币种单位计的整数，
-缺省 1,000,000，即 100 万），按 `pair_currency.scale` 换算成账本最小单位后，
+缺省 1,000,000，即 100 万），按 `pair_currency.raw_scale` 换算成账本最小单位后，
 向 `me.account.commands` 投递一条 `DEPOSIT` 命令：
 
 ```bash
@@ -1438,7 +1469,7 @@ curl -X POST http://localhost:8080/api/v1/admin/recharges \
 - **下单**：开启后每个 `order-interval-ms`（默认 500ms）为每个交易对提交一笔限价单：
   价格 = 币安最新价（按交易对 `priceScale` 换算），数量 = `order-notional / 最新价`
   （按 `quantityScale` 向下取整，并再对齐到
-  `10^(priceScale + quantityScale - quoteScale)` 的整数倍，保证任何成交价下
+  `10^(priceScale + quantityScale - quoteRawScale)` 的整数倍，保证任何成交价下
   `价 × 量` 都能整除成计价币最小单位），买卖方向逐交易对交替。下单复用币币模块的
   `OrderCommandAssembler` + `OrderCommandPublisher`，与 REST 下单走同一条 Kafka 链路。
 - **网络测试**：`POST /api/v1/bot/enable` 先调用币安 REST 测试接口
@@ -1527,8 +1558,9 @@ app:
   当前用户每一笔成交（QuestDB `user_trade`，主动 / 被动、方向、价格、数量、成交额，按成交时间
   倒序，5 秒轮询），历史流水展示当前用户 QuestDB `funds_flow` 记录，按发生时间倒序、最新在前
   （5 秒轮询）；资产余额
-  （可用 / 冻结，按币种精度换算）；限价 / 市价、
-  买入 / 卖出表单（25% / 50% / 75% / 100% 快捷填量，提交前校验最小下单量与最小金额，
+  （可用 / 冻结，按币种 raw_scale 换算，展示受 scale 上限约束）；限价 / 市价、
+  买入 / 卖出表单（25% / 50% / 75% / 100% 快捷填量，快捷填量会向下对齐最小数量步长；
+  提交前校验最小下单量、数量步长与最小金额，
   提交前还用轮询到的余额快照校验冻结金额 / 数量：不足时展示「可用余额不足」及差额，
   并主动刷新余额后让用户重试；最终仍以后端冻结回执为准）；自动生成 `requestId` 仅作命令
   标识，演示版不用于防重。
@@ -1564,6 +1596,8 @@ npm run build      # 产物在 web/dist
 > 余额是内存态，重启后端会清零。本地演示可向 Kafka `me.account.commands` 发送
 > `DEPOSIT` 命令充值（见上文「本地验证」），前端 5 秒内会刷新出来。
 >
-> 价格按交易对 `priceScale`、数量按 `quantityScale`、余额 / 冻结 / 成交金额按币种 `scale`
-> 的整数口径传输。前端负责展示值和小数输入的换算；订单冻结与成交金额按
-> `price × quantity × 10^quoteScale / 10^(priceScale + quantityScale)` 统一换算。
+> 价格按交易对 `priceScale`、数量按 `quantityScale`、余额 / 冻结 / 成交金额按币种
+> `raw_scale` 的整数口径传输；`scale` 只作为展示小数上限。前端负责展示值和小数输入的
+> 换算；订单冻结与成交金额按
+> `price × quantity × 10^quoteScale / 10^(priceScale + quantityScale)` 统一换算
+> （`quoteScale` 为计价币 `raw_scale`，amount 展示按 `priceScale`）。

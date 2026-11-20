@@ -57,23 +57,94 @@ export function formatUnits(
 }
 
 /**
- * 价格 × 数量 → 计价币最小单位金额。
+ * 价格 × 数量 → 计价币最小单位金额，无法整除时返回 `null`。
  *
- * 价格按 `10^-priceScale`、数量按 `10^-quantityScale` 存储，金额按 `10^-quoteScale`；
- * 与后端 `com.me.shared.money.Amounts` 使用同一公式。
+ * 与后端 `com.me.shared.money.Amounts.quoteAmount` 的整除要求一致：不能为了展示
+ * 而向下取整，否则不同价格（例如 0.1211 / 0.1299）在较粗的金额精度下会显示成同一个
+ * 金额，用户会误以为价格无效。返回 `null` 表示该价格 × 数量无法用当前计价币精度
+ * 精确记账，表单应阻止提交，而不是显示一个截断值。
  */
-export function quoteAmount(
+export function exactQuoteAmount(
   price: bigint,
   quantity: bigint,
   priceScale: number,
   quantityScale: number,
   quoteScale: number,
-): bigint {
+): bigint | null {
   const numerator = price * quantity * 10n ** BigInt(Math.max(0, quoteScale));
   const denominator = 10n ** BigInt(
     Math.max(0, priceScale) + Math.max(0, quantityScale),
   );
+  if (numerator % denominator !== 0n) {
+    return null;
+  }
   return numerator / denominator;
+}
+
+/**
+ * raw 整数按 `rawScale` 解释，并按 `displayScale` 截断展示。
+ *
+ * <p>`displayScale` 是展示上限（币种 `scale` 或交易对 `priceScale`），必须
+ * `<= rawScale`。账户/撮合始终按 raw 精度计算；截断只影响展示，不改变账本。
+ */
+export function formatDisplayUnits(
+  raw: number | bigint | string,
+  rawScale: number,
+  displayScale: number,
+  options: FormatOptions = {},
+): string {
+  const safeRawScale = Math.max(0, Math.min(Math.trunc(rawScale), 18));
+  const safeDisplayScale = Math.max(
+    0,
+    Math.min(Math.trunc(displayScale), safeRawScale),
+  );
+  if (safeDisplayScale >= safeRawScale) {
+    return formatUnits(raw, safeRawScale, options);
+  }
+  const divisor = 10n ** BigInt(safeRawScale - safeDisplayScale);
+  return formatUnits(toBigInt(raw) / divisor, safeDisplayScale, options);
+}
+
+/**
+ * 数量最小步长：保证任意整数价格下 `price × quantity` 都能换算成计价币最小单位。
+ *
+ * 与后端 `com.me.shared.money.Amounts.isQuantityAligned` 使用同一规则：
+ * `10^max(0, priceScale + quantityScale - quoteScale)`。
+ */
+export function quantityStep(
+  priceScale: number,
+  quantityScale: number,
+  quoteScale: number,
+): bigint {
+  const netScale = Math.max(
+    0,
+    Math.trunc(priceScale) + Math.trunc(quantityScale) - Math.trunc(quoteScale),
+  );
+  return 10n ** BigInt(netScale);
+}
+
+/** 数量是否对齐最小步长；正整数且能被步长整除时为 true。 */
+export function isQuantityAligned(
+  quantity: bigint,
+  priceScale: number,
+  quantityScale: number,
+  quoteScale: number,
+): boolean {
+  if (quantity <= 0n) {
+    return false;
+  }
+  return quantity % quantityStep(priceScale, quantityScale, quoteScale) === 0n;
+}
+
+/** 把数量向下对齐到最小步长；用于 25% / 50% 等按余额估算的快捷填量。 */
+export function alignQuantityDown(
+  quantity: bigint,
+  priceScale: number,
+  quantityScale: number,
+  quoteScale: number,
+): bigint {
+  const step = quantityStep(priceScale, quantityScale, quoteScale);
+  return step === 1n ? quantity : (quantity / step) * step;
 }
 
 /** 市价买入预算倍数：参考价 × 1.05 留出价格波动缓冲。 */

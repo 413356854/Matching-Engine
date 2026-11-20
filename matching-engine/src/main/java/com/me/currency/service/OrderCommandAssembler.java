@@ -14,7 +14,7 @@ import org.springframework.stereotype.Component;
 /**
  * 下单请求的共享组装器：单笔接口与批量测试接口共用。
  *
- * <p>负责同步校验、补齐交易对 / 币种精度、生成委托号，并组装成
+ * <p>负责同步校验、补齐交易对 / 币种 raw_scale、生成委托号，并组装成
  * {@link OrderCommand}。<b>委托号只在这里生成</b>，请求不携带 orderId。
  *
  * <p>只做同步校验，不保存委托、不冻结资金、不发送 Kafka；命令由调用方交给
@@ -60,9 +60,11 @@ public class OrderCommandAssembler {
         // 市价买入的预算：前端按卖一价（没有则最新价）× 1.05 × 数量算出，后端只做冻结与撮合。
         long marketBuyAmount = isMarketBuy(request) ? request.amount() : 0L;
         CurrencyView quoteCurrency = configCache.currency(pair.quoteCurrency());
-        int quoteScale = quoteCurrency == null ? 0 : quoteCurrency.scale();
+        // amount 的原始整数来自计价币 raw_scale；price_scale 只是 amount 的
+        // 计算/展示精度，不参与账户单位换算。
+        int quoteRawScale = quoteCurrency == null ? 0 : quoteCurrency.rawScale();
         String pairInvalidReason = validateAgainstPair(
-                pair, price, request.quantity(), marketBuyAmount, quoteScale);
+                pair, price, request.quantity(), marketBuyAmount, quoteRawScale);
         if (pairInvalidReason != null) {
             return new Result(requestId, null, symbol, null, pairInvalidReason);
         }
@@ -72,7 +74,7 @@ public class OrderCommandAssembler {
         OrderCommand command = new OrderCommand(
                 requestId, orderId, request.userId(), symbol,
                 request.side(), request.type(), price, request.quantity(),
-                pair.priceScale(), pair.quantityScale(), quoteScale, marketBuyAmount);
+                pair.priceScale(), pair.quantityScale(), quoteRawScale, marketBuyAmount);
         return new Result(requestId, orderId, symbol, command, null);
     }
 
@@ -120,11 +122,27 @@ public class OrderCommandAssembler {
         return null;
     }
 
-    /** 按交易对配置校验最小下单量和最小下单金额；通过返回 {@code null}。 */
+    /** 按交易对配置校验最小下单量、数量步长和最小下单金额；通过返回 {@code null}。 */
     private static String validateAgainstPair(TradingPairView pair, long price, long quantity,
-                                              long marketBuyAmount, int quoteScale) {
+                                              long marketBuyAmount, int quoteRawScale) {
         if (pair.minOrderQuantity() > 0 && quantity < pair.minOrderQuantity()) {
             return "BELOW_MIN_ORDER_QUANTITY";
+        }
+        // 价格精度高于计价币 raw_scale 时，amount 无法换算回计价币原始整数；
+        // 该交易对配置本身不可用（创建入口已拦截，这里防御存量/手工写入的配置）。
+        if (pair.priceScale() > quoteRawScale) {
+            return "PRICE_SCALE_EXCEEDS_RAW_SCALE";
+        }
+        // 数量必须对齐最小步长，保证与任意 maker 价格成交时价 × 量都能整除成
+        // 计价币最小单位；否则撮合引擎会在成交时因金额不可表示而进入 fatal。
+        // 精度越界的交易对配置也按该原因拒绝，避免把配置错误变成 500。
+        try {
+            if (!Amounts.isQuantityAligned(quantity, pair.priceScale(), pair.quantityScale(),
+                    quoteRawScale)) {
+                return "QUANTITY_STEP_INVALID";
+            }
+        } catch (IllegalArgumentException e) {
+            return "QUANTITY_STEP_INVALID";
         }
         if (marketBuyAmount > 0) {
             // 市价买入直接以预算金额做最小金额校验；预算已由前端换算成计价币最小单位。
@@ -139,7 +157,7 @@ public class OrderCommandAssembler {
             long amount;
             try {
                 amount = Amounts.quoteAmount(price, quantity,
-                        pair.priceScale(), pair.quantityScale(), quoteScale);
+                        pair.priceScale(), pair.quantityScale(), quoteRawScale);
             } catch (ArithmeticException | IllegalArgumentException e) {
                 return "AMOUNT_OVERFLOW";
             }

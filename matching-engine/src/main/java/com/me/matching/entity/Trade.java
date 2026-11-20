@@ -7,7 +7,7 @@ import com.me.shared.order.OrderSide;
  * 一笔成交。
  *
  * <p><b>撮合以数量为基准</b>：成交量 = min(新单剩余量, 挂单剩余量)；
- * <b>支付 / 交换金额</b> 按价格 / 数量 / 计价币精度换算成计价币最小单位
+ * <b>支付 / 交换金额</b> 按价格 / 数量 / 计价币 raw_scale 换算成计价币原始最小单位
  * （见 {@link Amounts#quoteAmount}）。
  *
  * <p>成交价规则：限价对限价取挂单（maker）价格；限价对市价取限价单价格

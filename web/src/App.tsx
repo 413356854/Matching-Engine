@@ -608,10 +608,20 @@ function App() {
       }
     }
     for (const currency of currencies) {
-      scales[currency.code] = currency.scale;
+      // 所有 raw 余额/金额都按 rawScale 格式化；展示小数上限由各面板的
+      // currency.scale 控制（Phase 2），这里先保证 raw 精度不丢失。
+      scales[currency.code] = currency.rawScale;
     }
     return scales;
   }, [currencies, pairs]);
+
+  const currencyDisplayScales = useMemo(() => {
+    const scales: Record<string, number> = {};
+    for (const currency of currencies) {
+      scales[currency.code] = currency.scale;
+    }
+    return scales;
+  }, [currencies]);
 
   const lastPrice =
     klines.length > 0 ? klines[klines.length - 1].closePrice : lastPrices[selectedSymbol];
@@ -663,6 +673,7 @@ function App() {
               flows={fundsFlows}
               flowsError={fundsFlowsError}
               currencyScales={currencyScales}
+              currencyDisplayScales={currencyDisplayScales}
               userId={userId}
               // 撤单与下单一样异步生效：先刷新一次，1.5s 后再刷新，等待解冻与状态落定。
               onOrderCanceled={handleOrderPlaced}
@@ -697,6 +708,7 @@ function App() {
               balances={balances}
               pair={pair}
               currencyScales={currencyScales}
+              currencyDisplayScales={currencyDisplayScales}
               error={balancesError}
               onRefresh={refreshBalances}
             />

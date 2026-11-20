@@ -7,12 +7,13 @@
 --   3. 下单接口会校验交易对存在且 status=1，最小下单量/金额为 0 表示不限制。
 -- =====================================================================
 
-INSERT INTO `pair_currency` (`code`, `name`, `scale`, `status`, `sort_order`)
-VALUES ('BTC', '比特币', 8, 1, 1),
-       ('ETH', '以太坊', 8, 1, 2),
-       ('USDT', '泰达币', 6, 1, 3)
+INSERT INTO `pair_currency` (`code`, `name`, `scale`, `raw_scale`, `status`, `sort_order`)
+VALUES ('BTC', '比特币', 8, 8, 1, 1),
+       ('ETH', '以太坊', 8, 8, 1, 2),
+       ('USDT', '泰达币', 2, 6, 1, 3)
 ON DUPLICATE KEY UPDATE `name`       = VALUES(`name`),
                         `scale`      = VALUES(`scale`),
+                        `raw_scale`  = VALUES(`raw_scale`),
                         `status`     = VALUES(`status`),
                         `sort_order` = VALUES(`sort_order`);
 

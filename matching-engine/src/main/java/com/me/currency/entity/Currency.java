@@ -8,8 +8,10 @@ import java.time.LocalDateTime;
 /**
  * 币种表 {@code pair_currency}。
  *
- * <p>币种精度用 {@code scale} 表示小数位数，金额一律是最小单位的整数：
- * 1 BTC = 10<sup>8</sup> sat，{@code scale = 8}。
+ * <p>{@code rawScale} 是账本原始精度：金额/数量最小单位 = 10<sup>-rawScale</sup>；
+ * {@code scale} 是对用户的展示小数上限，必须小于等于 {@code rawScale}。
+ * 例如 USDT 可以 {@code rawScale=6}、{@code scale=2}：内部按 6 位记账，
+ * 界面最多展示 2 位。
  */
 @TableName("pair_currency")
 public class Currency {
@@ -24,8 +26,11 @@ public class Currency {
     /** 币种名称，如 比特币。 */
     private String name;
 
-    /** 小数位数，最小单位 = 10^-scale。 */
+    /** 展示小数上限，必须 <= rawScale。 */
     private Integer scale;
+
+    /** 账本原始精度，金额/数量最小单位 = 10^-rawScale。 */
+    private Integer rawScale;
 
     /** 状态：1=启用，0=停用。 */
     private Integer status;
@@ -69,6 +74,14 @@ public class Currency {
 
     public void setScale(Integer scale) {
         this.scale = scale;
+    }
+
+    public Integer getRawScale() {
+        return rawScale;
+    }
+
+    public void setRawScale(Integer rawScale) {
+        this.rawScale = rawScale;
     }
 
     public Integer getStatus() {

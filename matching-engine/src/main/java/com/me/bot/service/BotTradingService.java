@@ -254,7 +254,7 @@ public class BotTradingService {
      * <p>账本按<b>成交价</b>（maker 挂单价）和成交量换算计价币金额，且要求精确整除。
      * 机器人的订单既可能做 maker 也可能做 taker，成交价是任一笔币安报价换算出的
      * 任意整数价格，因此数量必须满足：对任意价格，{@code priceSmallest × quantitySmallest}
-     * 都能被 {@code 10^(priceScale + quantityScale - quoteScale)} 整除。
+     * 都能被 {@code 10^(priceScale + quantityScale - quoteRawScale)} 整除。
      * 做法是把数量向下对齐到该 10 的幂（而不是某个具体价格的 gcd 步长），
      * 保证全链路成交金额都是整数，避免撮合内核抛 {@code quote amount is not an integer}。
      */
@@ -269,8 +269,8 @@ public class BotTradingService {
         }
 
         CurrencyView quoteCurrency = configCache.currency(pair.quoteCurrency());
-        int quoteScale = quoteCurrency == null ? 0 : quoteCurrency.scale();
-        int netScale = priceScale + pair.quantityScale() - quoteScale;
+        int quoteRawScale = quoteCurrency == null ? 0 : quoteCurrency.rawScale();
+        int netScale = priceScale + pair.quantityScale() - quoteRawScale;
         if (netScale <= 0) {
             return smallest;
         }

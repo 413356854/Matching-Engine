@@ -83,7 +83,7 @@ public class AdminRechargeController {
 
         long ledgerAmount;
         try {
-            ledgerAmount = toLedgerAmount(displayAmount, currencyView.scale());
+            ledgerAmount = toLedgerAmount(displayAmount, currencyView.rawScale());
         } catch (ArithmeticException e) {
             return badRequest(AdminRechargeView.rejected(
                     request.userId(), currency, "AMOUNT_OVERFLOW"));
@@ -94,7 +94,7 @@ public class AdminRechargeController {
                     request.userId(), currency, ledgerAmount);
             return ResponseEntity.status(HttpStatus.ACCEPTED)
                     .body(AdminRechargeView.success(requestId, request.userId(), currency,
-                            ledgerAmount, displayAmount, currencyView.scale()));
+                            ledgerAmount, displayAmount, currencyView.rawScale()));
         } catch (IllegalStateException e) {
             log.error("admin recharge publish failed: userId={}, currency={}, amount={}",
                     request.userId(), currency, ledgerAmount, e);
@@ -104,7 +104,7 @@ public class AdminRechargeController {
         }
     }
 
-    /** 展示金额 × 10^scale；溢出时抛出 {@link ArithmeticException}。 */
+    /** 展示金额 × 10^rawScale；溢出时抛出 {@link ArithmeticException}。 */
     static long toLedgerAmount(long displayAmount, int scale) {
         long factor = 1L;
         for (int i = 0; i < scale; i++) {

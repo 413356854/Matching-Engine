@@ -1,5 +1,5 @@
 import type { AccountBalance, TradingPair } from '../api';
-import { formatUnits } from '../format';
+import { formatDisplayUnits } from '../format';
 import { RefreshIcon, WalletIcon } from './icons';
 
 interface BalancesPanelProps {
@@ -7,6 +7,7 @@ interface BalancesPanelProps {
   balances: AccountBalance[];
   pair?: TradingPair;
   currencyScales: Record<string, number>;
+  currencyDisplayScales: Record<string, number>;
   error: string | null;
   onRefresh: () => void;
 }
@@ -16,6 +17,7 @@ export function BalancesPanel({
   balances,
   pair,
   currencyScales,
+  currencyDisplayScales,
   error,
   onRefresh,
 }: BalancesPanelProps) {
@@ -64,7 +66,8 @@ export function BalancesPanel({
 
       <div className="balance-list">
         {ordered.map((balance) => {
-          const scale = currencyScales[balance.currency] ?? 0;
+          const rawScale = currencyScales[balance.currency] ?? 0;
+          const displayScale = currencyDisplayScales[balance.currency] ?? rawScale;
           const isPairCurrency =
             pair &&
             (balance.currency === pair.baseCurrency || balance.currency === pair.quoteCurrency);
@@ -82,10 +85,10 @@ export function BalancesPanel({
                 </small>
               </span>
               <span className="balance-value" title={`${balance.available} 最小单位`}>
-                {formatUnits(balance.available, scale)}
+                {formatDisplayUnits(balance.available, rawScale, displayScale)}
               </span>
               <span className="balance-value frozen" title={`${balance.frozen} 最小单位`}>
-                {formatUnits(balance.frozen, scale)}
+                {formatDisplayUnits(balance.frozen, rawScale, displayScale)}
               </span>
             </div>
           );

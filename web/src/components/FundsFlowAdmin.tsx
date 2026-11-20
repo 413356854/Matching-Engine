@@ -9,7 +9,7 @@ import {
   type FundsFlowQuery,
 } from '../api';
 import { describeError } from '../errors';
-import { formatDateTime, formatUnits } from '../format';
+import { formatDateTime, formatDisplayUnits } from '../format';
 import { RefreshIcon } from './icons';
 import type { ToastKind } from './ToastStack';
 
@@ -53,6 +53,8 @@ function clockText(value: Date): string {
 }
 
 export function FundsFlowAdmin({ currencies, currencyScales, notify }: FundsFlowAdminProps) {
+  const displayScaleFor = (currency: string) =>
+    currencies.find((item) => item.code === currency)?.scale;
   const [userIdInput, setUserIdInput] = useState('');
   const [currencyInput, setCurrencyInput] = useState('');
   const [logTypeInput, setLogTypeInput] = useState('');
@@ -278,7 +280,8 @@ export function FundsFlowAdmin({ currencies, currencyScales, notify }: FundsFlow
           </thead>
           <tbody>
             {flows.map((flow) => {
-              const scale = currencyScales[flow.currency] ?? 0;
+              const rawScale = currencyScales[flow.currency] ?? 0;
+              const displayScale = displayScaleFor(flow.currency) ?? rawScale;
               return (
                 <tr
                   key={`${flow.eventId}-${flow.seq}-${flow.occurredAt}`}
@@ -295,19 +298,21 @@ export function FundsFlowAdmin({ currencies, currencyScales, notify }: FundsFlow
                       {OP_LABELS[flow.op] ?? flow.op}
                     </span>
                   </td>
-                  <td className="mono align-right">{formatUnits(flow.amount, scale)}</td>
+                  <td className="mono align-right">
+                    {formatDisplayUnits(flow.amount, rawScale, displayScale)}
+                  </td>
                   <td className="mono align-right">
                     <span className="admin-balance">
-                      {formatUnits(flow.availableBefore, scale)}
+                      {formatDisplayUnits(flow.availableBefore, rawScale, displayScale)}
                       <i>→</i>
-                      <b>{formatUnits(flow.availableAfter, scale)}</b>
+                      <b>{formatDisplayUnits(flow.availableAfter, rawScale, displayScale)}</b>
                     </span>
                   </td>
                   <td className="mono align-right">
                     <span className="admin-balance">
-                      {formatUnits(flow.frozenBefore, scale)}
+                      {formatDisplayUnits(flow.frozenBefore, rawScale, displayScale)}
                       <i>→</i>
-                      <b>{formatUnits(flow.frozenAfter, scale)}</b>
+                      <b>{formatDisplayUnits(flow.frozenAfter, rawScale, displayScale)}</b>
                     </span>
                   </td>
                   <td className="mono align-right muted">{flow.seq}</td>

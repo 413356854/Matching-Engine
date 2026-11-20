@@ -7,8 +7,8 @@ import java.time.Instant;
  * 不再写入 Kafka {@code me.orders}。
  *
  * <p>价格按 {@code 10^-priceScale}、数量按 {@code 10^-quantityScale} 存储，成交金额按
- * {@code 10^-quoteScale} 的计价币最小单位计算（见 {@code com.me.shared.money.Amounts}）；
- * {@code frozenAmount} 也是计价币最小单位。
+ * 计价币 {@code raw_scale}（{@code quoteScale}）的最小单位计算
+ * （见 {@code com.me.shared.money.Amounts}）；{@code frozenAmount} 也是计价币原始最小单位。
  *
  * <p><b>可能重复出现</b>：冻结回执可能因 Kafka 事务回滚重投或重复命令再次投递，同一
  * {@code orderId} 可能被多次送入撮合；撮合引擎按 orderId 去重，重复事件返回

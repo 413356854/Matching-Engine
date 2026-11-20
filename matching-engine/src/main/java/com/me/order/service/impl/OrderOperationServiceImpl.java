@@ -296,9 +296,9 @@ public class OrderOperationServiceImpl implements OrderOperationService {
             return new SaveOutcome(SaveStatus.UNKNOWN_SYMBOL, null);
         }
         CurrencyView quoteCurrency = configCache.currency(pair.quoteCurrency());
-        int quoteScale = quoteCurrency == null ? 0 : quoteCurrency.scale();
+        int quoteRawScale = quoteCurrency == null ? 0 : quoteCurrency.rawScale();
         OrderCommand scaled = command.withScales(
-                pair.priceScale(), pair.quantityScale(), quoteScale);
+                pair.priceScale(), pair.quantityScale(), quoteRawScale);
 
         // apply 内部完成价格/数量/冻结金额校验，并把委托写入内存委托表。
         OrderApplyResult result = orderService.apply(scaled);

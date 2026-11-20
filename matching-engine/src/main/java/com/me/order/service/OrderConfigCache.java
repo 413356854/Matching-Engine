@@ -49,6 +49,26 @@ public class OrderConfigCache {
                 currencies.put(normalize(currency.code()), currency);
             }
         }
+        // 交易对与币种精度必须满足撮合/账本的单位约定：
+        //   quantityScale == base.raw_scale（数量直接是基础币 raw 单位）
+        //   priceScale <= quote.raw_scale（amount 可换算回计价币 raw 单位）
+        for (TradingPairView pair : pairs.values()) {
+            CurrencyView base = currencies.get(normalize(pair.baseCurrency()));
+            if (base != null && pair.quantityScale() != base.rawScale()) {
+                throw new IllegalStateException("pair " + pair.symbol()
+                        + " quantityScale=" + pair.quantityScale()
+                        + " must equal base " + base.code() + " raw_scale="
+                        + base.rawScale());
+            }
+            CurrencyView quote = currencies.get(normalize(pair.quoteCurrency()));
+            if (quote != null && pair.priceScale() > quote.rawScale()) {
+                throw new IllegalStateException("pair " + pair.symbol()
+                        + " priceScale=" + pair.priceScale()
+                        + " exceeds quote " + quote.code() + " raw_scale="
+                        + quote.rawScale());
+            }
+        }
+
         pairsBySymbol = Map.copyOf(pairs);
         currenciesByCode = Map.copyOf(currencies);
     }

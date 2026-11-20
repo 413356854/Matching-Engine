@@ -36,11 +36,16 @@ public class CurrencyServiceImpl implements CurrencyService {
 
     private static CurrencyView toView(Currency currency) {
         // 币种代码在进入缓存前归一化；下游直接使用 view 里的 code。
+        int scale = Objects.requireNonNullElse(currency.getScale(), 0);
+        // 旧库没有 raw_scale 时退回 scale，保持原有单位；
+        // 新库应显式配置 raw_scale >= scale。
+        int rawScale = Objects.requireNonNullElse(currency.getRawScale(), scale);
         return new CurrencyView(
                 Objects.requireNonNullElse(currency.getId(), 0L),
                 normalize(currency.getCode()),
                 currency.getName(),
-                Objects.requireNonNullElse(currency.getScale(), 0),
+                scale,
+                rawScale,
                 Objects.requireNonNullElse(currency.getStatus(), 0),
                 Objects.requireNonNullElse(currency.getSortOrder(), 0));
     }

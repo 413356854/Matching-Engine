@@ -61,7 +61,7 @@ public class BotAccountBootstrap {
             }
             long target;
             try {
-                target = toLedgerAmount(displayAmount, currency.scale());
+                target = toLedgerAmount(displayAmount, currency.rawScale());
             } catch (ArithmeticException e) {
                 log.warn("bot initial deposit skipped: amount overflow, currency={}, amount={}",
                         currencyCode, displayAmount);
@@ -89,7 +89,7 @@ public class BotAccountBootstrap {
         return balances;
     }
 
-    /** 展示金额 × 10^scale；溢出时抛出 {@link ArithmeticException}。 */
+    /** 展示金额 × 10^rawScale；溢出时抛出 {@link ArithmeticException}。 */
     private static long toLedgerAmount(BigDecimal displayAmount, int scale) {
         return displayAmount.movePointRight(scale)
                 .setScale(0, RoundingMode.DOWN)

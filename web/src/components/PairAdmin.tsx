@@ -10,7 +10,14 @@ import {
   type TradingPair,
 } from '../api';
 import { describeError } from '../errors';
-import { formatInputValue, formatUnits, parseUnits, toSafeNumber } from '../format';
+import {
+  formatDisplayUnits,
+  formatInputValue,
+  formatUnits,
+  parseUnits,
+  quantityStep,
+  toSafeNumber,
+} from '../format';
 import { RefreshIcon } from './icons';
 import type { ToastKind } from './ToastStack';
 
@@ -254,7 +261,7 @@ export function PairAdmin({ currencies, notify, onPairsChanged }: PairAdminProps
           </thead>
           <tbody>
             {pairs.map((pair) => {
-              const quoteScale = currencyMap.get(pair.quoteCurrency)?.scale ?? 0;
+              const quoteScale = currencyMap.get(pair.quoteCurrency)?.rawScale ?? 0;
               const busy = busyId === pair.id;
               return (
                 <tr key={pair.id}>
@@ -280,7 +287,11 @@ export function PairAdmin({ currencies, notify, onPairsChanged }: PairAdminProps
                     title={`${pair.minOrderAmount.toLocaleString('zh-CN')} ${pair.quoteCurrency} 最小单位`}
                   >
                     {pair.minOrderAmount > 0
-                      ? `${formatUnits(pair.minOrderAmount, quoteScale)} ${pair.quoteCurrency}`
+                      ? `${formatDisplayUnits(
+                        pair.minOrderAmount,
+                        quoteScale,
+                        pair.priceScale,
+                      )} ${pair.quoteCurrency}`
                       : '不限'}
                   </td>
                   <td className="mono align-right">
@@ -407,7 +418,7 @@ function PairFormModal({
     if (!pair) {
       return '0';
     }
-    const quoteScale = currencyMap.get(pair.quoteCurrency)?.scale ?? 0;
+    const quoteScale = currencyMap.get(pair.quoteCurrency)?.rawScale ?? 0;
     return formatInputValue(pair.minOrderAmount, quoteScale);
   });
   const [makerFeeInput, setMakerFeeInput] = useState(String(pair?.makerFeeBps ?? 10));
@@ -436,13 +447,19 @@ function PairFormModal({
 
   const baseCurrency = currencyMap.get(baseInput);
   const quoteCurrency = currencyMap.get(quoteInput);
-  const quantityScale = baseCurrency?.scale ?? pair?.quantityScale ?? 0;
+  const quantityScale = baseCurrency?.rawScale ?? pair?.quantityScale ?? 0;
+  const priceScaleNumber = Number(priceScaleInput);
+  const derivedQuantityStep =
+    baseCurrency && quoteCurrency
+    && Number.isInteger(priceScaleNumber) && priceScaleNumber >= 0
+      ? quantityStep(priceScaleNumber, baseCurrency.rawScale, quoteCurrency.rawScale)
+      : null;
   const symbolPreview =
     baseInput && quoteInput ? `${baseInput}-${quoteInput}` : 'BASE-QUOTE';
 
   const parsedMinQuantity = parseLedgerAmount(minQuantityInput, quantityScale);
   const parsedMinAmount = quoteCurrency
-    ? parseLedgerAmount(minAmountInput, quoteCurrency.scale)
+    ? parseLedgerAmount(minAmountInput, quoteCurrency.rawScale)
     : null;
 
   const handleBackdrop = (event: MouseEvent<HTMLDivElement>) => {
@@ -482,14 +499,21 @@ function PairFormModal({
       setError(`价格精度必须是 0~${MAX_SCALE} 的整数`);
       return;
     }
-    const minOrderQuantity = parseLedgerAmount(minQuantityInput, baseCurrency.scale);
-    if (minOrderQuantity === null) {
-      setError(`最小下单量最多 ${baseCurrency.scale} 位小数，或超出可表示范围`);
+    if (mode === 'create' && priceScale > quoteCurrency.rawScale) {
+      setError(
+        `价格精度不能高于计价币 ${quoteInput} 的 raw_scale ${quoteCurrency.rawScale}；`
+        + '否则 amount 无法换算回计价币原始整数',
+      );
       return;
     }
-    const minOrderAmount = parseLedgerAmount(minAmountInput, quoteCurrency.scale);
+    const minOrderQuantity = parseLedgerAmount(minQuantityInput, baseCurrency.rawScale);
+    if (minOrderQuantity === null) {
+      setError(`最小下单量最多 ${baseCurrency.rawScale} 位小数，或超出可表示范围`);
+      return;
+    }
+    const minOrderAmount = parseLedgerAmount(minAmountInput, quoteCurrency.rawScale);
     if (minOrderAmount === null) {
-      setError(`最小下单金额最多 ${quoteCurrency.scale} 位小数，或超出可表示范围`);
+      setError(`最小下单金额最多 ${quoteCurrency.rawScale} 位小数，或超出可表示范围`);
       return;
     }
     const makerFeeBps = Number(makerFeeInput);
@@ -518,7 +542,7 @@ function PairFormModal({
 
     const input = {
       priceScale,
-      quantityScale: baseCurrency.scale,
+      quantityScale: baseCurrency.rawScale,
       minOrderQuantity,
       minOrderAmount,
       makerFeeBps,
@@ -591,7 +615,7 @@ function PairFormModal({
                 >
                   {options.map((currency) => (
                     <option key={currency.code} value={currency.code}>
-                      {currency.code} · {currency.name}（精度 {currency.scale}）
+                      {currency.code} · {currency.name}（raw {currency.rawScale} / 展示 {currency.scale}）
                     </option>
                   ))}
                 </select>
@@ -614,7 +638,7 @@ function PairFormModal({
                       value={currency.code}
                       disabled={currency.code === baseInput}
                     >
-                      {currency.code} · {currency.name}（精度 {currency.scale}）
+                      {currency.code} · {currency.name}（raw {currency.rawScale} / 展示 {currency.scale}）
                     </option>
                   ))}
                 </select>
@@ -632,9 +656,9 @@ function PairFormModal({
 
             <label className="modal-field">
               <span>
-                数量精度 <em>跟随基础币种</em>
+                数量精度 <em>跟随基础币种 raw_scale</em>
               </span>
-              <input value={baseCurrency ? String(baseCurrency.scale) : '--'} disabled />
+              <input value={baseCurrency ? String(baseCurrency.rawScale) : '--'} disabled />
             </label>
 
             <label className="modal-field">
@@ -751,10 +775,18 @@ function PairFormModal({
           </div>
 
           <p className="modal-hint">
-            最小下单量按{baseInput || '基础币'}精度
-            {baseCurrency ? ` ${baseCurrency.scale}` : ''} 换算，最小下单金额按
-            {quoteInput || '计价币'}精度
-            {quoteCurrency ? ` ${quoteCurrency.scale}` : ''} 换算；两者为 0 表示不限制。
+            最小下单量按{baseInput || '基础币'} raw_scale
+            {baseCurrency ? ` ${baseCurrency.rawScale}` : ''} 换算，最小下单金额按
+            {quoteInput || '计价币'} raw_scale
+            {quoteCurrency ? ` ${quoteCurrency.rawScale}` : ''} 换算；两者为 0 表示不限制。
+            价格精度不能高于计价币 raw_scale，否则 amount 无法换算回原始整数。
+            {derivedQuantityStep !== null && baseCurrency && (
+              <>
+                {' '}当前配置的最小数量步长为{' '}
+                {formatInputValue(derivedQuantityStep, baseCurrency.rawScale)}{' '}
+                {baseInput || '基础币'}。
+              </>
+            )}
             费率单位是基点（1 bps = 0.01%）。保存后会刷新配置缓存，下单校验立即生效。
           </p>
 

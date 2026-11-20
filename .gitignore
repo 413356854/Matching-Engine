@@ -13,6 +13,9 @@ loadtest/TEST-REPORT*.md
 # 汇总报告需要保留在仓库中
 !loadtest/TEST-REPORT.md
 
+# 本地脚本
+*.ps1
+
 # IDE
 .idea/
 *.iml
