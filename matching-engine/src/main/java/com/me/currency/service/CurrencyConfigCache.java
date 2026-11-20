@@ -14,7 +14,10 @@ import org.springframework.stereotype.Component;
  *
  * <p>启动时各查询一次列表，按 symbol / code 建成不可变 Map；下单校验和交易对、币种查询
  * 接口都只读内存，不再逐请求访问 MySQL。缓存保留下线交易对，以便区分
- * {@code SYMBOL_NOT_FOUND} 与 {@code SYMBOL_NOT_TRADING}；修改配置后需要重启应用。
+ * {@code SYMBOL_NOT_FOUND} 与 {@code SYMBOL_NOT_TRADING}。
+ *
+ * <p>管理端修改交易对后调用 {@link #load()} 重新读取，写操作串行执行；
+ * 币种配置仍然只能在启动时加载，修改后需要重启应用。
  */
 @Component
 public class CurrencyConfigCache {
@@ -35,7 +38,7 @@ public class CurrencyConfigCache {
     }
 
     @PostConstruct
-    public void load() {
+    public synchronized void load() {
         List<TradingPairView> pairs = pairService.listPairs();
         Map<String, TradingPairView> pairMap = new HashMap<>();
         for (TradingPairView pair : pairs) {

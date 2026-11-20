@@ -2714,6 +2714,77 @@ button:disabled {
 }
 
 /* ------------------------------------------------------------------ */
+/* Pair admin                                                          */
+/* ------------------------------------------------------------------ */
+
+.admin-table.pair-table {
+  min-width: 1000px;
+}
+
+.pair-symbol {
+  font-weight: 600;
+  letter-spacing: 0.2px;
+}
+
+.pair-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.pair-form-card {
+  width: min(600px, 100%);
+}
+
+.pair-form-card .modal-body {
+  gap: 9px;
+  padding-bottom: 16px;
+}
+
+.pair-form-card .modal-field > input,
+.pair-form-card .modal-field > select {
+  height: 34px;
+  font-size: 12px;
+}
+
+.pair-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px 10px;
+}
+
+.pair-form-previews {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.pair-form-preview {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: 7px;
+  background: rgba(0, 0, 0, 0.16);
+  color: var(--muted);
+  font-size: 10.5px;
+}
+
+.pair-form-preview b {
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 500;
+  text-align: right;
+}
+
+.modal-field > input:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* ------------------------------------------------------------------ */
 /* Animations                                                          */
 /* ------------------------------------------------------------------ */
 

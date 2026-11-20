@@ -127,6 +127,16 @@ export function SnapshotIcon() {
   );
 }
 
+export function PairIcon() {
+  return (
+    <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true">
+      <circle cx="7" cy="10" r="4.2" fill="none" stroke="currentColor" strokeWidth="1.3" />
+      <circle cx="13" cy="10" r="4.2" fill="none" stroke="currentColor" strokeWidth="1.3" opacity="0.65" />
+      <path d="M7 5.8v8.4M13 5.8v8.4" stroke="currentColor" strokeWidth="1.1" opacity="0.5" />
+    </svg>
+  );
+}
+
 export function CandleIcon() {
   return (
     <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true">

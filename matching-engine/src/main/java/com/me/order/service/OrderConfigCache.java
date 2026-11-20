@@ -15,8 +15,8 @@ import org.springframework.stereotype.Component;
  *
  * <p>启动时查询一次 {@link PairService#listOnlinePairs()} 和
  * {@link CurrencyService#listEnabledCurrencies()}，按 symbol / code 建成不可变 Map；
- * 之后下单命令消费路径只查内存，不再逐批访问 MySQL。缓存只在进程启动时刷新，
- * 修改交易对或币种配置后需要重启应用。
+ * 之后下单命令消费路径只查内存，不再逐批访问 MySQL。管理端修改交易对后调用
+ * {@link #load()} 刷新（写操作串行执行）；币种配置仍然只能在启动时加载。
  *
  * <p>缓存的是上线交易对；外部生产者向 {@code me.order.commands-batch} 写入下线或未知 symbol
  * 时会被拒绝。
@@ -36,7 +36,7 @@ public class OrderConfigCache {
     }
 
     @PostConstruct
-    public void load() {
+    public synchronized void load() {
         Map<String, TradingPairView> pairs = new HashMap<>();
         for (TradingPairView pair : pairService.listOnlinePairs()) {
             if (pair != null && pair.symbol() != null) {

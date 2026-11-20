@@ -22,7 +22,7 @@
 | 接入层 | Spring MVC / Spring WebSocket / Netty | — | REST 下单、交易对/余额/行情查询、管理端充值已实现（`/api/v1`）；盘口 WebSocket 实时推送已实现（`/ws/orderbook`）；WebSocket 下单/撤单已实现（`/ws/trade`，Aeron IPC）；Netty TCP 网关（规划） |
 | 消息 / 持久化 | Apache Kafka | broker **4.4.0** / client **4.2.2** | 直接使用 `org.apache.kafka:kafka-clients`（不引入 Spring Kafka）；冻结回执、单用户结算与行情事件，详见「持久化组件（当前实现与规划）」；本地单节点已装，见「本地 Kafka 环境（4.4.0）」 |
 | 查询投影 | QuestDB（当前）/ ClickHouse / PostgreSQL | — | 异步写入，不进撮合热路径 |
-| 前端 | React + Vite + lightweight-charts | — | `web/` 演示前端（已实现）：币币交易（交易对、余额、下单、多周期 K 线、最新成交）+ 后台管理（流水管理、委托历史、成交记录、K 线管理） |
+| 前端 | React + Vite + lightweight-charts | — | `web/` 演示前端（已实现）：币币交易（交易对、余额、下单、多周期 K 线、最新成交）+ 后台管理（交易对、流水、委托历史、成交记录、K 线、备份） |
 
 > **基线口径：JDK 21 + Spring Boot 4.1.2 + Maven 3.6.3+**。
 > 撮合内核（`com.me.matching.entity` / `service`）仍是零第三方依赖、纯 JDK，不引入 Spring/Kafka；它现在是**委托与撮合模块的进程内子包**，可独立编译、单测与压测。
@@ -409,8 +409,24 @@ curl -G http://localhost:9000/exec `
 `FROZEN_ADJUST_IN` 六条命令后，QuestDB 中应有 6 条流水，覆盖六种原子操作；余额不足的命令
 （如超额 `WITHDRAW`）被拒绝且不产生流水。
 
-### 管理端接口（流水 / 委托历史 / 成交记录 / K 线）
+### 管理端接口（交易对 / 流水 / 委托历史 / 成交记录 / K 线）
 
+- **交易对列表（含下线）**：`GET /api/v1/admin/pairs`
+  - 返回 `pair_symbol` 全部交易对，按 `sort_order`、`id` 升序。
+- **新增交易对**：`POST /api/v1/admin/pairs`
+  - 请求体包含 `baseCurrency` / `quoteCurrency`、价格 / 数量精度、最小下单量 / 金额、
+    maker / taker 费率、状态与排序；symbol 由 `基础币-计价币` 派生。
+  - `quantityScale` 必须等于基础币种精度，价格 / 数量精度范围 `0~18`，费率范围
+    `-10000~10000` bps（负值返佣）。成功后立即刷新币币入口与委托模块的配置缓存，
+    无需重启应用。
+- **修改交易对**：`PUT /api/v1/admin/pairs/{id}`
+  - 可调整最小下单量 / 金额、费率、状态与排序；symbol、币种与价格 / 数量精度不可修改
+    （订单簿按最小单位整数撮合，改精度会让新旧委托混用单位）。
+- **删除交易对**：`DELETE /api/v1/admin/pairs/{id}`
+  - 只允许删除已下线且订单簿没有挂单的交易对。交易对下线后撤单接口会拒绝该 symbol，
+    因此需要保持上线、撤销全部挂单后再下线删除。
+- 后台管理页「交易对」已对接上述接口：可新增、编辑、一键上下线、删除，
+  操作成功后同步刷新交易页的交易对列表。
 - **流水列表**：`GET /api/v1/admin/funds-flows?userId=1001&currency=USDT&logType=DEPOSIT&limit=100`
   - 四个参数都可选；`currency` / `logType` 不区分大小写，结果按 `occurred_at` 倒序。
   - `limit` 缺省 100，服务端上限 1000；响应体 `flows` 是流水列表，`userId` / `currency` /
@@ -459,7 +475,7 @@ curl -G http://localhost:9000/exec `
 - **启动恢复状态**：`GET /api/v1/admin/snapshots/recovery`
   - 返回当前恢复阶段（DISABLED / PENDING / RUNNING / READY / FAILED）、选中的 backup id、
     重放的批次 / 记录数、调整过的消费组数量和失败原因。恢复期间其他接口统一返回 503。
-- 后台管理页「备份管理」已对接上述接口：可查看快照列表、展开详情、
+- 后台管理页「备份」已对接上述接口：可查看快照列表、展开详情、
   点击「立即备份」触发快照。
 
 ### 启动快照恢复与 committed offset 重放
@@ -538,7 +554,7 @@ curl "http://localhost:8080/api/v1/currency/user-trades?userId=1001&limit=50"
 ```
 
 前端 `web/` 顶栏提供「币币交易 / 后台管理」两个并排栏目；进入后台管理后左侧子栏目为
-「流水管理 / 委托历史 / 成交记录 / K 线管理」，分别对接上面几组接口。
+「交易对 / 流水 / 委托历史 / 成交记录 / K 线 / 备份」，分别对接上面几组接口。
 
 > `admin` 是新增的支撑模块（独立包），不在五个业务模块链路中；后续可把查询投影
 > 从 QuestDB 扩展到 ClickHouse / 运营接口。
@@ -1516,11 +1532,11 @@ app:
   提交前还用轮询到的余额快照校验冻结金额 / 数量：不足时展示「可用余额不足」及差额，
   并主动刷新余额后让用户重试；最终仍以后端冻结回执为准）；自动生成 `requestId` 仅作命令
   标识，演示版不用于防重。
-- **后台管理**：左侧为「流水管理 / 委托历史 / 成交记录 / K 线管理」子栏目。流水管理按用户 /
+- **后台管理**：左侧为「交易对 / 流水 / 委托历史 / 成交记录 / K 线 / 备份」子栏目。流水按用户 /
   币种 / 日志类型查询 QuestDB `funds_flow`，展示金额、余额前后值、原子操作与 `seq`；委托历史按
   用户 / 交易对 / 终态（撮合完成 / 已撤销）查询 `ord_history`，展示方向、价格、数量、成交量与
   `seq`；成交记录按用户 / 交易对 / 角色（主动 / 被动）查询 `user_trade`，展示成交号、委托号、
-  对手单号、方向、价格、数量与成交额；K 线管理按交易对 / 周期查询 `md_kline`，展示 OHLC、
+  对手单号、方向、价格、数量与成交额；K 线按交易对 / 周期查询 `md_kline`，展示 OHLC、
   成交量、成交额与笔数。流水与 K 线子栏目提供「一键删除」，执行前二次确认，使用
   `TRUNCATE TABLE` 清空对应投影；委托历史与成交记录只读。
 - 「模拟登录 / 充值」弹框：「确认充值」调用 `POST /api/v1/admin/recharges` 为目标用户

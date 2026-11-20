@@ -709,6 +709,7 @@ function App() {
           currencyScales={currencyScales}
           online={online}
           notify={notify}
+          onPairsChanged={refreshAll}
         />
       )}
 
@@ -740,7 +741,7 @@ function App() {
           </>
         ) : (
           <>
-            <span>后台管理：QuestDB funds_flow / ord_history / user_trade / md_kline · MySQL snapshot_backup</span>
+            <span>后台管理：MySQL pair_symbol / snapshot_backup · QuestDB funds_flow / ord_history / user_trade / md_kline</span>
             <span>删除操作使用 TRUNCATE，不可恢复</span>
           </>
         )}

@@ -912,6 +912,102 @@ export async function clearAllKlines(signal?: AbortSignal): Promise<number> {
   return body.deletedCount ?? 0;
 }
 
+/**
+ * 后台：新增交易对。symbol 由后端按 `基础币种-计价币种` 派生，不能指定；
+ * 数量精度必须等于基础币种精度。
+ */
+export interface AdminPairCreateInput {
+  baseCurrency: string;
+  quoteCurrency: string;
+  priceScale: number;
+  quantityScale: number;
+  /** 最小下单量，基础币最小单位。 */
+  minOrderQuantity: number;
+  /** 最小下单金额，计价币最小单位。 */
+  minOrderAmount: number;
+  makerFeeBps: number;
+  takerFeeBps: number;
+  status: number;
+  sortOrder: number;
+}
+
+/** 后台：修改交易对。symbol 与币种不可修改。 */
+export type AdminPairUpdateInput = Omit<
+  AdminPairCreateInput,
+  'baseCurrency' | 'quoteCurrency'
+>;
+
+interface AdminPairQueryResponse {
+  success: boolean;
+  reason: string | null;
+  pairs: TradingPair[];
+}
+
+interface AdminPairWriteResponse {
+  success: boolean;
+  reason: string | null;
+  pair: TradingPair | null;
+}
+
+/** 后台：查询全部交易对（含下线），按展示顺序升序。 */
+export async function fetchAdminPairs(signal?: AbortSignal): Promise<TradingPair[]> {
+  const body = await request<AdminPairQueryResponse>('/api/v1/admin/pairs', { signal });
+  if (!body.success) {
+    throw new ApiError(body.reason ?? 'QUERY_FAILED', 200, body);
+  }
+  return body.pairs ?? [];
+}
+
+/** 后台：新增交易对，返回写入后的完整配置。 */
+export async function createAdminPair(
+  input: AdminPairCreateInput,
+  signal?: AbortSignal,
+): Promise<TradingPair> {
+  const body = await request<AdminPairWriteResponse>('/api/v1/admin/pairs', {
+    method: 'POST',
+    body: JSON.stringify(input),
+    signal,
+  });
+  if (!body.success || !body.pair) {
+    throw new ApiError(body.reason ?? 'WRITE_FAILED', 200, body);
+  }
+  return body.pair;
+}
+
+/** 后台：修改交易对配置，返回写入后的完整配置。 */
+export async function updateAdminPair(
+  id: number,
+  input: AdminPairUpdateInput,
+  signal?: AbortSignal,
+): Promise<TradingPair> {
+  const body = await request<AdminPairWriteResponse>(
+    `/api/v1/admin/pairs/${encodeURIComponent(String(id))}`,
+    {
+      method: 'PUT',
+      body: JSON.stringify(input),
+      signal,
+    },
+  );
+  if (!body.success || !body.pair) {
+    throw new ApiError(body.reason ?? 'WRITE_FAILED', 200, body);
+  }
+  return body.pair;
+}
+
+/** 后台：删除已下线的交易对。 */
+export async function deleteAdminPair(
+  id: number,
+  signal?: AbortSignal,
+): Promise<void> {
+  const body = await request<AdminPairWriteResponse>(
+    `/api/v1/admin/pairs/${encodeURIComponent(String(id))}`,
+    { method: 'DELETE', signal },
+  );
+  if (!body.success) {
+    throw new ApiError(body.reason ?? 'WRITE_FAILED', 200, body);
+  }
+}
+
 /** 一条备份快照记录（MySQL snapshot_backup）。 */
 export interface SnapshotBackup {
   id: number;
