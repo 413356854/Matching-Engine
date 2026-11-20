@@ -29,11 +29,13 @@ import org.springframework.web.bind.annotation.RestController;
  * {@code me.order.commands-batch} 投递命令，委托模块的 {@code OrderCommandListener} 是唯一接单入口。
  *
  * <p>{@code GET /api/v1/orders?userId=...&symbol=...&limit=...} 查询用户当前未完成委托
- * （{@code ACCEPTED} / {@code PAID} / {@code PARTIALLY_FILLED}），按创建时间倒序。
+ * （{@code ACCEPTED} / {@code PAID} / 进行中的 {@code PARTIALLY_FILLED}），按创建时间倒序；
+ * 已收尾的部分成交（部分成交终态）不返回。
  *
  * <p>{@code GET /api/v1/orders/history?userId=...&symbol=...&limit=...} 通过 shared 的
- * {@link OrderHistoryQueryPort} 查询 QuestDB {@code ord_history} 中已撤单 / 已撮合完成的委托，
- * 按最终时间倒序。委托模块不直接访问该表，QuestDB 访问层由 admin 模块负责。
+ * {@link OrderHistoryQueryPort} 查询 QuestDB {@code ord_history} 中的终态委托
+ * （撮合完成 / 未成交撤销 / 部分成交终态），按最终时间倒序。委托模块不直接访问该表，
+ * QuestDB 访问层由 admin 模块负责。
  *
  * <p>{@code GET /api/v1/orders/by-request-id?userId=...&requestId=...} 按 requestId 查询
  * 一笔委托：先查委托模块内存中的当前委托（任意状态，含 {@code REJECTED}），未命中再通过

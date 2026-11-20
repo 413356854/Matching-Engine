@@ -50,6 +50,7 @@ const REASON_TEXT: Record<string, string> = {
   ORDER_NOT_FOUND: '委托不存在',
   ORDER_NOT_PAID_YET: '委托尚未完成资金冻结，请稍后重试',
   ORDER_ALREADY_FILLED: '委托已全部成交，无法撤单',
+  ORDER_ALREADY_COMPLETED: '委托已结束（部分成交剩余已撤销），无法撤单',
   ORDER_ALREADY_CANCELED: '委托已撤销',
   SYMBOL_MISMATCH: '交易对与委托不匹配',
   USER_MISMATCH: '无权撤销该委托',

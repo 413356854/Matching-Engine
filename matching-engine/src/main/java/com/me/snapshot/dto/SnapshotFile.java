@@ -17,6 +17,9 @@ public record SnapshotFile(
      *
      * <p>版本 2 在 payload 中新增 {@code replayCheckpoints}：两个 offset-seq topic 在
      * 快照切点的逐分区端位点。
+     *
+     * <p>版本 3 删除订单簿快照中的 {@code marketBids} / {@code marketAsks}：市价单改为
+     * IOC，撮合后不挂单，未成交部分当次撤销并退款，订单簿中不再存在市价挂单。
      */
-    public static final int CURRENT_FORMAT_VERSION = 2;
+    public static final int CURRENT_FORMAT_VERSION = 3;
 }

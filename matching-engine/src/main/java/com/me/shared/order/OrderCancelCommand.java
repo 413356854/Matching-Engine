@@ -11,8 +11,8 @@ import java.util.Locale;
  *
  * <p>{@code requestId} 是撤单请求标识（仅用于日志与审计）；{@code orderId} 由前端提供，
  * 是待撤销委托的唯一标识；{@code symbol} 统一转大写，用作 Kafka key，保证同一交易对的
- * 撤单始终落在同一分区、按序处理。{@code userId} 为 0 表示请求未携带用户，委托模块只在
- * 大于 0 时校验撤单归属。
+ * 撤单始终落在同一分区、按序处理。{@code userId} 是发起撤单的用户，必须大于 0；
+ * 委托模块只在它与委托归属一致时才撤销，不一致的命令直接丢弃。
  */
 public record OrderCancelCommand(
         String requestId,

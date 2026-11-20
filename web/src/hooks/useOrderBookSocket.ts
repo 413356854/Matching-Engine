@@ -24,8 +24,6 @@ interface OrderBookSocketMessage {
   asks?: DepthLevel[];
   bestBid?: number | null;
   bestAsk?: number | null;
-  marketBidCount?: number;
-  marketAskCount?: number;
   trades?: Trade[];
   klines?: Kline[];
   timestamp?: string;
@@ -166,8 +164,6 @@ export function useOrderBookSocket(
             asks: message.asks ?? [],
             bestBid: message.bestBid ?? null,
             bestAsk: message.bestAsk ?? null,
-            marketBidCount: message.marketBidCount ?? 0,
-            marketAskCount: message.marketAskCount ?? 0,
             timestamp: message.timestamp ?? new Date().toISOString(),
           });
           setTrades(message.trades ?? []);

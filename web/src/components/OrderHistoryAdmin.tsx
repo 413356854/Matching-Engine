@@ -9,6 +9,7 @@ import {
 } from '../api';
 import { describeError } from '../errors';
 import { formatDateTime, formatPrice, formatQuantity } from '../format';
+import { marketIocStatusClass, marketIocStatusLabel } from '../orderStatus';
 import { RefreshIcon } from './icons';
 
 const DEFAULT_LIMIT = 100;
@@ -16,11 +17,13 @@ const LIMIT_OPTIONS = [50, 100, 200, 500, 1000];
 
 const STATUS_LABEL: Partial<Record<OrderStatus, string>> = {
   FILLED: '撮合完成',
+  PARTIALLY_FILLED: '部分成交',
   CANCELED: '已撤销',
 };
 
 const STATUS_CLASS: Partial<Record<OrderStatus, string>> = {
   FILLED: 'done',
+  PARTIALLY_FILLED: 'partial',
   CANCELED: 'flat',
 };
 
@@ -39,7 +42,8 @@ function clockText(value: Date): string {
 export function OrderHistoryAdmin() {
   const [userIdInput, setUserIdInput] = useState('');
   const [symbolInput, setSymbolInput] = useState('');
-  const [statusInput, setStatusInput] = useState<'' | 'FILLED' | 'CANCELED'>('');
+  const [statusInput, setStatusInput] =
+    useState<'' | 'FILLED' | 'CANCELED' | 'PARTIALLY_FILLED'>('');
   const [limitInput, setLimitInput] = useState(DEFAULT_LIMIT);
   const [applied, setApplied] = useState<AdminOrderHistoryQuery>({ limit: DEFAULT_LIMIT });
 
@@ -156,7 +160,9 @@ export function OrderHistoryAdmin() {
           <select
             value={statusInput}
             onChange={(event) =>
-              setStatusInput(event.target.value as '' | 'FILLED' | 'CANCELED')
+              setStatusInput(
+                event.target.value as '' | 'FILLED' | 'CANCELED' | 'PARTIALLY_FILLED',
+              )
             }
           >
             <option value="">全部</option>
@@ -261,8 +267,10 @@ export function OrderHistoryAdmin() {
                   {formatQuantity(order.filledQuantity, order.quantityScale)}
                 </td>
                 <td>
-                  <span className={`order-status ${STATUS_CLASS[order.status] ?? 'flat'}`}>
-                    {STATUS_LABEL[order.status] ?? order.status}
+                  <span className={`order-status ${
+                    marketIocStatusClass(order) ?? STATUS_CLASS[order.status] ?? 'flat'
+                  }`}>
+                    {marketIocStatusLabel(order) ?? STATUS_LABEL[order.status] ?? order.status}
                   </span>
                 </td>
                 <td className="mono align-right muted">{order.seq}</td>

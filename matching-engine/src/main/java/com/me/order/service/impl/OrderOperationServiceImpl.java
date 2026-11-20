@@ -506,9 +506,6 @@ public class OrderOperationServiceImpl implements OrderOperationService {
             if (!match.historyEvents().isEmpty()) {
                 historyEvents.addAll(match.historyEvents());
             }
-            match.ignoredTrades().forEach(ignored ->
-                    log.warn("trade clearing ignored: orderId={}, tradeId={}, reason={}",
-                            match.orderId(), ignored.tradeId(), ignored.reason()));
         }
         return new Outputs(matchPairsBySymbol, settlementCommands, historyEvents);
     }
@@ -526,7 +523,7 @@ public class OrderOperationServiceImpl implements OrderOperationService {
     /**
      * 撤单批次入口。
      *
-     * <p>撤单只处理可撤状态（PAID / PARTIALLY_FILLED）的委托：先从撮合引擎撤掉挂单，
+     * <p>撤单只处理可撤状态（PAID / 进行中的 PARTIALLY_FILLED）的委托：先从撮合引擎撤掉挂单，
      * 再更新委托状态并生成解冻结算 / 委托历史。撤单入口锁与下单入口锁分开，
      * 但两者都必须先于 orderLock，锁顺序与快照保持一致。
      */
@@ -625,7 +622,8 @@ public class OrderOperationServiceImpl implements OrderOperationService {
      *
      * <p>先调用撮合引擎把挂单从订单簿移除；只有引擎接受（accepted）的撤单才继续
      * 更新委托。更新成功的委托产生解冻结算命令（买家退剩余计价币、卖家退剩余基础币）
-     * 和 CANCELED 委托历史。引擎移除失败的委托（已成交 / 已不在簿）不会重复解冻。
+     * 和终态委托历史（无成交 CANCELED，有成交则 PARTIALLY_FILLED 终态）。
+     * 引擎移除失败的委托（已成交 / 已不在簿）不会重复解冻。
      */
     private void cancelAndApply(List<OrderCancelContext> contexts,
                                 List<TradeSettlementCommand> settlements,

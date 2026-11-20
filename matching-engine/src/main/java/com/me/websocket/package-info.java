@@ -28,7 +28,7 @@
  * 服务端 → 客户端：
  *   {"type":"subscribed","symbol":"BTC-USDT","depth":10}
  *   {"type":"orderbook","symbol":"BTC-USDT","depth":10,"bids":[...],"asks":[...],
- *    "bestBid":...,"bestAsk":...,"marketBidCount":0,"marketAskCount":0,
+ *    "bestBid":...,"bestAsk":...,
  *    "trades":[{"tradeId":1,"price":...,"quantity":...,"takerSide":"BUY",...}],
  *    "klines":[{"symbol":"BTC-USDT","interval":"1m","bucketStart":"...","openPrice":...,
  *               "highPrice":...,"lowPrice":...,"closePrice":...,"volume":...,...}],

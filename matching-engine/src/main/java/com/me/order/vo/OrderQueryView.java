@@ -6,8 +6,9 @@ import java.util.List;
  * 用户当前委托查询结果。
  *
  * <p>成功时 {@code orders} 是用户尚未完成的委托（{@code ACCEPTED} / {@code PAID} /
- * {@code PARTIALLY_FILLED}），按创建时间倒序（最新在前）；失败时 {@code reason} 是错误码，
- * {@code orders} 为空列表。{@code symbol} 回显实际生效的交易对筛选，未筛选时为 {@code null}。
+ * 进行中的 {@code PARTIALLY_FILLED}），按创建时间倒序（最新在前）；失败时
+ * {@code reason} 是错误码，{@code orders} 为空列表。{@code symbol} 回显实际生效的
+ * 交易对筛选，未筛选时为 {@code null}。
  */
 public record OrderQueryView(
         boolean success,

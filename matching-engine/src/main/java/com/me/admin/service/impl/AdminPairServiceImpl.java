@@ -230,7 +230,7 @@ public class AdminPairServiceImpl implements AdminPairService {
     }
 
     /**
-     * 订单簿里是否还有未成交的限价 / 市价挂单；没有订单簿视为无挂单。
+     * 订单簿里是否还有未成交的限价挂单；没有订单簿视为无挂单。市价单按 IOC 不挂单。
      *
      * <p>用 {@link OrderBook#depth(int)} 而不是逐方向计数：深度快照与撮合写入共用
      * 订单簿锁，不会读到撮合中途的结构。
@@ -241,10 +241,7 @@ public class AdminPairServiceImpl implements AdminPairService {
             return false;
         }
         DepthSnapshot depth = book.depth(1);
-        return !depth.bids().isEmpty()
-                || !depth.asks().isEmpty()
-                || depth.marketBidCount() > 0
-                || depth.marketAskCount() > 0;
+        return !depth.bids().isEmpty() || !depth.asks().isEmpty();
     }
 
     /** 校验精度、限额、费率与状态；通过返回 {@code null}。 */

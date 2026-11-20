@@ -45,28 +45,34 @@ public interface OrderService {
      * 成交清算：把撮合成交对的两笔委托推进为部分成交 / 已成交，并生成一条包含买方、卖方
      * 扣账与到账资金腿的双边结算命令。委托成交至 {@code FILLED} 时同时生成历史事件，
      * 供监听器在同一个 Kafka 事务里发往 {@code me.order.history-batch}。
-     * 由委托侧进程内撮合编排同步调用（不再消费 {@code me.trades}）。演示版不缓存成交对；
-     * 重复调用时由订单状态（已全部成交）拒绝，部分成交的重复回执不保证去重。
+     * 由委托侧进程内撮合在引擎锁内同步调用（不再消费 {@code me.trades}）；调用时
+     * 成交双方的委托必然已存在且处于可成交状态。
      */
     OrderTradeApplyResult onTrade(TradeEvent trade);
 
     /**
-     * 市价买入撮合结束：委托标记为已成交（撮合完成），未用完的冻结预算生成一条
-     * {@link com.me.shared.event.FundsLogType#ORDER_UNFREEZE} 退款清算命令退回可用余额。
+     * 市价单撮合结束（IOC）：撮合引擎只与对手方限价单成交，未成交部分不挂单。
+     * 委托未全部成交时收尾，并生成一条
+     * {@link com.me.shared.event.FundsLogType#ORDER_UNFREEZE} 清算命令退回剩余冻结：
+     * 买单退回未用完的计价币预算（{@code frozenAmount - settledQuoteAmount}），
+     * 卖单退回未成交的基础币（{@code frozenAmount - filledQuantity}）。
+     * 有成交量时状态保持 {@code PARTIALLY_FILLED} 并固定 {@code finalAt} 进入终态；
+     * 完全没有成交时进入 {@code CANCELED}。
      *
-     * <p>市价买入是「金额驱动」的即时单：撮合引擎按剩余预算限制成交量，未成交部分不再挂单。
-     * 若委托在成交过程中已因数量全部成交（{@code FILLED}），退款已由最后一笔成交的买方
-     * 结算命令携带，本方法不会重复退款；重复调用同样幂等。首次推进为 {@code FILLED} 时
-     * 同时生成历史事件（撮合完成）。
+     * <p>若委托在成交过程中已按数量全部成交（{@code FILLED}），退款已由最后一笔成交的
+     * 买方结算命令携带（成交价优于限价时），本方法返回空结果，不重复退款。
+     * 首次进入终态时同时生成历史事件（IOC 剩余量撤销）。
      */
-    OrderTradeApplyResult completeMarketBuy(long orderId);
+    OrderTradeApplyResult completeMarketOrder(long orderId);
 
     /**
      * 撤单准备：查询委托并校验归属、交易对与可撤状态，返回撤单快照。
      *
-     * <p>只允许撤 {@code PAID} / {@code PARTIALLY_FILLED}；{@code ACCEPTED} 仍在冻结回执途中，
-     * 返回 {@code ORDER_NOT_PAID_YET}，由调用方提示稍后重试。{@code userId > 0} 时校验
-     * 委托归属，0 表示命令未携带用户、跳过归属校验。
+     * <p>只允许撤 {@code PAID} / 进行中的 {@code PARTIALLY_FILLED}（{@code finalAt == null}）；
+     * 已收尾的部分成交是终态，返回 {@code ORDER_ALREADY_COMPLETED}。{@code ACCEPTED} 仍在
+     * 冻结回执途中，返回 {@code ORDER_NOT_PAID_YET}，由调用方提示稍后重试。
+     * 必须携带 {@code userId > 0}，且只有与委托归属一致时才可撤；不一致返回
+     * {@code USER_MISMATCH}，命令被丢弃。
      *
      * <p>本方法只读，由撤单监听器的查询线程池并发调用。
      */
@@ -88,8 +94,10 @@ public interface OrderService {
     boolean isCancelPending(long orderId);
 
     /**
-     * 撤单更新：把委托从可撤状态原子推进为 {@code CANCELED}，并按成交进度计算解冻金额，
-     * 生成一条只含 {@code ORDER_UNFREEZE} 腿的结算命令。
+     * 撤单更新：把委托从可撤状态原子推进为终态，并按成交进度计算解冻金额，
+     * 生成一条只含 {@code ORDER_UNFREEZE} 腿的结算命令。没有成交量的委托进入
+     * {@code CANCELED}；有成交量的委托保持 {@code PARTIALLY_FILLED} 并固定
+     * {@code finalAt}（部分成交终态）。
      *
      * <p>解冻金额：买单为 {@code frozenAmount - settledQuoteAmount}，卖单为
      * {@code quantity - filledQuantity}；为 0 时不生成清算命令。委托在准备阶段之后
@@ -122,8 +130,9 @@ public interface OrderService {
     OrderLookupRecord findByRequestId(long userId, String requestId);
 
     /**
-     * 查询用户当前未完成的委托（{@code ACCEPTED} / {@code PAID} / {@code PARTIALLY_FILLED}），
-     * 按创建时间倒序（最新在前）。已成交、已拒绝的委托不返回。
+     * 查询用户当前未完成的委托（{@code ACCEPTED} / {@code PAID} / 进行中的
+     * {@code PARTIALLY_FILLED}），按创建时间倒序（最新在前）。已进入终态的委托
+     * （含部分成交终态）不返回。
      *
      * @param userId 用户 ID，必须为正数
      * @param symbol 可选交易对筛选；{@code null} / 空白表示全部交易对

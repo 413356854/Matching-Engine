@@ -35,7 +35,7 @@ public interface OrderMatchingService {
     List<MatchResult> matchBatch(List<OrderPlacedEvent> orders);
 
     /**
-     * 成交清算：对一笔已撮合委托执行成交清算（含市价买入完成退款），生成撮合对与结算命令。
+     * 成交清算：对一笔已撮合委托执行成交清算（含市价单 IOC 收尾退款），生成撮合对与结算命令。
      * 可在订单更新线程池中并发调用；与撤单的互斥由调用方持有的引擎对象锁临界区保证。
      */
     OrderMatchResult clear(OrderPlacedEvent order, MatchResult result);

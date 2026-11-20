@@ -63,8 +63,11 @@ import org.springframework.stereotype.Service;
  *
  * <p><b>状态机</b>：{@code ACCEPTED}（已保存，等待冻结）
  * → {@code PAID}（冻结成功，交给进程内撮合）或 {@code REJECTED}（冻结失败）
- * → {@code PARTIALLY_FILLED} / {@code FILLED}（成交清算）；市价买入撮合结束后由
- * {@link #completeMarketBuy(long)} 直接推进为 {@code FILLED}。状态每推进一次 {@code seq} 加 1。
+ * → {@code PARTIALLY_FILLED} / {@code FILLED}（成交清算）。
+ * {@code PARTIALLY_FILLED} 在 {@code finalAt == null} 时表示仍在进行中（委托还挂在
+ * 订单簿中），{@code finalAt != null} 时表示终态：剩余部分已撤销并退款（市价单 IOC
+ * 收尾、限价单部分成交后撤单）。没有任何成交的撤单/市价单收尾进入 {@code CANCELED}。
+ * 状态每推进一次 {@code seq} 加 1。
  *
  * <p><b>成交清算</b>：{@code OrderMatchingService} 在冻结回执监听线程中同步调用
  * {@link #onTrade(TradeEvent)}；taker / maker 两笔委托同时推进成交进度，并生成一条包含买方、
@@ -267,71 +270,10 @@ public class OrderServiceImpl implements OrderService {
 
     @Override
     public OrderTradeApplyResult onTrade(TradeEvent trade) {
-        String invalidReason = validateTrade(trade);
-        if (invalidReason != null) {
-            return OrderTradeApplyResult.ignored(invalidReason);
-        }
-
-        // 先确认两笔委托都存在、属于该交易对、用户一致且可成交，避免只推进一笔委托。
-        Order takerBefore = orders.get(trade.takerOrderId());
-        if (takerBefore == null) {
-            return OrderTradeApplyResult.ignored("TAKER_ORDER_NOT_FOUND");
-        }
-        if (!takerBefore.symbol().equals(trade.symbol())) {
-            return OrderTradeApplyResult.ignored("TAKER_SYMBOL_MISMATCH");
-        }
-        if (takerBefore.userId() != trade.takerUserId()) {
-            return OrderTradeApplyResult.ignored("TAKER_USER_MISMATCH");
-        }
-        if (takerBefore.side() != trade.takerSide()) {
-            return OrderTradeApplyResult.ignored("TAKER_SIDE_MISMATCH");
-        }
-        if (!fillable(takerBefore)) {
-            return OrderTradeApplyResult.ignored("TAKER_ORDER_STATUS_" + takerBefore.status());
-        }
-        Order makerBefore = orders.get(trade.makerOrderId());
-        if (makerBefore == null) {
-            return OrderTradeApplyResult.ignored("MAKER_ORDER_NOT_FOUND");
-        }
-        if (!makerBefore.symbol().equals(trade.symbol())) {
-            return OrderTradeApplyResult.ignored("MAKER_SYMBOL_MISMATCH");
-        }
-        if (makerBefore.userId() != trade.makerUserId()) {
-            return OrderTradeApplyResult.ignored("MAKER_USER_MISMATCH");
-        }
-        if (makerBefore.side() == trade.takerSide()) {
-            return OrderTradeApplyResult.ignored("MAKER_SIDE_MISMATCH");
-        }
-        if (!fillable(makerBefore)) {
-            return OrderTradeApplyResult.ignored("MAKER_ORDER_STATUS_" + makerBefore.status());
-        }
-
-        try {
-            long expectedAmount = Amounts.quoteAmount(trade.price(), trade.quantity(),
-                    takerBefore.priceScale(), takerBefore.quantityScale(),
-                    takerBefore.quoteScale());
-            if (trade.amount() != expectedAmount) {
-                return OrderTradeApplyResult.ignored("AMOUNT_MISMATCH");
-            }
-        } catch (ArithmeticException | IllegalArgumentException e) {
-            return OrderTradeApplyResult.ignored("AMOUNT_OVERFLOW");
-        }
-
-        OrderFill takerFill = fillOrder(trade.takerOrderId(), trade);
-        if (!takerFill.applied()) {
-            log.warn("trade clearing ignored for taker: takerOrderId={}, reason={}",
-                    trade.takerOrderId(), takerFill.reason());
-            return OrderTradeApplyResult.ignored("TAKER_" + takerFill.reason());
-        }
-        OrderFill makerFill = fillOrder(trade.makerOrderId(), trade);
-        if (!makerFill.applied()) {
-            log.warn("trade clearing ignored for maker: makerOrderId={}, reason={}",
-                    trade.makerOrderId(), makerFill.reason());
-            return OrderTradeApplyResult.ignored("MAKER_" + makerFill.reason());
-        }
-
-        Order takerOrder = takerFill.order();
-        Order makerOrder = makerFill.order();
+        // 成交由进程内撮合产生，双方委托必然存在、属于该交易对且处于可成交状态；
+        // 撮合、清算与撤单共用 orderLock，这里不为不可达的状态漂移保留失败分支。
+        Order takerOrder = fillOrder(trade.takerOrderId(), trade);
+        Order makerOrder = fillOrder(trade.makerOrderId(), trade);
         List<OrderHistoryEvent> historyEvents = new ArrayList<>(2);
         if (takerOrder.status() == OrderStatus.FILLED) {
             historyEvents.add(takerOrder.toHistoryEvent());
@@ -387,35 +329,46 @@ public class OrderServiceImpl implements OrderService {
                 trade.makerOrderId(),
                 sellerLegs);
 
-        return OrderTradeApplyResult.handled(
+        return OrderTradeApplyResult.of(
                 List.of(buyerCommand, sellerCommand), historyEvents);
     }
 
     @Override
-    public OrderTradeApplyResult completeMarketBuy(long orderId) {
-        if (orderId <= 0) {
-            return OrderTradeApplyResult.ignored("ORDER_ID_INVALID");
-        }
+    public OrderTradeApplyResult completeMarketOrder(long orderId) {
         AtomicReference<OrderTradeApplyResult> resultRef = new AtomicReference<>();
-        orders.computeIfPresent(orderId, (id, order) -> {
-            if (order.side() != OrderSide.BUY || order.type() != OrderType.MARKET) {
-                resultRef.set(OrderTradeApplyResult.ignored("NOT_MARKET_BUY"));
+        orders.compute(orderId, (id, order) -> {
+            if (order == null || order.type() != OrderType.MARKET) {
+                resultRef.set(OrderTradeApplyResult.empty());
                 return order;
             }
-            if (order.status() != OrderStatus.PAID
-                    && order.status() != OrderStatus.PARTIALLY_FILLED) {
-                // 已全部成交时，多余冻结已由最后一笔成交的买方结算命令退还；
-                // 已拒绝 / 已撤销 / 重复调用都不再产生退款，保证幂等。
-                resultRef.set(OrderTradeApplyResult.ignored("ORDER_STATUS_" + order.status()));
+            if (order.status() == OrderStatus.FILLED
+                    || order.status() == OrderStatus.CANCELED
+                    || order.finalAt() != null) {
+                // 最后一笔成交已把委托推进为 FILLED（买方结算命令已携带退款腿），
+                // 或委托已经收尾进入终态（含部分成交终态），这里不能再产生退款。
+                resultRef.set(OrderTradeApplyResult.empty());
                 return order;
             }
 
-            long refund = order.frozenAmount() - order.settledQuoteAmount();
-            // 市价买入按预算成交：撮合结束即完成，剩余数量不再挂单。
-            Order completed = order.withStatus(OrderStatus.FILLED);
-            List<OrderHistoryEvent> historyEvents = List.of(completed.toHistoryEvent());
-            if (refund <= 0) {
-                resultRef.set(OrderTradeApplyResult.handled(List.of(), historyEvents));
+            // 市价单按 IOC 处理：撮合结束后未成交部分撤销，不挂单。
+            // 买单退回未用完的计价币预算，卖单退回未成交的基础币。
+            long consumed = order.side() == OrderSide.BUY
+                    ? order.settledQuoteAmount()
+                    : order.filledQuantity();
+            long refund = order.frozenAmount() - consumed;
+            if (refund < 0) {
+                log.warn("market order completion refund negative, clamp to zero: orderId={}, "
+                        + "frozen={}, consumed={}", orderId, order.frozenAmount(), consumed);
+                refund = 0L;
+            }
+
+            // 有成交量时保持 PARTIALLY_FILLED 并固定 finalAt 进入终态；完全没有成交才进入 CANCELED。
+            Order completed = order.filledQuantity() > 0
+                    ? order.withTerminalStatus(OrderStatus.PARTIALLY_FILLED)
+                    : order.withStatus(OrderStatus.CANCELED);
+            OrderHistoryEvent historyEvent = completed.toHistoryEvent();
+            if (refund == 0) {
+                resultRef.set(OrderTradeApplyResult.of(List.of(), List.of(historyEvent)));
                 return completed;
             }
 
@@ -429,18 +382,20 @@ public class OrderServiceImpl implements OrderService {
                     List.of(new TradeSettlementCommand.SettlementLeg(
                             order.userId(), order.frozenCurrency(),
                             FundsLogType.ORDER_UNFREEZE, refund)));
-            resultRef.set(OrderTradeApplyResult.handled(
-                    List.of(refundCommand), historyEvents));
+            resultRef.set(OrderTradeApplyResult.of(
+                    List.of(refundCommand), List.of(historyEvent)));
             return completed;
         });
-        OrderTradeApplyResult result = resultRef.get();
-        return result == null ? OrderTradeApplyResult.ignored("ORDER_NOT_FOUND") : result;
+        return resultRef.get();
     }
 
     @Override
     public OrderCancelPrepareResult prepareCancel(long orderId, long userId, String symbol) {
         if (orderId <= 0) {
             return OrderCancelPrepareResult.rejected("ORDER_ID_INVALID");
+        }
+        if (userId <= 0) {
+            return OrderCancelPrepareResult.rejected("USER_ID_INVALID");
         }
         if (symbol == null || symbol.isBlank()) {
             return OrderCancelPrepareResult.rejected("SYMBOL_REQUIRED");
@@ -453,20 +408,28 @@ public class OrderServiceImpl implements OrderService {
         if (!order.symbol().equals(normalizedSymbol)) {
             return OrderCancelPrepareResult.rejected("SYMBOL_MISMATCH");
         }
-        if (userId > 0 && order.userId() != userId) {
+        if (order.userId() != userId) {
             return OrderCancelPrepareResult.rejected("USER_MISMATCH");
         }
         return switch (order.status()) {
-            case PAID, PARTIALLY_FILLED -> OrderCancelPrepareResult.ready(new OrderCancelContext(
-                    order.orderId(), order.userId(), order.symbol(), order.side(), order.type(),
-                    order.price(), order.status(), order.quantity(), order.filledQuantity(),
-                    order.frozenCurrency(), order.frozenAmount(), order.settledQuoteAmount()));
+            case PAID -> OrderCancelPrepareResult.ready(cancelContext(order));
+            // 部分成交只有在 finalAt == null（仍在簿中）时可撤；已收尾的部分成交是终态。
+            case PARTIALLY_FILLED -> order.finalAt() == null
+                    ? OrderCancelPrepareResult.ready(cancelContext(order))
+                    : OrderCancelPrepareResult.rejected("ORDER_ALREADY_COMPLETED");
             // 已受理但冻结回执未到：此时撤销会与回执竞争，拒绝并让调用方稍后重试。
             case ACCEPTED -> OrderCancelPrepareResult.rejected("ORDER_NOT_PAID_YET");
             case CANCELED -> OrderCancelPrepareResult.rejected("ORDER_ALREADY_CANCELED");
             case FILLED -> OrderCancelPrepareResult.rejected("ORDER_ALREADY_FILLED");
             case REJECTED -> OrderCancelPrepareResult.rejected("ORDER_REJECTED");
         };
+    }
+
+    private static OrderCancelContext cancelContext(Order order) {
+        return new OrderCancelContext(
+                order.orderId(), order.userId(), order.symbol(), order.side(), order.type(),
+                order.price(), order.status(), order.quantity(), order.filledQuantity(),
+                order.frozenCurrency(), order.frozenAmount(), order.settledQuoteAmount());
     }
 
     @Override
@@ -485,8 +448,7 @@ public class OrderServiceImpl implements OrderService {
                 resultRef.set(OrderCancelBeginResult.allowed());
                 return order;
             }
-            if (order.status() != OrderStatus.PAID
-                    && order.status() != OrderStatus.PARTIALLY_FILLED) {
+            if (!isCancelable(order)) {
                 resultRef.set(OrderCancelBeginResult.rejected(
                         "ORDER_STATUS_" + order.status()));
                 return order;
@@ -517,9 +479,8 @@ public class OrderServiceImpl implements OrderService {
                 resultRef.set(OrderCancelApplyResult.ignored("SYMBOL_MISMATCH"));
                 return order;
             }
-            if (order.status() != OrderStatus.PAID
-                    && order.status() != OrderStatus.PARTIALLY_FILLED) {
-                // 撤单准备后可能被成交清算或另一条撤单命令抢先推进；不重复解冻。
+            if (!isCancelable(order)) {
+                // 撤单准备后可能被成交清算、IOC 收尾或另一条撤单命令抢先推进；不重复解冻。
                 resultRef.set(OrderCancelApplyResult.ignored("ORDER_STATUS_" + order.status()));
                 return order;
             }
@@ -536,12 +497,15 @@ public class OrderServiceImpl implements OrderService {
                 refund = 0L;
             }
 
-            Order canceled = order.withStatus(OrderStatus.CANCELED);
-            OrderHistoryEvent historyEvent = canceled.toHistoryEvent();
+            // 有成交量的委托以 PARTIALLY_FILLED 终态结束，完全没有成交才进入 CANCELED。
+            Order completed = order.filledQuantity() > 0
+                    ? order.withTerminalStatus(OrderStatus.PARTIALLY_FILLED)
+                    : order.withStatus(OrderStatus.CANCELED);
+            OrderHistoryEvent historyEvent = completed.toHistoryEvent();
             if (refund == 0) {
                 resultRef.set(OrderCancelApplyResult.canceled(
                         0L, List.of(), historyEvent));
-                return canceled;
+                return completed;
             }
 
             long settlementId = tradeSettlementIdGenerator.getAndIncrement();
@@ -556,79 +520,15 @@ public class OrderServiceImpl implements OrderService {
                             FundsLogType.ORDER_UNFREEZE, refund)));
             resultRef.set(OrderCancelApplyResult.canceled(
                     refund, List.of(command), historyEvent));
-            return canceled;
+            return completed;
         });
         OrderCancelApplyResult result = resultRef.get();
         return result == null ? OrderCancelApplyResult.ignored("ORDER_NOT_FOUND") : result;
     }
 
-    private OrderFill fillOrder(long orderId, TradeEvent trade) {
-        AtomicReference<OrderFill> resultRef = new AtomicReference<>();
-        orders.computeIfPresent(orderId, (id, order) -> {
-            if (!fillable(order)) {
-                resultRef.set(OrderFill.notFillable(order.status()));
-                return order;
-            }
-            Order updated = order.withFill(trade.quantity(), trade.amount());
-            resultRef.set(OrderFill.filled(updated));
-            return updated;
-        });
-        OrderFill result = resultRef.get();
-        return result == null ? OrderFill.notFound() : result;
-    }
-
-    private static boolean fillable(Order order) {
-        return order.status() == OrderStatus.PAID
-                || order.status() == OrderStatus.PARTIALLY_FILLED;
-    }
-
-    private String validateTrade(TradeEvent trade) {
-        if (trade == null) {
-            return "TRADE_IS_NULL";
-        }
-        if (trade.tradeId() <= 0) {
-            return "TRADE_ID_INVALID";
-        }
-        if (trade.symbol() == null || ParsedSymbol.parse(trade.symbol()) == null) {
-            return "SYMBOL_INVALID";
-        }
-        if (trade.takerOrderId() <= 0 || trade.makerOrderId() <= 0) {
-            return "ORDER_ID_INVALID";
-        }
-        if (trade.takerOrderId() == trade.makerOrderId()) {
-            return "SELF_TRADE";
-        }
-        if (trade.takerUserId() <= 0 || trade.makerUserId() <= 0) {
-            return "USER_ID_INVALID";
-        }
-        if (trade.takerSide() == null) {
-            return "SIDE_REQUIRED";
-        }
-        if (trade.price() <= 0) {
-            return "PRICE_INVALID";
-        }
-        if (trade.quantity() <= 0) {
-            return "QUANTITY_INVALID";
-        }
-        if (trade.amount() <= 0) {
-            return "AMOUNT_INVALID";
-        }
-        return null;
-    }
-
-    private record OrderFill(boolean applied, Order order, String reason) {
-
-        private static OrderFill filled(Order order) {
-            return new OrderFill(true, order, null);
-        }
-
-        private static OrderFill notFillable(OrderStatus status) {
-            return new OrderFill(false, null, "ORDER_STATUS_" + status);
-        }
-
-        private static OrderFill notFound() {
-            return new OrderFill(false, null, "ORDER_NOT_FOUND");
-        }
+    private Order fillOrder(long orderId, TradeEvent trade) {
+        return orders.compute(orderId, (id, order) ->
+                order.withFill(trade.quantity(), trade.amount()));
     }
 
     @Override
@@ -650,7 +550,7 @@ public class OrderServiceImpl implements OrderService {
                 .filter(order -> order.userId() == userId)
                 .filter(order -> normalizedSymbol == null
                         || order.symbol().equals(normalizedSymbol))
-                .filter(order -> isOpen(order.status()))
+                .filter(OrderServiceImpl::isOpen)
                 .sorted(Comparator.comparing(Order::createdAt)
                         .thenComparingLong(Order::orderId)
                         .reversed())
@@ -659,10 +559,20 @@ public class OrderServiceImpl implements OrderService {
                 .toList();
     }
 
-    private static boolean isOpen(OrderStatus status) {
-        return status == OrderStatus.ACCEPTED
-                || status == OrderStatus.PAID
-                || status == OrderStatus.PARTIALLY_FILLED;
+    /**
+     * 委托是否仍在进行中：{@code PARTIALLY_FILLED} 只有在 {@code finalAt == null}
+     * （仍在订单簿中等待成交）时才算未完成；已收尾的部分成交是终态。
+     */
+    private static boolean isOpen(Order order) {
+        return order.status() == OrderStatus.ACCEPTED
+                || order.status() == OrderStatus.PAID
+                || (order.status() == OrderStatus.PARTIALLY_FILLED && order.finalAt() == null);
+    }
+
+    /** 可撤状态：PAID，或仍在进行中的部分成交（{@code finalAt == null}）。 */
+    private static boolean isCancelable(Order order) {
+        return order.status() == OrderStatus.PAID
+                || (order.status() == OrderStatus.PARTIALLY_FILLED && order.finalAt() == null);
     }
 
     @Override
@@ -803,6 +713,19 @@ public class OrderServiceImpl implements OrderService {
         }
 
         /**
+         * 推进为终态并固定 {@code finalAt}：用于有成交量的委托收尾（市价单 IOC 剩余撤销、
+         * 部分成交后撤单）。状态保持 {@code PARTIALLY_FILLED}，以 {@code finalAt}
+         * 与仍在进行中的部分成交区分。
+         */
+        private Order withTerminalStatus(OrderStatus newStatus) {
+            Instant finalTime = finalAt != null ? finalAt : Instant.now();
+            return new Order(requestId, orderId, userId, symbol, side, type, price, quantity,
+                    frozenCurrency, frozenAmount, filledQuantity, settledQuoteAmount,
+                    newStatus, seq + 1, createdAt, finalTime,
+                    priceScale, quantityScale, quoteScale, cancelRequested);
+        }
+
+        /**
          * 标记撤单开始：在引擎对象锁内原子设置，阻止后续撮合把委托重新挂回订单簿。
          * 该标记不改变对外可见状态与 seq，真正的 {@code CANCELED} 推进由
          * {@code applyCancel} 完成。
@@ -848,8 +771,10 @@ public class OrderServiceImpl implements OrderService {
         }
 
         /**
-         * 进入终态（撤单 / 撮合完成）时固定 {@code finalAt}；部分成交、已支付等中间状态
-         * 保持 {@code null}。固定时间戳让同一委托重复投递的历史事件在 QuestDB 中可去重。
+         * 进入撤销 / 全部成交终态时固定 {@code finalAt}；进行中的部分成交、已支付等
+         * 中间状态保持 {@code null}。部分成交后的终态由
+         * {@link #withTerminalStatus(OrderStatus)} 固定 {@code finalAt}。
+         * 固定时间戳让同一委托重复投递的历史事件在 QuestDB 中可去重。
          */
         private static Instant terminalTime(OrderStatus status, Instant current) {
             if (current != null) {
@@ -860,7 +785,7 @@ public class OrderServiceImpl implements OrderService {
                     : null;
         }
 
-        /** 终态委托的历史快照；由调用方保证 {@code status} 是 CANCELED / FILLED。 */
+        /** 终态委托的历史快照；由调用方保证 {@code finalAt} 非空。 */
         private OrderHistoryEvent toHistoryEvent() {
             return new OrderHistoryEvent(
                     orderId, requestId, userId, symbol, side, type, status, price, quantity,

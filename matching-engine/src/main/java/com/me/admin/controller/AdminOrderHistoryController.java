@@ -65,7 +65,10 @@ public class AdminOrderHistoryController {
                 return badRequest(userId, normalizedSymbol, normalizedStatus,
                         "STATUS_INVALID");
             }
-            if (parsedStatus != OrderStatus.CANCELED && parsedStatus != OrderStatus.FILLED) {
+            // 历史表只归档终态：FILLED / CANCELED / 部分成交收尾（PARTIALLY_FILLED）。
+            if (parsedStatus != OrderStatus.CANCELED
+                    && parsedStatus != OrderStatus.FILLED
+                    && parsedStatus != OrderStatus.PARTIALLY_FILLED) {
                 return badRequest(userId, normalizedSymbol, normalizedStatus,
                         "STATUS_INVALID");
             }

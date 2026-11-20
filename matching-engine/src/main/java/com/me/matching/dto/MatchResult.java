@@ -6,13 +6,14 @@ import java.util.List;
 /**
  * 一笔新委托的撮合结果。
  *
- * <p>未成交的剩余量通常会挂入订单簿：限价单挂限价簿，市价单挂市价簿。金额驱动的市价买入
- * （{@code frozenAmount > 0}）是即时单，剩余量不挂单，由委托模块标记完成并退回剩余预算。
+ * <p>限价单未成交的剩余量挂入订单簿。市价单按 IOC（Immediate-Or-Cancel）处理：
+ * 剩余量不挂单，由委托模块在撮合结束后撤销，并退回剩余冻结资金（市价买入退回未用完的
+ * 计价币预算，市价卖出退回未成交的基础币）。
  *
  * @param orderId           新委托 id
  * @param requestedQuantity 委托数量
  * @param filledQuantity    已成交量
- * @param remainingQuantity 未成交量（金额驱动的市价买入不挂单）
+ * @param remainingQuantity 未成交量（限价单已挂入订单簿；市价单已按 IOC 撤销）
  * @param trades            本次撮合产生的成交，按撮合顺序排列
  * @param duplicate         同一 orderId 重复投递（at-least-once），本次未撮合
  */

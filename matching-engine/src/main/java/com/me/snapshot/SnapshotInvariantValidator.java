@@ -49,8 +49,11 @@ public final class SnapshotInvariantValidator {
                 acceptedOrders++;
                 continue;
             }
-            if (order.status() != OrderStatus.PAID
-                    && order.status() != OrderStatus.PARTIALLY_FILLED) {
+            // 只统计仍在进行中的委托冻结；已收尾的部分成交（finalAt 非空）资金已退回。
+            boolean open = order.status() == OrderStatus.PAID
+                    || (order.status() == OrderStatus.PARTIALLY_FILLED
+                        && order.finalAt() == null);
+            if (!open) {
                 continue;
             }
             long remaining = order.side() == OrderSide.BUY

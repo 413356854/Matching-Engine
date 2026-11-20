@@ -106,9 +106,6 @@ export interface OrderBookDepth {
   asks: DepthLevel[];
   bestBid: number | null;
   bestAsk: number | null;
-  /** 无价格的市价挂单数量，不进入价格梯。 */
-  marketBidCount: number;
-  marketAskCount: number;
   /** ISO-8601，UTC。 */
   timestamp: string;
 }
@@ -315,7 +312,8 @@ interface OrderQueryResponse {
 }
 
 /**
- * 一条历史委托（QuestDB ord_history）：只包含撤单（CANCELED）与撮合完成（FILLED）。
+ * 一条历史委托（QuestDB ord_history）：只包含终态——撮合完成（FILLED）、
+ * 未成交撤销（CANCELED）与部分成交收尾（PARTIALLY_FILLED）。
  * 价格、数量、金额均为对应精度的最小单位整数。
  */
 export interface OrderHistory {
@@ -352,7 +350,7 @@ interface OrderHistoryQueryResponse {
 export interface AdminOrderHistoryQuery {
   userId?: number | null;
   symbol?: string;
-  status?: 'FILLED' | 'CANCELED';
+  status?: 'FILLED' | 'CANCELED' | 'PARTIALLY_FILLED';
   limit?: number;
 }
 
@@ -367,10 +365,11 @@ interface AdminOrderHistoryQueryResponse {
 
 /** 委托历史支持的终态筛选（与后端 ord_history.status 对齐）。 */
 export const ORDER_HISTORY_STATUSES: ReadonlyArray<{
-  value: 'FILLED' | 'CANCELED';
+  value: 'FILLED' | 'CANCELED' | 'PARTIALLY_FILLED';
   label: string;
 }> = [
   { value: 'FILLED', label: '撮合完成' },
+  { value: 'PARTIALLY_FILLED', label: '部分成交' },
   { value: 'CANCELED', label: '已撤销' },
 ];
 

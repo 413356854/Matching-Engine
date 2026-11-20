@@ -42,7 +42,7 @@
 |---|---|---|---|---|---|
 | ① | **账户模块** | `com.me.account` | 开户、余额（available / frozen）、冻结与解冻、资金流水、对账口径 | `AccountService`、`AccountController` | `shared` |
 | ② | **币币模块** | `com.me.currency` | 币种、交易对（symbol）、价格/数量精度、最小下单量、费率档位、上下架；**下单接入**（同步校验后写入 Disruptor，聚合为 `OrderCommandBatch` 投递 `me.order.commands-batch`，不直接调用委托模块）；**用户历史流水 / 历史成交查询**（经 shared 只读查询端口读取 QuestDB `funds_flow` / `user_trade`，最新在前） | `PairService`、`OrderPlacementController`、`OrderCommandPublisher`、`OrderIngressRing`、`CurrencyConfigCache`、`UserFundsFlowController`、`UserTradeController` | `shared` + `com.me.kafka` 基础设施 |
-| ③④ | **委托与撮合模块** | `com.me.order` + 内部纯 JDK 子包 `com.me.matching` | 消费 `me.order.commands-batch`（**唯一接单入口**）、参数与幂等校验、订单状态机、委托查询；撤单/改单（规划）；订单簿、价格-时间优先、成交生成；冻结回执后进程内撮合与成交清算；**终态委托历史收集**（撤单 `CANCELED` / 撮合完成 `FILLED` → `me.order.history-batch`）与用户历史委托查询 | `OrderCommandListener`、`OrderService`、`OrderMatchingService`、`MatchingEngine`、`OrderBook`、`OrderHistoryPublisher` | account、currency、`shared` |
+| ③④ | **委托与撮合模块** | `com.me.order` + 内部纯 JDK 子包 `com.me.matching` | 消费 `me.order.commands-batch`（**唯一接单入口**）、参数与幂等校验、订单状态机、委托查询；撤单/改单（规划）；订单簿、价格-时间优先、成交生成；冻结回执后进程内撮合与成交清算；**终态委托历史收集**（撮合完成 `FILLED` / 未成交撤销 `CANCELED` / 部分成交终态 `PARTIALLY_FILLED` → `me.order.history-batch`）与用户历史委托查询 | `OrderCommandListener`、`OrderService`、`OrderMatchingService`、`MatchingEngine`、`OrderBook`、`OrderHistoryPublisher` | account、currency、`shared` |
 | ⑤ | **结算中心** | `com.me.settlement` | （规划）双边记账、手续费、资金划转、清算幂等、日终对账；当前仅保留包结构，结算逻辑在 account / order 内 | 规划 | account、order |
 | ⑥ | **行情模块** | `com.me.marketdata` | 消费撮合对、K 线聚合、成交 / 深度查询；落 QuestDB | `MarketDataListener`、`MarketDataService`、`MarketDataRepository`、`KlineAggregator` | 撮合对事件（order → marketdata） |
 
@@ -263,7 +263,7 @@ pwsh -File .\stop-kafka.ps1
 | `me.account.settlements-batch` | 8 | 单用户成交结算批量消息（`key/partition=slot(userId)`，每个 slot 一条，body=`TradeSettlementBatch`；每笔成交拆成买方 `-b`、卖方 `-s` 两条命令，每个元素只含一个用户的资金腿） |
 | `me.account.offset-seq-batch` | 8 | 账户操作全局序列（固定 `key=batch`，body=`AccountOffsetSeqBatch`；每个元素是输入消费记录 `(topic, partition, offset)` 与自己的 `accountSeq` 的映射；与资金流水 / 冻结回执 / 消费 offset 同事务提交，供备份快照恢复后按序回溯 Kafka 消息） |
 | `me.funds-batch` | 8 | 资金流水批量消息（按 userId 哈希分区，每个分区每批一条，body=`FundsFlowBatch`；8 个 admin consumer 并行归档 QuestDB） |
-| `me.order.history-batch` | 8 | 委托历史批量消息（`key=symbol`，每个 symbol 一条，body=`OrderHistoryBatch`；只包含撤单 `CANCELED` 与撮合完成 `FILLED` 两种终态；admin 消费并归档 QuestDB `ord_history`，建表脚本 `doc/questdb/ord_history.sql`） |
+| `me.order.history-batch` | 8 | 委托历史批量消息（`key=symbol`，每个 symbol 一条，body=`OrderHistoryBatch`；只包含终态：撮合完成 `FILLED`、未成交撤销 `CANCELED`、部分成交终态 `PARTIALLY_FILLED`；admin 消费并归档 QuestDB `ord_history`，建表脚本 `doc/questdb/ord_history.sql`） |
 | `me.order.offset-seq-batch` | 8 | 委托操作全局序列（固定 `key=batch`，body=`OrderOffsetSeqBatch`；每个元素是输入消费记录 `(topic, partition, offset)` 与自己的 `orderSeq` 的映射；与撮合输出 / 结算命令 / 委托历史 / 消费 offset 同事务提交，供备份快照恢复后按序回溯 Kafka 消息） |
 | `me.depth` | 8 | 深度 / BBO 事件（规划；当前代码未使用） |
 
@@ -446,8 +446,8 @@ curl -G http://localhost:9000/exec `
     记录数 `deletedCount`；表结构与索引保留，之后新产生的流水继续归档。
   - 只清空 QuestDB 中的查询投影，不影响 `me.funds-batch` topic 与账户内存余额。
 - **委托历史列表**：`GET /api/v1/admin/order-history?userId=1001&symbol=BTC-USDT&status=FILLED&limit=100`
-  - 参数均可选；`status` 只接受 `FILLED`（撮合完成）/ `CANCELED`（撤单），结果按
-    `final_at` 倒序；`limit` 缺省 100、上限 1000。
+  - 参数均可选；`status` 只接受 `FILLED`（撮合完成）/ `PARTIALLY_FILLED`（部分成交终态）/
+    `CANCELED`（未成交撤销），结果按 `final_at` 倒序；`limit` 缺省 100、上限 1000。
   - 数据来自 admin 模块消费 `me.order.history-batch` 后归档的 QuestDB `ord_history`；
     委托模块在撤单推进或成交清算到 `FILLED` 时产出事件，与消费 offset 同事务发送。
   - 建表脚本见 `doc/questdb/ord_history.sql`。
@@ -604,7 +604,7 @@ curl "http://localhost:8080/api/v1/currency/user-trades?userId=1001&limit=50"
    （`ACCEPTED → PAID / REJECTED`），生成撮合单；按原回执顺序聚合后由
    `OrderMatchingService.matchBatch` 在引擎对象锁内调用 `MatchingEngine.place()`，收集成交对；
    再把成交清算提交线程池并发调用 `OrderMatchingService.clear`（内部 `OrderService.onTrade` /
-   `completeMarketBuy`），最后在同一个冻结回执监听事务里发布 `me.match-pair-batch` 与
+   `completeMarketOrder`），最后在同一个冻结回执监听事务里发布 `me.match-pair-batch` 与
    `me.account.settlements-batch`。不再写 `me.orders`，也不再由 matching 模块消费 Kafka。
    引擎对象锁覆盖撮合与清算两个阶段，撤单的引擎阶段会等待，避免与清算交错。
    - 冻结回执重复是正常路径：账户模块对重复 `requestId` 会再次发布回执，并可能再次执行冻结
@@ -645,8 +645,8 @@ curl "http://localhost:8080/api/v1/currency/user-trades?userId=1001&limit=50"
 `GET /api/v1/orders?userId=1001&symbol=BTC-USDT&limit=100`
 
 - `userId` 必填；`symbol` 可选，不传时返回用户全部交易对的当前委托；
-- 只返回未完成委托：`ACCEPTED`（等待冻结）/ `PAID`（撮合中）/ `PARTIALLY_FILLED`（部分成交），
-  已成交 / 已拒绝不返回；
+- 只返回未完成委托：`ACCEPTED`（等待冻结）/ `PAID`（撮合中）/ 进行中的 `PARTIALLY_FILLED`
+  （部分成交且仍在簿中）；已进入终态的委托（`FILLED` / `CANCELED` / 部分成交终态）不返回；
 - 按创建时间倒序（最新在前），`limit` 缺省 100、上限 200；
 - 响应中每笔委托包含 `orderId`、`userId`、`symbol`、`side`、`type`、`price`、`quantity`、
   `filledQuantity`、`frozenCurrency`、`frozenAmount`、`status`、`seq`、`createdAt`。
@@ -667,7 +667,8 @@ curl "http://localhost:8080/api/v1/orders?userId=1001&limit=20"
   `ord_history`。两处都没有返回 **404 + `ORDER_NOT_FOUND`**。
 - 响应 `source` 表示命中位置：`CURRENT`（当前内存）或 `HISTORY`（已归档终态）。
 - 同一用户重复使用同一 `requestId` 时返回 `orderId` 最大（最新）的一笔；当前委托的
-  `finalAt` 只在终态时非空，历史委托只包含 `CANCELED` / `FILLED`。
+  `finalAt` 只在终态时非空（进行中的 `PARTIALLY_FILLED` 为空），历史委托只包含终态：
+  `FILLED` / `CANCELED` / 已收尾的 `PARTIALLY_FILLED`。
 - 参数非法返回 400（`USER_ID_REQUIRED` / `USER_ID_INVALID` / `REQUEST_ID_REQUIRED` /
   `REQUEST_ID_INVALID`）；QuestDB 不可用时返回 503 `QUERY_FAILED`。
 
@@ -706,9 +707,10 @@ curl "http://localhost:8080/api/v1/orders/by-request-id?userId=1001&requestId=re
 ### 撤单
 
 `POST /api/v1/currency/orders/cancel`（币币模块）。`symbol` 与 `orderId` 由前端提供，
-`requestId` 缺省由服务端生成，`userId` 可选（传入时校验委托归属）。接口只做同步校验并把
-撤单命令非阻塞写入**独立的撤单 Disruptor**；委托模块的 `OrderCancelListener` 消费
-`me.order.cancels-batch`，是系统唯一的撤单入口。
+`requestId` 缺省由服务端生成，`userId` **必填**（当前由前端传入当前用户；接入登录后改为
+从 token 取 userId，不再信任 body）。委托模块只在 `userId` 与委托归属一致时才撤销，
+不一致的命令直接丢弃。接口只做同步校验并把撤单命令非阻塞写入**独立的撤单 Disruptor**；
+委托模块的 `OrderCancelListener` 消费 `me.order.cancels-batch`，是系统唯一的撤单入口。
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/currency/orders/cancel \
@@ -722,9 +724,11 @@ curl -X POST http://localhost:8080/api/v1/currency/orders/cancel \
 {"success":true,"reason":null,"requestId":"cancel-1","orderId":5002,"symbol":"BTC-USDT"}
 ```
 
-- **可撤状态**：`PAID`（已冻结、已进入撮合）与 `PARTIALLY_FILLED`；`ACCEPTED` 仍在冻结
-  回执途中，异步返回 `ORDER_NOT_PAID_YET`，前端稍后重试即可；`FILLED` / `CANCELED` /
-  `REJECTED` 不再产生解冻。
+- **可撤状态**：`PAID`（已冻结、已进入撮合）与仍在进行中的 `PARTIALLY_FILLED`
+  （`finalAt` 为空）；`ACCEPTED` 仍在冻结回执途中，异步返回 `ORDER_NOT_PAID_YET`，
+  前端稍后重试即可；已收尾的部分成交、`FILLED` / `CANCELED` / `REJECTED` 不再产生解冻。
+- **撤单终态**：没有成交量的委托进入 `CANCELED`；有成交量的委托保持 `PARTIALLY_FILLED`
+  并固定 `finalAt`，以该终态展示「部分成交」。
 - **撤单链路**（与下单一致，但使用独立 Disruptor 与 topic）：
   1. HTTP 线程 `tryPublishEvent` 写入 `OrderCancelIngressRing`，ring 满或未启动返回 503；
   2. `order-cancel-ingress-handler` 单线程把撤单按 symbol 放入 `Map<String,List>`；
@@ -732,7 +736,8 @@ curl -X POST http://localhost:8080/api/v1/currency/orders/cancel \
      `OrderCancelBatch`，按 `key=symbol` 发往 `me.order.cancels-batch`；
   3. `OrderCancelListener` 消费批量消息：线程池并发查询委托并生成撮合撤消单 → 聚合后
      在**引擎对象锁**内调用 `MatchingEngine.cancel` 并收集被撤销挂单 → 线程池并发把委托
-     推进为 `CANCELED` 并生成 `ORDER_UNFREEZE` 清算单 → 聚合清算单发送
+     推进为终态（无成交 `CANCELED`，有成交则 `PARTIALLY_FILLED` 终态）并生成
+     `ORDER_UNFREEZE` 清算单 → 聚合清算单发送
      `me.account.settlements-batch`；
   4. 账户模块按 userId slot 结算解冻，资金流水 `logType=ORDER_UNFREEZE`。
 - **并发安全**：`MatchingEngine.place` 与 `cancel` 都是 `synchronized` 实例方法（引擎对象锁），
@@ -827,19 +832,21 @@ curl -X POST http://localhost:8080/api/v1/currency/orders/cancel \
 | 类型 | 结构 | 作用 |
 |---|---|---|
 | 限价单 | `TreeMap<price, LinkedHashMap<orderId, BookOrder>>`，买卖各一 | TreeMap 价格优先（买盘降序、卖盘升序），LinkedHashMap 同价 FIFO |
-| 市价单 | `LinkedHashMap<orderId, BookOrder>`，买卖各一 | 按到达顺序 FIFO；市价单没有价格 |
+| 市价单 | 不挂单 | 按 **IOC**（Immediate-Or-Cancel）处理：只在到达当次撮合，剩余量立即撤销 |
 
 ### 撮合规则
 
-1. 新委托**先与对手方限价单撮合**：买吃最低卖价、卖吃最高买价；限价单价格不穿越时停止。
-2. 限价簿撮合后仍有剩余，且新委托是**限价单**时，**再与对手方市价单 FIFO 撮合**。
-3. **市价单不与市价单撮合**：市价新单只吃限价单；普通市价单剩余量挂入市价簿，等待后续限价单来吃。
-   **市价买入（`frozenAmount > 0`）是金额驱动的即时单**：每笔成交量还要满足
-   「剩余预算 ÷ 卖价」，预算买不起下一单位即停止，剩余量不挂单；撮合结束后未用完的预算
-   以 `ORDER_UNFREEZE` 清算消息退回可用余额。
-4. 每笔成交**以数量为基准**：成交量 = `min(新单剩余量, 挂单剩余量)`；金额 = 成交量 × 成交价，
+1. 新委托**只与对手方限价单撮合**：买吃最低卖价、卖吃最高买价；限价单价格不穿越时停止，
+   市价单一路吃到没有可成交的限价单。
+2. **市价单按 IOC 处理**：撮合结束后未成交部分立即撤销，不进入订单簿；委托模块把剩余
+   冻结资金以 `ORDER_UNFREEZE` 清算消息退回可用余额（买单退回未用完的计价币预算，
+   卖单退回未成交的基础币）。市价单不与其他市价单撮合。
+3. **市价买入（`frozenAmount > 0`）是金额驱动的即时单**：每笔成交量还要满足
+   「剩余预算 ÷ 卖价」，预算买不起下一单位即停止，剩余预算同样退回。
+4. 限价单撮合后的剩余量挂入本方价格梯。
+5. 每笔成交**以数量为基准**：成交量 = `min(新单剩余量, 挂单剩余量)`；金额 = 成交量 × 成交价，
    再按 `priceScale / quantityScale / quoteScale` 换算成计价币最小单位。
-5. 成交价：限价对限价取挂单（maker）价格；限价对市价取限价单价格（市价单价格恒为 0）。
+6. 成交价：取挂单（maker）的限价；市价单没有价格，成交价完全由对手方限价决定。
 
 ### 事件链路
 
@@ -1064,7 +1071,7 @@ curl "http://localhost:8080/api/v1/marketdata/trades?symbol=BTC-USDT&limit=2"
 - `depth` 缺省 20、上限 100，返回买卖两边各最多 `depth` 个价位；
 - `bids` 价格降序（买一在前）、`asks` 价格升序（卖一在前）；每个价位是
   `price / quantity / orderCount` 的聚合；
-- 市价单没有价格，不进入价格梯，用 `marketBidCount` / `marketAskCount` 报告数量；
+- 市价单按 IOC 处理，不挂单，不会出现在深度里；
 - 没有委托时返回 `success=true` 和空列表，`bestBid` / `bestAsk` 为 `null`。
 
 ```bash
@@ -1081,8 +1088,6 @@ curl "http://localhost:8080/api/v1/marketdata/orderbook?symbol=BTC-USDT&depth=5"
   "asks": [{ "price": 5000000, "quantity": 200000000, "orderCount": 1 }],
   "bestBid": 4990000,
   "bestAsk": 5000000,
-  "marketBidCount": 0,
-  "marketAskCount": 0,
   "timestamp": "2026-11-08T10:00:00Z"
 }
 ```
@@ -1110,7 +1115,7 @@ curl "http://localhost:8080/api/v1/marketdata/orderbook?symbol=BTC-USDT&depth=5"
 
 ```json
 {"type":"subscribed","symbol":"BTC-USDT","depth":10,"timestamp":"2026-11-17T11:20:00Z"}
-{"type":"orderbook","symbol":"BTC-USDT","depth":10,"bids":[{"price":5000000,"quantity":1000000,"orderCount":1}],"asks":[{"price":5010000,"quantity":1000000,"orderCount":1}],"bestBid":5000000,"bestAsk":5010000,"marketBidCount":0,"marketAskCount":0,"trades":[{"tradeId":1,"symbol":"BTC-USDT","price":5000000,"quantity":1000000,"amount":5000000000000,"takerSide":"BUY","executedAt":"2026-11-17T11:19:59Z"}],"klines":[{"symbol":"BTC-USDT","interval":"1m","bucketStart":"2026-11-17T11:19:00Z","openPrice":5000000,"highPrice":5010000,"lowPrice":4990000,"closePrice":5010000,"volume":3000000,"amount":15015000000000,"tradeCount":3}],"timestamp":"2026-11-17T11:20:00.500Z"}
+{"type":"orderbook","symbol":"BTC-USDT","depth":10,"bids":[{"price":5000000,"quantity":1000000,"orderCount":1}],"asks":[{"price":5010000,"quantity":1000000,"orderCount":1}],"bestBid":5000000,"bestAsk":5010000,"trades":[{"tradeId":1,"symbol":"BTC-USDT","price":5000000,"quantity":1000000,"amount":5000000000000,"takerSide":"BUY","executedAt":"2026-11-17T11:19:59Z"}],"klines":[{"symbol":"BTC-USDT","interval":"1m","bucketStart":"2026-11-17T11:19:00Z","openPrice":5000000,"highPrice":5010000,"lowPrice":4990000,"closePrice":5010000,"volume":3000000,"amount":15015000000000,"tradeCount":3}],"timestamp":"2026-11-17T11:20:00.500Z"}
 {"type":"unsubscribed","timestamp":"2026-11-17T11:20:01Z"}
 {"type":"error","symbol":"BTC-USDT","reason":"SYMBOL_INVALID","timestamp":"2026-11-17T11:20:02Z"}
 ```
@@ -1149,6 +1154,9 @@ WS 只负责连接级校验（login、requestId、限流、消息大小）和 Ae
 {"action":"cancelOrder","requestId":"r-2","orderId":123,"symbol":"BTC-USDT"}
 {"action":"ping"}
 ```
+
+撤单归属取连接 `login` 时的 `userId`（由 `TradeSession` 注入 Aeron 请求），
+`cancelOrder` 消息体中的 `userId` 字段会被忽略。
 
 服务端 → 客户端：
 
@@ -1553,8 +1561,8 @@ app:
   时自动重新订阅；最新成交展示价格 / 数量 / 时间，随盘口同一帧 WebSocket 推送）；K 线蜡烛图 + 成交量柱
   （周期切换、缩放 / 拖拽、十字光标 OHLC 图例，最新柱随盘口帧 500ms 更新）；图表下方「当前委托 / 历史委托 / 历史成交 / 历史流水」
   面板通过顶部标签切换：当前委托显示方向、价格、数量、已成交、状态与「撤单」操作（3 秒轮询；
-  `PAID` / `PARTIALLY_FILLED` 可撤，`ACCEPTED` 等待冻结完成后可撤），历史委托展示当前用户
-  已撤单 / 已撮合完成的委托（QuestDB `ord_history`，按终态时间倒序，5 秒轮询），历史成交展示
+  `PAID` / 进行中的 `PARTIALLY_FILLED` 可撤，`ACCEPTED` 等待冻结完成后可撤），历史委托展示当前用户
+  已进入终态的委托（含部分成交终态，QuestDB `ord_history`，按终态时间倒序，5 秒轮询），历史成交展示
   当前用户每一笔成交（QuestDB `user_trade`，主动 / 被动、方向、价格、数量、成交额，按成交时间
   倒序，5 秒轮询），历史流水展示当前用户 QuestDB `funds_flow` 记录，按发生时间倒序、最新在前
   （5 秒轮询）；资产余额
@@ -1566,7 +1574,7 @@ app:
   标识，演示版不用于防重。
 - **后台管理**：左侧为「交易对 / 流水 / 委托历史 / 成交记录 / K 线 / 备份」子栏目。流水按用户 /
   币种 / 日志类型查询 QuestDB `funds_flow`，展示金额、余额前后值、原子操作与 `seq`；委托历史按
-  用户 / 交易对 / 终态（撮合完成 / 已撤销）查询 `ord_history`，展示方向、价格、数量、成交量与
+  用户 / 交易对 / 终态（撮合完成 / 部分成交 / 已撤销）查询 `ord_history`，展示方向、价格、数量、成交量与
   `seq`；成交记录按用户 / 交易对 / 角色（主动 / 被动）查询 `user_trade`，展示成交号、委托号、
   对手单号、方向、价格、数量与成交额；K 线按交易对 / 周期查询 `md_kline`，展示 OHLC、
   成交量、成交额与笔数。流水与 K 线子栏目提供「一键删除」，执行前二次确认，使用

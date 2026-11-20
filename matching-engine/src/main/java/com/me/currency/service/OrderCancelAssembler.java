@@ -14,8 +14,10 @@ import org.springframework.stereotype.Component;
  * 不查委托、不修改状态、不解冻资金；真正的撤单由委托模块消费
  * {@code me.order.cancels-batch} 后异步完成。
  *
- * <p>{@code requestId} 缺省时由服务端生成 UUID；{@code userId} 为 0 / 缺省表示命令未携带
- * 用户，委托模块跳过归属校验。WebSocket 路径由调用方保证传入登录用户的 {@code userId > 0}。
+ * <p>{@code requestId} 缺省时由服务端生成 UUID；{@code userId} 必填且必须大于 0，表示
+ * 发起撤单的用户。委托模块只在命令的 {@code userId} 与委托归属一致时才撤销，否则丢弃命令。
+ * HTTP 路径由前端在 body 中传入当前用户；WebSocket / Aeron 路径由连接登录态注入。
+ * 接入登录后，userId 应改为从认证主体（token）获取，不再信任客户端 body。
  */
 @Component
 public class OrderCancelAssembler {
@@ -50,7 +52,7 @@ public class OrderCancelAssembler {
         }
 
         long orderId = request.orderId();
-        long userId = request.userId() == null ? 0L : request.userId();
+        long userId = request.userId();
         OrderCancelCommand command = new OrderCancelCommand(requestId, orderId, userId, symbol);
         return new Result(requestId, orderId, symbol, command, null);
     }
@@ -69,7 +71,10 @@ public class OrderCancelAssembler {
         if (request.symbol() == null || request.symbol().isBlank()) {
             return "SYMBOL_REQUIRED";
         }
-        if (request.userId() != null && request.userId() <= 0) {
+        if (request.userId() == null) {
+            return "USER_ID_REQUIRED";
+        }
+        if (request.userId() <= 0) {
             return "USER_ID_INVALID";
         }
         return null;

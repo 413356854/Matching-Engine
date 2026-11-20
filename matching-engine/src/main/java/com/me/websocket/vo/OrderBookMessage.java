@@ -14,7 +14,7 @@ import java.util.List;
  * <p>{@code type} 区分消息用途：
  * <ul>
  *   <li>{@code subscribed} / {@code unsubscribed}：订阅变更回执，只带 symbol / depth；</li>
- *   <li>{@code orderbook}：盘口快照，带买卖梯、买一/卖一、市价单数量、最新成交、
+ *   <li>{@code orderbook}：盘口快照，带买卖梯、买一/卖一、最新成交、
  *       各周期最新 K 线与快照时间；</li>
  *   <li>{@code error}：协议错误，{@code reason} 是错误码。</li>
  * </ul>
@@ -29,8 +29,6 @@ public record OrderBookMessage(
         List<DepthLevel> asks,
         Long bestBid,
         Long bestAsk,
-        Integer marketBidCount,
-        Integer marketAskCount,
         List<TradeView> trades,
         List<KlineView> klines,
         Instant timestamp,
@@ -46,8 +44,6 @@ public record OrderBookMessage(
                 snapshot.asks(),
                 snapshot.bestBid(),
                 snapshot.bestAsk(),
-                snapshot.marketBidCount(),
-                snapshot.marketAskCount(),
                 trades,
                 klines,
                 snapshot.timestamp(),
@@ -57,18 +53,18 @@ public record OrderBookMessage(
     public static OrderBookMessage subscribed(String symbol, int depth) {
         return new OrderBookMessage(
                 "subscribed", symbol, depth,
-                null, null, null, null, null, null, null, null, Instant.now(), null);
+                null, null, null, null, null, null, Instant.now(), null);
     }
 
     public static OrderBookMessage unsubscribed() {
         return new OrderBookMessage(
                 "unsubscribed", null, null,
-                null, null, null, null, null, null, null, null, Instant.now(), null);
+                null, null, null, null, null, null, Instant.now(), null);
     }
 
     public static OrderBookMessage error(String symbol, String reason) {
         return new OrderBookMessage(
                 "error", symbol, null,
-                null, null, null, null, null, null, null, null, Instant.now(), reason);
+                null, null, null, null, null, null, Instant.now(), reason);
     }
 }

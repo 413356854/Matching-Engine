@@ -14,7 +14,7 @@ import org.springframework.web.bind.annotation.RestController;
  *
  * <p>{@code GET /api/v1/marketdata/orderbook?symbol=BTC-USDT&depth=20} 返回撮合引擎内存
  * 订单簿的只读快照：买盘价格降序、卖盘价格升序，{@code bestBid} / {@code bestAsk} 是买一 /
- * 卖一。市价单没有价格，只通过 {@code marketBidCount} / {@code marketAskCount} 报告数量。
+ * 卖一。市价单按 IOC 处理，不挂单，不会出现在深度里。
  *
  * <p>{@code symbol} 必填并统一转大写；{@code depth} 缺省 20、上限 100。
  * 交易对没有订单簿时返回成功和空列表。这是只读展示接口，不改变订单簿。

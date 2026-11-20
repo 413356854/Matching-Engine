@@ -18,8 +18,6 @@ public record OrderBookDepthView(
         List<DepthLevel> asks,
         Long bestBid,
         Long bestAsk,
-        int marketBidCount,
-        int marketAskCount,
         Instant timestamp) {
 
     public OrderBookDepthView {
@@ -37,14 +35,12 @@ public record OrderBookDepthView(
                 snapshot.asks(),
                 snapshot.bestBid(),
                 snapshot.bestAsk(),
-                snapshot.marketBidCount(),
-                snapshot.marketAskCount(),
                 snapshot.timestamp());
     }
 
     public static OrderBookDepthView rejected(String symbol, String reason) {
         return new OrderBookDepthView(
                 false, reason, symbol, 0,
-                List.of(), List.of(), null, null, 0, 0, Instant.now());
+                List.of(), List.of(), null, null, Instant.now());
     }
 }

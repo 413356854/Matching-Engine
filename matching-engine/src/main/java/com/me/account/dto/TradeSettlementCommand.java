@@ -18,9 +18,9 @@ import java.util.List;
  * <p>账户模块把每条命令的<b>所有腿作为一个原子操作</b>执行：任一腿余额不足，该条命令不生效。
  * 买卖两侧是两条独立命令，不保证跨用户原子性。
  *
- * <p><b>非成交清算</b>：市价买入撮合结束后退回未用完的冻结预算，只携带一条
- * {@link FundsLogType#ORDER_UNFREEZE} 腿；此时 {@code tradeId} 与 {@code makerOrderId} 为 0，
- * {@code takerOrderId} 仍是产生退款的市价买入委托。
+ * <p><b>非成交清算</b>：市价单 IOC 收尾时退回剩余冻结（买单为未用完的预算，卖单为
+ * 未成交数量），只携带一条 {@link FundsLogType#ORDER_UNFREEZE} 腿；此时 {@code tradeId}
+ * 与 {@code makerOrderId} 为 0，{@code takerOrderId} 仍是产生退款的市价委托。
  *
  * <p>{@code requestId} 是结算命令的唯一标识（演示版由委托模块的进程内计数器生成，
  * 后续随内存状态持久化/恢复）；仅用于日志、审计与资金流水，不再作为账户幂等键。

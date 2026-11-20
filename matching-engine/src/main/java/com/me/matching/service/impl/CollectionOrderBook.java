@@ -33,19 +33,18 @@ import java.util.TreeMap;
  *   <li><b>限价单</b>：{@code TreeMap<price, LinkedHashMap<orderId, BookOrder>>}。
  *       买盘价格降序、卖盘价格升序，TreeMap 提供价格优先；同一价位的 LinkedHashMap
  *       按插入顺序提供时间优先（FIFO）。</li>
- *   <li><b>市价单</b>：{@code LinkedHashMap<orderId, BookOrder>}，买卖各一，按到达顺序 FIFO。
- *       市价单没有价格，成交时用对手方限价单的价格。</li>
+ *   <li><b>市价单</b>：不挂单。市价单按 <b>IOC</b>（Immediate-Or-Cancel）处理：只在
+ *       到达当次与对手方限价单撮合，未成交部分立即撤销，由委托模块解冻剩余资金。</li>
  * </ul>
  *
  * <h2>撮合规则</h2>
  * <ol>
- *   <li>新委托<b>先与对手方限价单撮合</b>：买吃卖盘最低价、卖吃买盘最高价；
- *       限价单价格不穿越时停止。</li>
- *   <li>仍有剩余且新委托是<b>限价单</b>时，<b>再与对手方市价单按 FIFO 撮合</b>。</li>
- *   <li><b>市价单不与市价单撮合</b>：市价新单只吃限价单；未成交部分通常挂到市价簿，
- *       等待后续限价单来吃。</li>
- *   <li><b>金额驱动的市价买入</b>：{@code frozenAmount > 0} 时视为即时单（IOC），
- *       每笔成交量还受剩余预算约束（预算 / 卖价），预算耗尽即停止，剩余量不挂单。</li>
+ *   <li>新委托<b>只与对手方限价单撮合</b>：买吃卖盘最低价、卖吃买盘最高价；
+ *       限价单价格不穿越时停止，市价单一路吃到没有可成交的限价单。</li>
+ *   <li><b>市价单不与市价单撮合</b>：市价单没有价格，而且按 IOC 不会留在订单簿中。</li>
+ *   <li><b>限价单</b>撮合后的剩余量挂入本方价格梯；市价单剩余量撤销，不进入订单簿。</li>
+ *   <li><b>金额驱动的市价买入</b>：{@code frozenAmount > 0} 时，每笔成交量还受剩余
+ *       预算约束（预算 / 卖价），预算耗尽即停止；剩余预算由委托模块退回。</li>
  *   <li>每笔成交<b>以数量为基准</b>：成交量 = min(新单剩余量, 挂单剩余量)；
  *       金额 = 成交量 × 成交价。</li>
  * </ol>
@@ -53,7 +52,7 @@ import java.util.TreeMap;
  * <h2>成交价</h2>
  * <ul>
  *   <li>限价 vs 限价：取挂单（maker）价格，价格优先、时间优先。</li>
- *   <li>限价 vs 市价：取限价单价格（市价单价格恒为 0）。</li>
+ *   <li>市价 vs 限价：取限价单（maker）价格。</li>
  * </ul>
  *
  * <p><b>幂等</b>：冻结回执可能因 Kafka 事务重投或重复命令再次触发撮合，同一 orderId 只撮合一次，
@@ -78,12 +77,6 @@ public final class CollectionOrderBook implements OrderBook {
 
     /** 限价卖盘：价格升序，最低卖价在 firstKey()。 */
     private final NavigableMap<Long, LinkedHashMap<Long, BookOrder>> limitAsks = new TreeMap<>();
-
-    /** 市价买盘：按到达顺序 FIFO。 */
-    private final Map<Long, BookOrder> marketBids = new LinkedHashMap<>();
-
-    /** 市价卖盘：按到达顺序 FIFO。 */
-    private final Map<Long, BookOrder> marketAsks = new LinkedHashMap<>();
 
     /** 已处理的 orderId，用于 at-least-once 去重。 */
     private final Set<Long> seenOrderIds = new HashSet<>();
@@ -119,32 +112,30 @@ public final class CollectionOrderBook implements OrderBook {
         long remaining = order.quantity();
         List<Trade> trades = new ArrayList<>();
 
-        // 1) 先与对手方限价单撮合：价格优先 + 同价 FIFO。
+        // 1) 与对手方限价单撮合：价格优先 + 同价 FIFO。
         remaining = matchLimitOrders(buy ? limitAsks : limitBids, order, remaining, trades, budget);
 
-        // 2) 限价单仍有剩余时，再与对手方市价单 FIFO 撮合；市价单不参与这一步（不与市价撮合）。
+        // 2) 市价单按 IOC 处理：未成交部分立即撤销，不进入订单簿，由委托模块解冻剩余资金；
+        //    限价单剩余量挂入本方价格梯。
         if (remaining > 0 && order.type() == OrderType.LIMIT) {
-            remaining = matchMarketOrders(buy ? marketAsks : marketBids, order, remaining, trades);
-        }
-
-        // 3) 剩余量挂入本方订单簿；金额驱动的市价买入不挂单。
-        if (remaining > 0 && budget == null) {
             rest(order, remaining);
         }
         return MatchResult.matched(order.orderId(), order.quantity(), remaining, trades);
     }
 
     /**
-     * 从订单簿移除挂单：市价单直接查对应方向的 FIFO 映射；限价单按方向 + 价格直接定位
-     * 价格档位，再按 orderId 移除。价格档位被撤空时同步删除该档位，避免深度快照出现
-     * 0 数量的空档。撤单不移除去重集合中的 orderId，重复的冻结回执仍会返回 duplicate，
-     * 不会把已撤委托重新挂回订单簿。
+     * 从订单簿移除挂单：限价单按方向 + 价格直接定位价格档位，再按 orderId 移除。
+     * 价格档位被撤空时同步删除该档位，避免深度快照出现 0 数量的空档。撤单不移除去重集合
+     * 中的 orderId，重复的冻结回执仍会返回 duplicate，不会把已撤委托重新挂回订单簿。
+     *
+     * <p>市价单按 IOC 处理，只在一次撮合调用内存在，永远不会出现在订单簿中，
+     * 因此对市价单的撤单返回 {@code null}（未找到）。
      */
     @Override
     public synchronized BookOrder cancel(long orderId, OrderSide side, OrderType type,
                                          long price) {
         if (type == OrderType.MARKET) {
-            return marketBook(side).remove(orderId);
+            return null;
         }
         NavigableMap<Long, LinkedHashMap<Long, BookOrder>> book = limitBook(side);
         LinkedHashMap<Long, BookOrder> level = book.get(price);
@@ -193,25 +184,6 @@ public final class CollectionOrderBook implements OrderBook {
             }
             if (makers.isEmpty()) {
                 levels.remove();
-            }
-        }
-        return remaining;
-    }
-
-    /**
-     * 新委托是限价单、限价簿撮合后仍有剩余时，按 FIFO 吃对手方市价单。
-     * 市价挂单价格为 0，成交价取新委托的限价。
-     */
-    private long matchMarketOrders(Map<Long, BookOrder> opposite,
-                                   OrderPlacedEvent taker,
-                                   long remaining,
-                                   List<Trade> trades) {
-        Iterator<BookOrder> makerIt = opposite.values().iterator();
-        while (remaining > 0 && makerIt.hasNext()) {
-            BookOrder maker = makerIt.next();
-            remaining = match(taker, maker, taker.price(), remaining, trades, null);
-            if (maker.filled()) {
-                makerIt.remove();
             }
         }
         return remaining;
@@ -284,25 +256,21 @@ public final class CollectionOrderBook implements OrderBook {
     }
 
     /**
-     * 剩余量挂入订单簿：限价单进 price -> LinkedHashMap，市价单进 LinkedHashMap。
+     * 剩余量挂入限价簿：price -> LinkedHashMap。市价单按 IOC 处理，不会走到这里。
      */
     private void rest(OrderPlacedEvent order, long remaining) {
-        BookOrder bookOrder = new BookOrder(order, remaining);
-        if (order.type() == OrderType.LIMIT) {
-            limitBook(order.side())
-                    .computeIfAbsent(order.price(), price -> new LinkedHashMap<>())
-                    .put(order.orderId(), bookOrder);
-        } else {
-            marketBook(order.side()).put(order.orderId(), bookOrder);
+        if (order.type() != OrderType.LIMIT) {
+            throw new IllegalArgumentException(
+                    "market order must not rest: orderId=" + order.orderId());
         }
+        BookOrder bookOrder = new BookOrder(order, remaining);
+        limitBook(order.side())
+                .computeIfAbsent(order.price(), price -> new LinkedHashMap<>())
+                .put(order.orderId(), bookOrder);
     }
 
     private NavigableMap<Long, LinkedHashMap<Long, BookOrder>> limitBook(OrderSide side) {
         return side == OrderSide.BUY ? limitBids : limitAsks;
-    }
-
-    private Map<Long, BookOrder> marketBook(OrderSide side) {
-        return side == OrderSide.BUY ? marketBids : marketAsks;
     }
 
     @Override
@@ -315,22 +283,7 @@ public final class CollectionOrderBook implements OrderBook {
     }
 
     @Override
-    public int marketOrderCount(OrderSide side) {
-        return marketBook(side).size();
-    }
-
-    @Override
     public BookOrder find(long orderId) {
-        for (BookOrder order : marketBids.values()) {
-            if (order.orderId() == orderId) {
-                return order;
-            }
-        }
-        for (BookOrder order : marketAsks.values()) {
-            if (order.orderId() == orderId) {
-                return order;
-            }
-        }
         for (LinkedHashMap<Long, BookOrder> level : limitBids.values()) {
             BookOrder order = level.get(orderId);
             if (order != null) {
@@ -352,8 +305,6 @@ public final class CollectionOrderBook implements OrderBook {
                 symbol,
                 snapshotLevels(limitBids),
                 snapshotLevels(limitAsks),
-                snapshotMarket(marketBids),
-                snapshotMarket(marketAsks),
                 sortedSeenOrderIds(),
                 nextTradeId);
     }
@@ -372,7 +323,6 @@ public final class CollectionOrderBook implements OrderBook {
                     + " does not match " + symbol);
         }
         if (snapshot.bids() == null || snapshot.asks() == null
-                || snapshot.marketBids() == null || snapshot.marketAsks() == null
                 || snapshot.seenOrderIds() == null) {
             throw new IllegalArgumentException("snapshot book is incomplete: " + symbol);
         }
@@ -384,15 +334,11 @@ public final class CollectionOrderBook implements OrderBook {
         NavigableMap<Long, LinkedHashMap<Long, BookOrder>> restoredBids =
                 new TreeMap<>(Comparator.reverseOrder());
         NavigableMap<Long, LinkedHashMap<Long, BookOrder>> restoredAsks = new TreeMap<>();
-        Map<Long, BookOrder> restoredMarketBids = new LinkedHashMap<>();
-        Map<Long, BookOrder> restoredMarketAsks = new LinkedHashMap<>();
         Set<Long> restoredSeen = new HashSet<>();
         Set<Long> allOrderIds = new HashSet<>();
 
         restoreLevels(snapshot.bids(), OrderSide.BUY, restoredBids, allOrderIds);
         restoreLevels(snapshot.asks(), OrderSide.SELL, restoredAsks, allOrderIds);
-        restoreMarket(snapshot.marketBids(), OrderSide.BUY, restoredMarketBids, allOrderIds);
-        restoreMarket(snapshot.marketAsks(), OrderSide.SELL, restoredMarketAsks, allOrderIds);
 
         for (Long orderId : snapshot.seenOrderIds()) {
             if (orderId == null || orderId <= 0) {
@@ -413,10 +359,6 @@ public final class CollectionOrderBook implements OrderBook {
         limitBids.putAll(restoredBids);
         limitAsks.clear();
         limitAsks.putAll(restoredAsks);
-        marketBids.clear();
-        marketBids.putAll(restoredMarketBids);
-        marketAsks.clear();
-        marketAsks.putAll(restoredMarketAsks);
         seenOrderIds.clear();
         seenOrderIds.addAll(restoredSeen);
         nextTradeId = snapshot.nextTradeId();
@@ -460,28 +402,6 @@ public final class CollectionOrderBook implements OrderBook {
         }
     }
 
-    private void restoreMarket(List<BookOrderSnapshot> orders,
-                               OrderSide expectedSide,
-                               Map<Long, BookOrder> target,
-                               Set<Long> allOrderIds) {
-        for (BookOrderSnapshot order : orders) {
-            if (order == null || order.type() != OrderType.MARKET
-                    || order.side() != expectedSide || order.price() != 0) {
-                throw new IllegalArgumentException("snapshot market order is invalid: " + order);
-            }
-            BookOrder restored = BookOrder.fromSnapshot(order);
-            if (!symbol.equals(restored.symbol())) {
-                throw new IllegalArgumentException("snapshot book order symbol mismatch: "
-                        + restored.symbol() + " != " + symbol);
-            }
-            if (!allOrderIds.add(restored.orderId())) {
-                throw new IllegalArgumentException("duplicate snapshot book orderId: "
-                        + restored.orderId());
-            }
-            target.put(restored.orderId(), restored);
-        }
-    }
-
     private static List<PriceLevelSnapshot> snapshotLevels(
             NavigableMap<Long, LinkedHashMap<Long, BookOrder>> book) {
         List<PriceLevelSnapshot> levels = new ArrayList<>(book.size());
@@ -493,14 +413,6 @@ public final class CollectionOrderBook implements OrderBook {
             levels.add(new PriceLevelSnapshot(entry.getKey(), List.copyOf(orders)));
         }
         return List.copyOf(levels);
-    }
-
-    private static List<BookOrderSnapshot> snapshotMarket(Map<Long, BookOrder> book) {
-        List<BookOrderSnapshot> orders = new ArrayList<>(book.size());
-        for (BookOrder order : book.values()) {
-            orders.add(order.toSnapshot());
-        }
-        return List.copyOf(orders);
     }
 
     private List<Long> sortedSeenOrderIds() {
@@ -520,8 +432,6 @@ public final class CollectionOrderBook implements OrderBook {
                 asks,
                 bids.isEmpty() ? null : bids.get(0).price(),
                 asks.isEmpty() ? null : asks.get(0).price(),
-                marketBids.size(),
-                marketAsks.size(),
                 Instant.now());
     }
 

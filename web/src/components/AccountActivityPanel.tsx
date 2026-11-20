@@ -9,6 +9,7 @@ import {
   type UserTrade,
 } from '../api';
 import { describeError } from '../errors';
+import { marketIocStatusClass, marketIocStatusLabel } from '../orderStatus';
 import {
   formatDateTime,
   formatDisplayUnits,
@@ -41,9 +42,13 @@ interface AccountActivityPanelProps {
 
 type ActivityTab = 'orders' | 'history' | 'trades' | 'flows';
 
-/** 委托历史只包含两种终态，文案与「当前委托」状态机区分：FILLED 显示为撮合完成。 */
+/**
+ * 委托历史只包含终态：FILLED / 部分成交收尾（PARTIALLY_FILLED）/ 未成交撤销（CANCELED）。
+ * 文案与「当前委托」状态机区分：FILLED 显示为撮合完成。
+ */
 const HISTORY_STATUS_LABEL: Partial<Record<OrderStatus, string>> = {
   FILLED: '撮合完成',
+  PARTIALLY_FILLED: '部分成交',
   CANCELED: '已撤销',
 };
 
@@ -324,6 +329,12 @@ export function AccountActivityPanel({
             <tbody>
               {history.map((order) => {
                 const side = order.side === 'BUY' ? 'up' : 'down';
+                const statusLabel =
+                  marketIocStatusLabel(order) ??
+                  HISTORY_STATUS_LABEL[order.status] ??
+                  STATUS_LABEL[order.status];
+                const statusClass =
+                  marketIocStatusClass(order) ?? STATUS_CLASS[order.status];
                 return (
                   <tr
                     key={order.orderId}
@@ -351,8 +362,8 @@ export function AccountActivityPanel({
                       {formatQuantity(order.filledQuantity, order.quantityScale)}
                     </td>
                     <td>
-                      <span className={`order-status ${STATUS_CLASS[order.status]}`}>
-                        {HISTORY_STATUS_LABEL[order.status] ?? STATUS_LABEL[order.status]}
+                      <span className={`order-status ${statusClass}`}>
+                        {statusLabel}
                       </span>
                     </td>
                   </tr>

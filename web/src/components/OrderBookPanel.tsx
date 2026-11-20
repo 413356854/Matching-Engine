@@ -58,10 +58,6 @@ export function OrderBookPanel({
   const bestBid = orderBook?.bestBid ?? null;
   const bestAsk = orderBook?.bestAsk ?? null;
   const spread = bestBid !== null && bestAsk !== null ? bestAsk - bestBid : null;
-  const marketNote =
-    orderBook && (orderBook.marketBidCount > 0 || orderBook.marketAskCount > 0)
-      ? `市价挂单：买 ${orderBook.marketBidCount} / 卖 ${orderBook.marketAskCount}`
-      : null;
 
   const barWidth = (cumulative: number) =>
     `${Math.max(2, Math.min(100, (cumulative / maxCumulative) * 100))}%`;
@@ -136,7 +132,6 @@ export function OrderBookPanel({
 
       <div className="ob-footer">
         <span>价差 {spread !== null ? formatPrice(spread, priceScale) : '--'}</span>
-        {marketNote && <span>{marketNote}</span>}
       </div>
     </>
   );

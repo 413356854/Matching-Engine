@@ -5,22 +5,14 @@ import com.me.shared.order.OrderHistoryEvent;
 import java.util.List;
 
 /**
- * 成交对清算 / 市价买入完成结果。
+ * 成交清算 / 市价单 IOC 收尾的结果：本次推进产生的结算命令与进入终态的委托历史。
  *
- * <p>{@code handled=true} 表示成交对已完成委托清算，{@code settlementCommands} 是需要投递到
- * 账户结算 topic 的<b>单用户</b>资金消息：买方一条、卖方一条。委托状态通过
- * {@code OrderService.view(orderId)} 查询；这里不再携带 {@code OrderView}。
- *
- * <p>{@code historyEvents} 是本次推进中进入终态的委托快照：taker / maker 谁被成交至
- * {@code FILLED}，就为谁生成一条历史事件；部分成交不产生历史事件。撤单产生的历史事件
- * 由 {@link OrderCancelApplyResult#historyEvent()} 携带。
- *
- * <p>{@code handled=false} 表示成交无法落到委托（委托不存在、状态不可成交、字段非法等），
- * 调用方只记录日志，不产生资金结算。
+ * <p>成交由进程内撮合在引擎锁内同步产生并清算，taker / maker 必然已在委托表中且
+ * 可成交，撤单也走同一把锁，因此清算没有失败结果；{@code settlementCommands} /
+ * {@code historyEvents} 为空表示本次无需额外输出（例如市价单已在最后一笔成交中
+ * 全部成交，退款腿已随成交结算携带）。
  */
 public record OrderTradeApplyResult(
-        boolean handled,
-        String reason,
         List<TradeSettlementCommand> settlementCommands,
         List<OrderHistoryEvent> historyEvents) {
 
@@ -29,20 +21,12 @@ public record OrderTradeApplyResult(
         historyEvents = historyEvents == null ? List.of() : List.copyOf(historyEvents);
     }
 
-    public static OrderTradeApplyResult handled(List<TradeSettlementCommand> settlementCommands,
-                                                List<OrderHistoryEvent> historyEvents) {
-        return new OrderTradeApplyResult(true, null, settlementCommands, historyEvents);
+    public static OrderTradeApplyResult of(List<TradeSettlementCommand> settlementCommands,
+                                           List<OrderHistoryEvent> historyEvents) {
+        return new OrderTradeApplyResult(settlementCommands, historyEvents);
     }
 
-    public static OrderTradeApplyResult handled(List<TradeSettlementCommand> settlementCommands) {
-        return handled(settlementCommands, List.of());
-    }
-
-    public static OrderTradeApplyResult handled(TradeSettlementCommand settlementCommand) {
-        return handled(List.of(settlementCommand), List.of());
-    }
-
-    public static OrderTradeApplyResult ignored(String reason) {
-        return new OrderTradeApplyResult(false, reason, List.of(), List.of());
+    public static OrderTradeApplyResult empty() {
+        return new OrderTradeApplyResult(List.of(), List.of());
     }
 }

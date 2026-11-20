@@ -213,8 +213,8 @@ public class SnapshotLoader {
      * <p>逐项检查：
      * <ul>
      *   <li>symbol 唯一、价格档位非空且价格为正；</li>
-     *   <li>限价档位的订单必须是 LIMIT 且价格等于档位价；市价订单必须是 MARKET 且价格 0；</li>
-     *   <li>挂单方向与所在集合一致（bids/marketBids 为 BUY，asks/marketAsks 为 SELL）；</li>
+     *   <li>挂单必须是 LIMIT 且价格等于档位价（市价单按 IOC 不挂单，不会出现在快照里）；</li>
+     *   <li>挂单方向与所在集合一致（bids 为 BUY，asks 为 SELL）；</li>
      *   <li>remainingQuantity ∈ (0, quantity]；</li>
      *   <li>所有挂单都已在 seenOrderIds 中（去重集合是撮合幂等的基础）；</li>
      *   <li>nextTradeId 为正。</li>
@@ -232,8 +232,7 @@ public class SnapshotLoader {
             if (bookBySymbol.putIfAbsent(book.symbol(), book) != null) {
                 throw fail(path, "duplicate book symbol: " + book.symbol());
             }
-            if (book.bids() == null || book.asks() == null
-                    || book.marketBids() == null || book.marketAsks() == null) {
+            if (book.bids() == null || book.asks() == null) {
                 throw fail(path, "book levels are missing: " + book.symbol());
             }
             if (book.seenOrderIds() == null) {
@@ -244,10 +243,8 @@ public class SnapshotLoader {
                         + ", nextTradeId=" + book.nextTradeId());
             }
             Set<Long> seen = validateSeenOrderIds(book, path);
-            validateLevels(book, book.bids(), OrderSide.BUY, true, seen, path);
-            validateLevels(book, book.asks(), OrderSide.SELL, true, seen, path);
-            validateMarketOrders(book, book.marketBids(), OrderSide.BUY, seen, path);
-            validateMarketOrders(book, book.marketAsks(), OrderSide.SELL, seen, path);
+            validateLevels(book, book.bids(), OrderSide.BUY, seen, path);
+            validateLevels(book, book.asks(), OrderSide.SELL, seen, path);
         }
         return bookBySymbol;
     }
@@ -269,7 +266,6 @@ public class SnapshotLoader {
     private void validateLevels(OrderBookSnapshot book,
                                 List<PriceLevelSnapshot> levels,
                                 OrderSide side,
-                                boolean limit,
                                 Set<Long> seen,
                                 Path path) {
         for (PriceLevelSnapshot level : levels) {
@@ -283,16 +279,6 @@ public class SnapshotLoader {
             for (BookOrderSnapshot order : level.orders()) {
                 validateBookOrder(book, order, side, OrderType.LIMIT, level.price(), seen, path);
             }
-        }
-    }
-
-    private void validateMarketOrders(OrderBookSnapshot book,
-                                      List<BookOrderSnapshot> orders,
-                                      OrderSide side,
-                                      Set<Long> seen,
-                                      Path path) {
-        for (BookOrderSnapshot order : orders) {
-            validateBookOrder(book, order, side, OrderType.MARKET, 0L, seen, path);
         }
     }
 
@@ -350,9 +336,11 @@ public class SnapshotLoader {
      *       quantity 完全一致；</li>
      *   <li>委托的 {@code filledQuantity + 挂单剩余量 == quantity}，防止成交进度与
      *       订单簿剩余量不一致；</li>
-     *   <li>{@code PAID / PARTIALLY_FILLED} 的未完成委托必须仍在订单簿中；</li>
-     *   <li>{@code FILLED / CANCELED} 的委托必须出现在同 symbol 订单簿的
-     *       seenOrderIds 中，证明它确实进入过撮合引擎。</li>
+     *   <li>进行中的委托（{@code PAID}，或 {@code finalAt} 为空的 {@code PARTIALLY_FILLED}）
+     *       必须仍在订单簿中；</li>
+     *   <li>已进入终态的委托（{@code FILLED} / {@code CANCELED} / {@code finalAt} 非空的
+     *       {@code PARTIALLY_FILLED}）必须出现在同 symbol 订单簿的 seenOrderIds 中，
+     *       证明它确实进入过撮合引擎。</li>
      * </ul>
      */
     private void validateCrossReferences(SnapshotPayload payload,
@@ -373,24 +361,26 @@ public class SnapshotLoader {
                     validateCrossReference(bookOrder, orderById, restingIds, path);
                 }
             }
-            for (BookOrderSnapshot bookOrder : book.marketBids()) {
-                validateCrossReference(bookOrder, orderById, restingIds, path);
-            }
-            for (BookOrderSnapshot bookOrder : book.marketAsks()) {
-                validateCrossReference(bookOrder, orderById, restingIds, path);
-            }
         }
 
         for (OrderSnapshot order : payload.orderState().orders()) {
-            boolean open = order.status() == OrderStatus.PAID
-                    || order.status() == OrderStatus.PARTIALLY_FILLED;
+            // 终态判定：FILLED / CANCELED，或 finalAt 非空的 PARTIALLY_FILLED（部分成交收尾）。
+            boolean open = (order.status() == OrderStatus.PAID
+                    || order.status() == OrderStatus.PARTIALLY_FILLED)
+                    && order.finalAt() == null;
+            if (open && order.type() == OrderType.MARKET) {
+                // 市价单按 IOC 处理：撮合当次即进入终态，静止快照中不允许存在未完成的市价单。
+                throw fail(path, "market order must not be open in a quiescent snapshot "
+                        + "(IOC): orderId=" + order.orderId() + ", status=" + order.status());
+            }
             if (open && !restingIds.contains(order.orderId())) {
                 throw fail(path, "open order is not resting in a book: orderId="
                         + order.orderId() + ", status=" + order.status());
             }
             boolean reachedEngine = open
                     || order.status() == OrderStatus.FILLED
-                    || order.status() == OrderStatus.CANCELED;
+                    || order.status() == OrderStatus.CANCELED
+                    || order.status() == OrderStatus.PARTIALLY_FILLED;
             if (reachedEngine) {
                 OrderBookSnapshot book = bookBySymbol.get(order.symbol());
                 Set<Long> seen = seenBySymbol.get(order.symbol());
@@ -414,6 +404,10 @@ public class SnapshotLoader {
         OrderSnapshot order = orderById.get(bookOrder.orderId());
         if (order == null) {
             throw fail(path, "resting order has no order snapshot: " + bookOrder.orderId());
+        }
+        if (order.finalAt() != null) {
+            throw fail(path, "terminal order must not rest in a book: orderId="
+                    + bookOrder.orderId() + ", status=" + order.status());
         }
         if (order.userId() != bookOrder.userId()
                 || !order.symbol().equals(bookOrder.symbol())

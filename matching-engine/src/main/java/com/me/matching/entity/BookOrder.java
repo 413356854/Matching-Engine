@@ -10,7 +10,7 @@ import java.time.Instant;
  * 订单簿中的挂单。
  *
  * <p>订单进入订单簿后，价格、方向、类型等不变，只有剩余数量随成交递减。
- * 限价单 {@code price > 0}，市价单 {@code price = 0}。
+ * 市价单按 IOC 处理、不挂单，因此挂单只有限价单（{@code price > 0}）。
  *
  * <p>纯 JDK，无框架依赖。
  */

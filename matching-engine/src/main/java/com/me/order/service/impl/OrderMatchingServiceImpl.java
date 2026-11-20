@@ -9,7 +9,6 @@ import com.me.order.dto.OrderCancelBeginResult;
 import com.me.order.dto.OrderCancelContext;
 import com.me.order.dto.OrderCancelMatchResult;
 import com.me.order.dto.OrderMatchResult;
-import com.me.order.dto.OrderMatchResult.IgnoredTrade;
 import com.me.order.dto.OrderTradeApplyResult;
 import com.me.order.service.OrderMatchingService;
 import com.me.order.service.OrderService;
@@ -18,7 +17,6 @@ import com.me.shared.event.TradeEvent;
 import com.me.shared.order.OrderCancelEvent;
 import com.me.shared.order.OrderHistoryEvent;
 import com.me.shared.order.OrderPlacedEvent;
-import com.me.shared.order.OrderSide;
 import com.me.shared.order.OrderType;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -114,40 +112,26 @@ public class OrderMatchingServiceImpl implements OrderMatchingService {
         List<TradeSettlementCommand> settlementCommands =
                 new ArrayList<>(result.trades().size() + 1);
         List<OrderHistoryEvent> historyEvents = new ArrayList<>(2);
-        List<IgnoredTrade> ignoredTrades = new ArrayList<>();
 
         for (Trade trade : result.trades()) {
             matchPairEvents.add(toMatchPair(trade, executedAt));
             TradeEvent tradeEvent = toTradeEvent(trade, executedAt);
             OrderTradeApplyResult cleared = orderService.onTrade(tradeEvent);
-            if (cleared.handled()) {
-                settlementCommands.addAll(cleared.settlementCommands());
-                historyEvents.addAll(cleared.historyEvents());
-            } else {
-                ignoredTrades.add(new IgnoredTrade(trade.tradeId(), cleared.reason()));
-                log.warn("trade clearing ignored inside in-process matching: orderId={}, "
-                                + "tradeId={}, takerOrderId={}, makerOrderId={}, reason={}",
-                        result.orderId(), trade.tradeId(), trade.takerOrderId(),
-                        trade.makerOrderId(), cleared.reason());
-            }
+            settlementCommands.addAll(cleared.settlementCommands());
+            historyEvents.addAll(cleared.historyEvents());
         }
 
-        // 市价买入按预算成交，撮合结束后不再挂单：标记委托完成，并把未用完的冻结预算
-        // 生成一条退款清算命令。若最后成交已使委托全部成交，onTrade 已携带退款腿，
-        // completeMarketBuy 会按状态幂等忽略。
-        if (order.side() == OrderSide.BUY && order.type() == OrderType.MARKET) {
-            OrderTradeApplyResult completed = orderService.completeMarketBuy(order.orderId());
-            if (completed.handled()) {
-                settlementCommands.addAll(completed.settlementCommands());
-                historyEvents.addAll(completed.historyEvents());
-            } else {
-                log.warn("market buy completion ignored: orderId={}, reason={}",
-                        order.orderId(), completed.reason());
-            }
+        // 市价单按 IOC 处理，撮合结束后不挂单：未成交部分撤销，并把剩余冻结资金生成
+        // 一条退款清算命令（买单退回未用完的预算，卖单退回未成交数量）。若最后成交已使
+        // 委托全部成交，onTrade 已携带退款腿，completeMarketOrder 不再产生输出。
+        if (order.type() == OrderType.MARKET) {
+            OrderTradeApplyResult completed = orderService.completeMarketOrder(order.orderId());
+            settlementCommands.addAll(completed.settlementCommands());
+            historyEvents.addAll(completed.historyEvents());
         }
 
         return OrderMatchResult.matched(result.orderId(),
-                matchPairEvents, settlementCommands, historyEvents, ignoredTrades);
+                matchPairEvents, settlementCommands, historyEvents);
     }
 
     private static MatchPairEvent toMatchPair(Trade trade, Instant executedAt) {

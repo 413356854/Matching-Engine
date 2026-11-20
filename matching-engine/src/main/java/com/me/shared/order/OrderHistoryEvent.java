@@ -4,9 +4,11 @@ import java.time.Instant;
 import java.util.Locale;
 
 /**
- * 委托历史事件：委托进入终态（{@link OrderStatus#CANCELED} / {@link OrderStatus#FILLED}）时的快照。
+ * 委托历史事件：委托进入终态时的快照。终态包括 {@link OrderStatus#FILLED}、
+ * {@link OrderStatus#CANCELED}，以及已收尾的部分成交（{@link OrderStatus#PARTIALLY_FILLED}
+ * 且 {@code finalAt} 非空）。
  *
- * <p>委托模块在撤单更新、成交清算、市价买入完成时收集该事件，按 symbol 聚合后发往
+ * <p>委托模块在撤单更新、成交清算、市价单 IOC 收尾时收集该事件，按 symbol 聚合后发往
  * {@code me.order.history-batch}；admin 模块消费并归档到 QuestDB {@code ord_history}。
  *
  * <p>{@code finalAt} 是委托进入终态的时间，由第一次状态推进时确定，之后保持不变：
@@ -42,8 +44,8 @@ public record OrderHistoryEvent(
         }
     }
 
-    /** 是否终态事件；只有撤单与撮合完成会进入历史。 */
+    /** 是否终态事件：进入终态的记录都有固定的 {@code finalAt}。 */
     public boolean terminal() {
-        return status == OrderStatus.CANCELED || status == OrderStatus.FILLED;
+        return finalAt != null;
     }
 }

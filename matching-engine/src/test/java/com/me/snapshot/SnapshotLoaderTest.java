@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.me.shared.order.OrderStatus;
 import com.me.snapshot.dto.SnapshotFile;
 import com.me.snapshot.dto.SnapshotPayload;
 import java.nio.file.Files;
@@ -74,6 +75,27 @@ class SnapshotLoaderTest {
                 () -> loader.load(path));
         assertTrue(error.getMessage().contains("invariant")
                 || error.getMessage().contains("accountFrozen"));
+    }
+
+    @Test
+    void loadsTerminalPartiallyFilledOrder() {
+        // 有成交量的部分成交收尾是终态：不挂单、冻结已退回，快照仍应通过校验。
+        Path path = write(SnapshotTestData.terminalPartialPayload());
+
+        SnapshotLoader.LoadedSnapshot loaded = loader.load(path);
+
+        assertTrue(loaded.payload().orderState().orders().stream()
+                .anyMatch(order -> order.status() == OrderStatus.PARTIALLY_FILLED
+                        && order.finalAt() != null));
+    }
+
+    @Test
+    void rejectsOpenMarketOrder() {
+        Path path = write(SnapshotTestData.openMarketOrderPayload());
+
+        SnapshotRecoveryException error = assertThrows(SnapshotRecoveryException.class,
+                () -> loader.load(path));
+        assertTrue(error.getMessage().contains("market order"));
     }
 
     @Test

@@ -21,7 +21,8 @@ public interface OrderBook {
     String symbol();
 
     /**
-     * 处理一笔新委托：先撮合，未成交部分挂入订单簿。
+     * 处理一笔新委托：先与对手方限价单撮合。限价单未成交部分挂入订单簿；市价单按
+     * IOC 处理，未成交部分撤销（不挂单），由委托模块退回剩余冻结资金。
      * 同一 {@code orderId} 重复投递时返回 {@link MatchResult#duplicate}，不会二次撮合。
      */
     MatchResult place(OrderPlacedEvent order);
@@ -29,10 +30,11 @@ public interface OrderBook {
     /**
      * 撤单：从订单簿移除指定 orderId 的挂单。
      *
-     * <p>{@code side} / {@code type} / {@code price} 用于直接定位挂单所在的价格梯或市价簿；
+     * <p>{@code side} / {@code type} / {@code price} 用于直接定位挂单所在的价格梯；
      * 委托的方向、类型、价格在生命周期内不变。返回被移除的挂单（携带撤消时的剩余数量）；
-     * 委托不在簿中（已全部成交、尚未挂单或重复撤单）时返回 {@code null}。已成交过的
-     * orderId 仍会保留在去重集合中，防止重复下单事件在撤单后再次挂单。
+     * 委托不在簿中（已全部成交、尚未挂单或重复撤单）时返回 {@code null}。市价单按 IOC
+     * 处理，从不挂单，因此对市价单撤单总是返回 {@code null}。已成交过的 orderId 仍会保留
+     * 在去重集合中，防止重复下单事件在撤单后再次挂单。
      */
     BookOrder cancel(long orderId, OrderSide side, OrderType type, long price);
 
@@ -45,9 +47,6 @@ public interface OrderBook {
 
     /** 指定方向上仍在簿中的限价单数量。 */
     int limitOrderCount(OrderSide side);
-
-    /** 指定方向上仍在簿中的市价单数量。 */
-    int marketOrderCount(OrderSide side);
 
     /** 按 orderId 查找挂单，找不到返回 {@code null}（测试 / 运维查看用）。 */
     BookOrder find(long orderId);
