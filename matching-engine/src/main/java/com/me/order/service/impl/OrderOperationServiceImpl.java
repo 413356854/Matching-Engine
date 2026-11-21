@@ -613,6 +613,8 @@ public class OrderOperationServiceImpl implements OrderOperationService {
         }
         if (!result.historyEvents().isEmpty()) {
             orderHistoryPublisher.publishBatch(output, result.historyEvents());
+            // 历史事件已进入本批输出（随事务提交后对外可见），终态委托可以离开内存。
+            orderService.onHistoryPublished(result.historyEvents());
         }
         offsetSeqPublisher.publish(output, result);
     }

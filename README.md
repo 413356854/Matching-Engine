@@ -469,7 +469,9 @@ curl -G http://localhost:9000/exec `
     「每 (userId, currency) 的未成交委托剩余冻结 == 账户冻结」后写入本地 JSON 文件。
   - 返回 `backupId`、`path`、`fileSizeBytes`、`accountSeq` / `orderSeq` 水位、账户 /
     委托 / 订单簿 / offset 数量与 SHA-256 校验和；并发调用返回 409，引擎 fatal /
-    排空超时 / 一致性校验失败返回 503。
+    排空超时 / 一致性校验失败返回 503。快照只包含内存中仍保留的委托（未完成 +
+    `REJECTED`）；终态委托在历史事件发布后已从委托内存移除，按 requestId 查询回退到
+    QuestDB `ord_history`。
   - 每次成功快照同时写入 MySQL `snapshot_backup`（文件路径、大小、校验和、seq 水位、
     统计信息）和 `snapshot_backup_offset`（六条状态机输入 topic 的逐分区 next offset）；
     建表脚本见 `doc/mysql/snapshot_backup.sql`。主表 + offset 表在同一事务写入。
@@ -629,13 +631,11 @@ curl "http://localhost:8080/api/v1/currency/user-trades?userId=1001&limit=50"
   其他委托类型不允许携带 `amount`；数量不得低于交易对最小下单量，最小下单金额按配置校验
   （限价单用 `price × quantity`，市价买用 `amount`，市价卖按最近成交价估算；
   没有成交价时跳过金额校验，订单按 IOC 撤销）。
-- **重复命令语义**：不做 requestId / 成交对 / 撮合输出的内存防重缓存。生产链路不会重复
+- **命令投递语义**：不做 requestId / 成交对 / 撮合输出的内存防重缓存。生产链路不会重复
   投递同一命令：`me.order.commands-batch` 只由币币模块的批量 producer 写入（幂等、不重发），
-  消费端把输出与 offset 放在同一 Kafka 事务，失败即 fatal。同一 `orderId + requestId`
-  再次出现视为合同被破坏（时钟回拨撞号、回归或新增外部/重试入口），返回
-  `ORDER_DUPLICATE_COMMAND` 并记录 error，不重发冻结命令；同一 `orderId` 换 `requestId`
-  返回 `ORDER_ID_ALREADY_EXISTS`；成交重投由订单状态拒绝。账户模块不按 `requestId` 去重，
-  但只有上面的合同破坏路径才会让它看到重复的冻结命令。
+  消费端把输出与 offset 放在同一 Kafka 事务，失败即 fatal。`orderId` 由下单入口统一生成
+  且每单唯一，委托模块不做 orderId 重复校验。终态委托在历史事件发布后从内存移除。
+  账户模块不按 `requestId` 去重。
 - **查询**：`OrderService.view(orderId)`，委托不存在返回 `null`；`OrderView` 携带状态、
   委托内状态序号 `seq`，以及冻结的币种和金额。`OrderService.openOrders(userId, symbol, limit)`
   返回用户当前未完成委托。
@@ -778,11 +778,11 @@ curl -X POST http://localhost:8080/api/v1/currency/orders/cancel \
 下单后的可观测信号：`me.match-pair-batch` 可消费到撮合对，`me.account.settlements-batch`
 可消费到结算命令，`me.orders` / `me.trades` 不再有新增消息。未充值或余额不足时，委托状态为
 `REJECTED`，不会撮合，可通过 `GET /api/v1/orders/by-request-id?userId=...&requestId=...`
-查询（当前内存委托包含 `REJECTED`；`GET /api/v1/orders` 只返回未完成委托）。
+查询（内存保留 `REJECTED`；`FILLED` / `CANCELED` 等终态委托在历史事件发布后已从内存移除，
+按 requestId 查询回退到 QuestDB `ord_history`；`GET /api/v1/orders` 只返回未完成委托）。
 下单接口每次请求都由服务端生成新的 `orderId`，重复发送同一个 `requestId` 会产生新委托；
 `me.order.commands-batch` 是应用内部 topic，只由币币模块的批量 producer 写入，不支持外部
-生产者直写。委托模块对同一 `orderId + requestId` 再次出现会返回 `ORDER_DUPLICATE_COMMAND`
-并告警（正常链路不会发生）。
+生产者直写。`orderId` 由下单入口统一生成且每单唯一，委托模块不做重复校验。
 
 ## 已实现：撮合内核 M0（集合版订单簿，委托模块进程内）
 
@@ -1335,8 +1335,7 @@ curl -X POST http://localhost:8080/api/v1/currency/orders \
   Disruptor（**不等待 Kafka 聚合或 broker ack**；202 只表示命令已进入 ring，ring 满时返回 503）。
 - **异步部分**：Kafka broker ack、委托保存、`ACCEPTED → PAID / REJECTED`、进程内撮合、
   成交清算全部由委托模块消费 `me.order.commands-batch` 后推进。余额不足（`REJECTED`）、
-  成交状态、冻结失败等都不会通过本接口返回，可通过 `GET /api/v1/orders` 观察；
-  委托模块对同一 `orderId` 换 `requestId` 返回 `ORDER_ID_ALREADY_EXISTS`（正常链路不会发生）。
+  成交状态、冻结失败等都不会通过本接口返回，可通过 `GET /api/v1/orders` 观察。
 - **模块边界**：币币模块不 import / 调用任何 `com.me.order` 类型或服务；
   `OrderCommandListener` 是唯一接单入口。
 - **字段**：`requestId` 缺省时服务端生成 UUID，客户端重试应带上；<b>`orderId` 始终由币币模块

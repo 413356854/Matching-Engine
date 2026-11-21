@@ -8,8 +8,8 @@ import java.util.Locale;
  * <p>由币币模块的下单接口或外部生产者写入；委托模块只通过
  * {@code com.me.order.mq.OrderCommandListener} 消费，Kafka 是唯一的下单入口。
  *
- * <p>{@code requestId} 是幂等键，重复投递只会保存一笔委托；{@code orderId} 是委托的唯一标识，
- * 同一 orderId 不能重复保存。价格按 {@code 10^-priceScale}、数量按 {@code 10^-quantityScale}
+ * <p>{@code requestId} 是请求 / 查询标识，不参与防重；{@code orderId} 是委托的唯一标识，
+ * 由下单入口统一生成。价格按 {@code 10^-priceScale}、数量按 {@code 10^-quantityScale}
  * 存储，{@code quoteScale} 是计价币的 <b>raw_scale</b>（账本原始精度）；限价单价格必须
  * 大于 0，市价单价格固定为 0，{@code symbol} 统一转为大写。
  *

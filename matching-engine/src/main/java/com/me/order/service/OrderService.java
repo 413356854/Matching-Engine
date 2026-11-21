@@ -13,6 +13,7 @@ import com.me.order.vo.OrderView;
 import com.me.shared.event.OrderFreezeResultEvent;
 import com.me.shared.event.TradeEvent;
 import com.me.shared.order.OrderCommand;
+import com.me.shared.order.OrderHistoryEvent;
 import java.util.List;
 
 /**
@@ -26,10 +27,8 @@ import java.util.List;
 public interface OrderService {
 
     /**
-     * 保存一笔委托并给出需要发送的冻结命令。生产链路不会重复投递同一命令；同一
-     * {@code orderId + requestId} 再次出现视为合同被破坏，返回
-     * {@code ORDER_DUPLICATE_COMMAND} 并记录 error，不重发冻结命令。同一
-     * {@code orderId} 换 {@code requestId} 返回 {@code ORDER_ID_ALREADY_EXISTS}。
+     * 保存一笔委托并给出需要发送的冻结命令。生产链路不会重复投递同一命令；
+     * {@code orderId} 由下单入口统一生成且每单唯一，本方法不做 orderId 重复校验。
      */
     OrderApplyResult apply(OrderCommand command);
 
@@ -111,6 +110,16 @@ public interface OrderService {
     OrderCancelApplyResult applyCancel(OrderCancelContext context);
 
     /**
+     * 终态委托的历史事件已经写入本批输出后调用：从内存委托表移除这些委托。
+     *
+     * <p>只在 {@link #onTrade} / {@link #completeMarketOrder} / {@link #applyCancel}
+     * 产生历史事件，且调用方确认事件已随当前 Kafka 事务输出后调用。重复调用幂等。
+     *
+     * <p>终态委托移除后，按 requestId 的当前委托查询会回退到 QuestDB 历史委托。
+     */
+    void onHistoryPublished(List<OrderHistoryEvent> historyEvents);
+
+    /**
      * 按委托号查询；委托不存在时返回 {@code null}。
      */
     OrderView view(long orderId);
@@ -118,9 +127,9 @@ public interface OrderService {
     /**
      * 按 {@code userId + requestId} 查询当前内存中的委托；不存在时返回 {@code null}。
      *
-     * <p>不限制委托状态：内存中仍保留的 {@code REJECTED} / {@code FILLED} /
-     * {@code CANCELED} 委托也能查到。同一用户重复使用同一个 {@code requestId} 产生多笔
-     * 委托时，返回 {@code orderId} 最大（最新）的一笔。
+     * <p>不限制委托状态：内存中仍保留的委托（含 {@code REJECTED}）都能查到；终态委托
+     * 在历史事件发布后已从内存移除，查询方应回退到 QuestDB 历史委托。同一用户重复使用
+     * 同一个 {@code requestId} 产生多笔委托时，返回 {@code orderId} 最大（最新）的一笔。
      *
      * <p>本方法只做查询；{@code requestId} 索引不改变演示版“不做 requestId 防重”的重投语义。
      *
@@ -141,7 +150,8 @@ public interface OrderService {
     List<OrderView> openOrders(long userId, String symbol, int limit);
 
     /**
-     * 快照用：返回全部委托及结算 requestId 生成器的只读副本，按 orderId 升序。
+     * 快照用：返回内存中仍保留的委托（未完成 + {@code REJECTED}；终态委托已在发布
+     * 历史事件后移除）及结算 requestId 生成器的只读副本，按 orderId 升序。
      *
      * <p>调用方必须持有委托模块的批次锁（{@code OrderBatchLock}），否则只能得到
      * {@link java.util.concurrent.ConcurrentHashMap} 的弱一致遍历结果。快照服务在

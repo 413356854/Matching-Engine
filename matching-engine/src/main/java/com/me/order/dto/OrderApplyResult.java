@@ -8,7 +8,7 @@ import com.me.order.vo.OrderView;
  * 失败时携带拒绝原因。
  *
  * <p>{@code freezeCommand} 只在本次新建委托且处于 {@code ACCEPTED}（等待冻结回执）时非空；
- * 重复命令以 {@code rejected} 返回，不带冻结命令。
+ * 失败时 {@code freezeCommand} 为空。
  */
 public record OrderApplyResult(
         boolean success,

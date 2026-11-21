@@ -55,7 +55,7 @@ import java.util.TreeMap;
  *   <li>市价 vs 限价：取限价单（maker）价格。</li>
  * </ul>
  *
- * <p><b>幂等</b>：冻结回执可能因 Kafka 事务重投或重复命令再次触发撮合，同一 orderId 只撮合一次，
+ * <p><b>幂等</b>：冻结回执可能因 Kafka 事务重投或重复回执再次触发撮合，同一 orderId 只撮合一次，
  * 重复调用返回 {@link MatchResult#duplicate}。已见 orderId 保存在内存 Set 中，
  * 与订单簿一样由快照恢复机制负责清理（M0 不实现快照）。
  *

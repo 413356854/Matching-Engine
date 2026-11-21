@@ -45,15 +45,14 @@ import org.springframework.stereotype.Service;
  * <p>下单命令只由 {@code OrderCommandListener} 从 Kafka {@code me.order.commands-batch} 消费后
  * 调用 {@link #apply(com.me.shared.order.OrderCommand)}，Kafka 是唯一的下单入口。
  *
- * <p>委托按 {@code orderId} 保存在 {@link ConcurrentHashMap} 中，不落库；进程重启后委托全部丢失。
+ * <p>委托按 {@code orderId} 保存在 {@link ConcurrentHashMap} 中，不落库；终态委托在历史
+ * 事件发布后从内存移除（按 requestId 查询回退到 QuestDB 历史委托），未完成与
+ * {@code REJECTED} 委托保留。进程重启后未恢复的委托丢失。
  *
- * <p><b>重复命令语义</b>：{@code me.order.commands-batch} 只由应用内部的
+ * <p><b>命令投递语义</b>：{@code me.order.commands-batch} 只由应用内部的
  * {@code OrderCommandBatchPublisher} 写入（幂等 producer，不重发），消费端把输出与
  * 输入 offset 放在同一个 Kafka 事务提交，失败即 fatal，因此生产链路不会把同一条命令
- * 处理两次。同一 orderId + requestId 再次出现说明合同被破坏（时钟回拨撞号、代码回归
- * 或新增外部/重试入口）：这里显式拒绝并记录 error，<b>不再重发冻结命令</b>；同一
- * orderId 换 requestId 返回 {@code ORDER_ID_ALREADY_EXISTS}；成交重投由订单状态
- * （已 FILLED / PARTIALLY_FILLED 不可再成交）拒绝。
+ * 处理两次；{@code orderId} 由下单入口统一生成且每单唯一，本类不做 orderId 重复校验。
  *
  * <p>{@code userId + requestId → 最新 orderId} 的索引只服务于按 requestId 查询，
  * 不参与防重：同一 requestId 重复下单仍会生成新委托，索引返回其中最新的一笔。
@@ -155,20 +154,8 @@ public class OrderServiceImpl implements OrderService {
                 command.quoteScale(),
                 false);
 
-        Order existing = orders.putIfAbsent(order.orderId(), order);
-        if (existing != null) {
-            if (existing.requestId().equals(command.requestId())) {
-                // 生产链路不会重投同一命令（应用内 producer 不重发，消费端输出与 offset
-                // 同事务、失败 fatal）。重复只可能来自合同被破坏，例如时钟回拨撞号、
-                // 代码回归或新增外部/重试入口；重发冻结会永久多冻一笔，这里显式拒绝。
-                log.error("order rejected, duplicate orderId + requestId: orderId={}, "
-                        + "requestId={}", command.orderId(), command.requestId());
-                return OrderApplyResult.rejected("ORDER_DUPLICATE_COMMAND");
-            }
-            log.warn("order rejected, orderId already exists: orderId={}, requestId={}",
-                    command.orderId(), command.requestId());
-            return OrderApplyResult.rejected("ORDER_ID_ALREADY_EXISTS");
-        }
+        // orderId 由下单入口统一生成，每单唯一；这里不做重复校验。
+        orders.put(order.orderId(), order);
         indexByRequest(order);
 
         return successOf(order);
@@ -250,7 +237,7 @@ public class OrderServiceImpl implements OrderService {
             if (order.status() == OrderStatus.PAID
                     || order.status() == OrderStatus.PARTIALLY_FILLED
                     || order.status() == OrderStatus.FILLED) {
-                // 回执可能因事务重试/重复命令被再次投递。已支付（甚至已成交）时仍返回 placedEvent，
+                // 回执可能因事务重试/重复回执被再次投递。已支付（甚至已成交）时仍返回 placedEvent，
                 // 撮合引擎按 orderId 返回 duplicate，本次不再产生撮合对/结算（演示版不重放输出）。
                 resultRef.set(OrderFreezeApplyResult.placed(order.toPlacedEvent()));
                 return order;
@@ -525,6 +512,24 @@ public class OrderServiceImpl implements OrderService {
         });
         OrderCancelApplyResult result = resultRef.get();
         return result == null ? OrderCancelApplyResult.ignored("ORDER_NOT_FOUND") : result;
+    }
+
+    @Override
+    public void onHistoryPublished(List<OrderHistoryEvent> historyEvents) {
+        if (historyEvents.isEmpty()) {
+            return;
+        }
+        for (OrderHistoryEvent event : historyEvents) {
+            Order removed = orders.remove(event.orderId());
+            if (removed == null) {
+                continue;
+            }
+            String normalizedRequestId = normalizeRequestId(removed.requestId());
+            if (normalizedRequestId != null) {
+                orderIdsByRequest.remove(
+                        new RequestKey(removed.userId(), normalizedRequestId), removed.orderId());
+            }
+        }
     }
 
     private Order fillOrder(long orderId, TradeEvent trade) {

@@ -100,8 +100,9 @@ public class OrderController {
     /**
      * 按 requestId 查询一笔委托：先查内存中的当前委托，再查 QuestDB 历史委托。
      *
-     * <p>当前委托不限制状态，因此冻结失败变成 {@code REJECTED} 的委托也能查到；历史委托
-     * 只包含 {@code CANCELED} / {@code FILLED}。两处都没有时返回 404 + {@code ORDER_NOT_FOUND}。
+     * <p>当前委托不限制状态，因此冻结失败变成 {@code REJECTED} 的委托也能查到；终态委托
+     * 在历史事件发布后已从委托内存移除，会回退到 QuestDB 历史委托 {@code ord_history}。
+     * 两处都没有时返回 404 + {@code ORDER_NOT_FOUND}。
      */
     @GetMapping("/by-request-id")
     public ResponseEntity<OrderLookupView> byRequestId(
