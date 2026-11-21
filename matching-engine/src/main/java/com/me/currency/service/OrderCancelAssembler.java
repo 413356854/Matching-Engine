@@ -3,6 +3,7 @@ package com.me.currency.service;
 import com.me.currency.dto.CancelOrderRequest;
 import com.me.currency.vo.TradingPairView;
 import com.me.shared.order.OrderCancelCommand;
+import com.me.shared.order.OrderRequestLimits;
 import java.util.Locale;
 import java.util.UUID;
 import org.springframework.stereotype.Component;
@@ -61,6 +62,11 @@ public class OrderCancelAssembler {
     private static String validate(CancelOrderRequest request) {
         if (request == null) {
             return "REQUEST_REQUIRED";
+        }
+        if (request.requestId() != null
+                && request.requestId().strip().length()
+                > OrderRequestLimits.MAX_REQUEST_ID_LENGTH) {
+            return "REQUEST_ID_INVALID";
         }
         if (request.orderId() == null) {
             return "ORDER_ID_REQUIRED";

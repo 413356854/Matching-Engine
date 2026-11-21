@@ -3,8 +3,10 @@ package com.me.currency.service;
 import com.me.currency.dto.PlaceOrderRequest;
 import com.me.currency.vo.CurrencyView;
 import com.me.currency.vo.TradingPairView;
+import com.me.shared.marketdata.LatestPriceQueryPort;
 import com.me.shared.money.Amounts;
 import com.me.shared.order.OrderCommand;
+import com.me.shared.order.OrderRequestLimits;
 import com.me.shared.order.OrderSide;
 import com.me.shared.order.OrderType;
 import java.util.Locale;
@@ -27,11 +29,14 @@ public class OrderCommandAssembler {
 
     private final CurrencyConfigCache configCache;
     private final OrderIdGenerator orderIdGenerator;
+    private final LatestPriceQueryPort latestPriceQuery;
 
     public OrderCommandAssembler(CurrencyConfigCache configCache,
-                                 OrderIdGenerator orderIdGenerator) {
+                                 OrderIdGenerator orderIdGenerator,
+                                 LatestPriceQueryPort latestPriceQuery) {
         this.configCache = configCache;
         this.orderIdGenerator = orderIdGenerator;
+        this.latestPriceQuery = latestPriceQuery;
     }
 
     /**
@@ -83,6 +88,11 @@ public class OrderCommandAssembler {
         if (request == null) {
             return "REQUEST_REQUIRED";
         }
+        if (request.requestId() != null
+                && request.requestId().strip().length()
+                > OrderRequestLimits.MAX_REQUEST_ID_LENGTH) {
+            return "REQUEST_ID_INVALID";
+        }
         if (request.userId() == null) {
             return "USER_ID_REQUIRED";
         }
@@ -123,8 +133,8 @@ public class OrderCommandAssembler {
     }
 
     /** 按交易对配置校验最小下单量、数量步长和最小下单金额；通过返回 {@code null}。 */
-    private static String validateAgainstPair(TradingPairView pair, long price, long quantity,
-                                              long marketBuyAmount, int quoteRawScale) {
+    private String validateAgainstPair(TradingPairView pair, long price, long quantity,
+                                       long marketBuyAmount, int quoteRawScale) {
         if (pair.minOrderQuantity() > 0 && quantity < pair.minOrderQuantity()) {
             return "BELOW_MIN_ORDER_QUANTITY";
         }
@@ -163,6 +173,24 @@ public class OrderCommandAssembler {
             }
             if (pair.minOrderAmount() > 0 && amount < pair.minOrderAmount()) {
                 return "BELOW_MIN_ORDER_AMOUNT";
+            }
+            return null;
+        }
+        // 市价卖单没有价格：用最近成交价估算名义金额；没有参考价时跳过金额校验
+        // （该交易对没有成交，订单会按 IOC 撤销，不会产生成交）。
+        if (pair.minOrderAmount() > 0) {
+            Long referencePrice = latestPriceQuery.latestPrice(pair.symbol());
+            if (referencePrice != null && referencePrice > 0) {
+                long amount;
+                try {
+                    amount = Amounts.quoteAmount(referencePrice, quantity,
+                            pair.priceScale(), pair.quantityScale(), quoteRawScale);
+                } catch (ArithmeticException | IllegalArgumentException e) {
+                    return "AMOUNT_OVERFLOW";
+                }
+                if (amount < pair.minOrderAmount()) {
+                    return "BELOW_MIN_ORDER_AMOUNT";
+                }
             }
         }
         return null;

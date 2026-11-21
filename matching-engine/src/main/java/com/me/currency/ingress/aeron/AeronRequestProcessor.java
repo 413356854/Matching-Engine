@@ -11,6 +11,7 @@ import com.me.kafka.FatalState;
 import com.me.shared.gateway.AeronAction;
 import com.me.shared.gateway.AeronOrderAck;
 import com.me.shared.gateway.AeronOrderRequest;
+import com.me.shared.order.OrderRequestLimits;
 import com.me.snapshot.recovery.RecoveryState;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -28,8 +29,6 @@ import org.slf4j.LoggerFactory;
 public final class AeronRequestProcessor {
 
     private static final Logger log = LoggerFactory.getLogger(AeronRequestProcessor.class);
-
-    private static final int MAX_REQUEST_ID_LENGTH = 128;
 
     private final OrderCommandAssembler orderCommandAssembler;
     private final OrderCancelAssembler orderCancelAssembler;
@@ -75,7 +74,7 @@ public final class AeronRequestProcessor {
         if (request.userId() <= 0) {
             return failure(request, requestId, "USER_ID_INVALID");
         }
-        if (requestId.length() > MAX_REQUEST_ID_LENGTH) {
+        if (requestId.length() > OrderRequestLimits.MAX_REQUEST_ID_LENGTH) {
             return failure(request, requestId, "REQUEST_ID_INVALID");
         }
         if (fatalState.isFatal()) {

@@ -4,6 +4,7 @@ import com.me.marketdata.entity.TradeRecord;
 import com.me.marketdata.repository.MarketDataRepository;
 import com.me.marketdata.service.MarketDataService;
 import com.me.shared.event.MatchPairEvent;
+import com.me.shared.marketdata.LatestPriceQueryPort;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -33,7 +34,7 @@ import org.springframework.stereotype.Component;
  * {@code limit} 超过容量按容量截断。同一交易对的读写由该交易对的监视器锁串行。
  */
 @Component
-public class RecentTradeCache {
+public class RecentTradeCache implements LatestPriceQueryPort {
 
     private static final Logger log = LoggerFactory.getLogger(RecentTradeCache.class);
 
@@ -102,6 +103,19 @@ public class RecentTradeCache {
         return cache.snapshot(limit);
     }
 
+    /**
+     * 最近一笔成交价；只读内存缓存，不触发 QuestDB 加载。缓存未预热或该交易对没有成交时
+     * 返回 {@code null}，调用方应跳过依赖该参考价的校验。
+     */
+    @Override
+    public Long latestPrice(String symbol) {
+        if (symbol == null || symbol.isBlank()) {
+            return null;
+        }
+        SymbolTrades cache = bySymbol.get(symbol);
+        return cache == null ? null : cache.latestPrice();
+    }
+
     private SymbolTrades cache(String symbol) {
         return bySymbol.computeIfAbsent(symbol, ignored -> new SymbolTrades());
     }
@@ -149,6 +163,11 @@ public class RecentTradeCache {
                         event.executedAt()));
             }
             trim();
+        }
+
+        synchronized Long latestPrice() {
+            TradeRecord head = trades.peekFirst();
+            return head == null ? null : head.price();
         }
 
         synchronized List<TradeRecord> snapshot(int limit) {

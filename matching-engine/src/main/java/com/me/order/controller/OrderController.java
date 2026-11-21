@@ -10,6 +10,7 @@ import com.me.order.vo.OrderQueryView;
 import com.me.order.vo.OrderView;
 import com.me.shared.order.OrderHistoryQueryPort;
 import com.me.shared.order.OrderHistoryRecord;
+import com.me.shared.order.OrderRequestLimits;
 import java.util.List;
 import java.util.Locale;
 import org.slf4j.Logger;
@@ -49,8 +50,6 @@ public class OrderController {
     private static final Logger log = LoggerFactory.getLogger(OrderController.class);
 
     private static final int MAX_SYMBOL_LENGTH = 32;
-    private static final int MAX_REQUEST_ID_LENGTH = 128;
-
     private final OrderService orderService;
     private final OrderHistoryQueryPort historyQueryPort;
     private final OrderHistoryLookupService historyLookupService;
@@ -118,7 +117,7 @@ public class OrderController {
         if (normalizedRequestId == null || normalizedRequestId.isEmpty()) {
             return lookupBadRequest("REQUEST_ID_REQUIRED");
         }
-        if (normalizedRequestId.length() > MAX_REQUEST_ID_LENGTH) {
+        if (normalizedRequestId.length() > OrderRequestLimits.MAX_REQUEST_ID_LENGTH) {
             return lookupBadRequest("REQUEST_ID_INVALID");
         }
 

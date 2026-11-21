@@ -3,6 +3,7 @@ package com.me.websocket.trading.handler;
 import com.me.aeron.AeronProperties;
 import com.me.shared.gateway.AeronAction;
 import com.me.shared.gateway.AeronOrderRequest;
+import com.me.shared.order.OrderRequestLimits;
 import com.me.websocket.trading.config.TradingProperties;
 import com.me.websocket.trading.dto.TradeClientMessage;
 import com.me.websocket.trading.service.TradeAeronPublisher;
@@ -46,8 +47,6 @@ public final class TradeWebSocketHandler extends AbstractWebSocketHandler {
     private static final String ACTION_PLACE = "placeorder";
     private static final String ACTION_CANCEL = "cancelorder";
     private static final String ACTION_PING = "ping";
-
-    private static final int MAX_REQUEST_ID_LENGTH = 128;
 
     private final TradingProperties properties;
     private final AeronProperties aeronProperties;
@@ -183,7 +182,7 @@ public final class TradeWebSocketHandler extends AbstractWebSocketHandler {
             sendError(session, null, "REQUEST_ID_REQUIRED");
             return;
         }
-        if (requestId.length() > MAX_REQUEST_ID_LENGTH) {
+        if (requestId.length() > OrderRequestLimits.MAX_REQUEST_ID_LENGTH) {
             sendError(session, requestId, "REQUEST_ID_INVALID");
             return;
         }
@@ -224,7 +223,7 @@ public final class TradeWebSocketHandler extends AbstractWebSocketHandler {
             sendError(session, null, "REQUEST_ID_REQUIRED");
             return;
         }
-        if (requestId.length() > MAX_REQUEST_ID_LENGTH) {
+        if (requestId.length() > OrderRequestLimits.MAX_REQUEST_ID_LENGTH) {
             sendError(session, requestId, "REQUEST_ID_INVALID");
             return;
         }

@@ -21,6 +21,7 @@ import com.me.shared.money.Amounts;
 import com.me.shared.order.OrderCommand;
 import com.me.shared.order.OrderHistoryEvent;
 import com.me.shared.order.OrderPlacedEvent;
+import com.me.shared.order.OrderRequestLimits;
 import com.me.shared.order.OrderSide;
 import com.me.shared.order.OrderStatus;
 import com.me.shared.order.OrderType;
@@ -638,6 +639,9 @@ public class OrderServiceImpl implements OrderService {
         }
         if (command.requestId() == null || command.requestId().isBlank()) {
             return "REQUEST_ID_REQUIRED";
+        }
+        if (command.requestId().strip().length() > OrderRequestLimits.MAX_REQUEST_ID_LENGTH) {
+            return "REQUEST_ID_INVALID";
         }
         if (command.orderId() <= 0) {
             return "ORDER_ID_INVALID";
